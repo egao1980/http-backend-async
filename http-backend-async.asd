@@ -10,12 +10,14 @@
                "fast-http"
                "babel"
                "alexandria"
-               "sb-bsd-sockets")
+               "sb-bsd-sockets"
+               "cl+ssl")
   :serial t
   :pathname "src"
   :components ((:file "package")
                (:file "socket")
                (:file "http1")
+               (:file "tls")
                (:file "backend"))
   :in-order-to ((test-op (test-op "http-backend-async/tests"))))
 
@@ -25,7 +27,8 @@
   :serial t
   :components ((:file "package")
                (:file "fixture")
-               (:file "backend-test"))
+               (:file "backend-test")
+               (:file "live-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
