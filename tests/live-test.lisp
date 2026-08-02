@@ -1,6 +1,6 @@
 (in-package #:http-backend-async/tests)
 
-;;; Live HTTPS + Content-Encoding against public origins.
+;;; Live HTTPS + CE — mirrors psf/requests httpbin cases (see PROVENANCE.md).
 ;;; Skip when HTTP_ASYNC_LIVE=0 or the network/origin is unreachable.
 
 (defun %live-enabled-p ()
@@ -21,57 +21,86 @@
            (error (e)
              (skip (format nil "live network unavailable: ~A" e)))))))
 
-(deftest live-https-get
+(deftest live-http-200-ok-get
+  "requests: GET httpbin/get over HTTPS."
   (with-live (eb el)
     (let ((res (%await-promise
                 (get-async (%live-url "/get") :timeout 20.0)
                 eb el :timeout 25.0)))
-      (ok (<= 200 (response-status res) 299))
-      (ok (plusp (length (response-body res)))))))
+      (ok (= 200 (response-status res)))
+      (ok (plusp (length (response-body res))))
+      (ok (search "\"url\"" (%body-text res))))))
 
-(deftest live-https-gzip
-  "Origin returns Content-Encoding: gzip; backend must decode."
+(deftest live-decompress-gzip
+  "requests: TestRequests.test_decompress_gzip"
+  (with-live (eb el)
+    (let* ((res (%await-promise
+                 (get-async (%live-url "/gzip")
+                            :accept-encoding '(:gzip)
+                            :timeout 20.0)
+                 eb el :timeout 25.0))
+           (text (%body-text res)))
+      (ok (= 200 (response-status res)))
+      ;; requests: r.content.decode("ascii")
+      (ok (every (lambda (c) (< (char-code c) 128)) text))
+      (ok (search "\"gzipped\"" text))
+      (ok (search "true" text))
+      ;; stack policy: CE removed after decode
+      (ok (null (response-header res :content-encoding))))))
+
+(deftest live-decompress-deflate
+  "httpbin /deflate — same shape as requests/urllib3 deflate decode."
+  (with-live (eb el)
+    (let* ((res (%await-promise
+                 (get-async (%live-url "/deflate")
+                            :accept-encoding '(:deflate)
+                            :timeout 20.0)
+                 eb el :timeout 25.0))
+           (text (%body-text res)))
+      (ok (= 200 (response-status res)))
+      (ok (search "\"deflated\"" text))
+      (ok (null (response-header res :content-encoding))))))
+
+(deftest live-accept-encoding-identity
+  "requests: Accept-Encoding identity — no transport compression."
   (with-live (eb el)
     (let ((res (%await-promise
-                (get-async (%live-url "/gzip")
-                           :accept-encoding '(:gzip)
+                (get-async (%live-url "/get")
+                           :accept-encoding "identity"
                            :timeout 20.0)
                 eb el :timeout 25.0)))
       (ok (= 200 (response-status res)))
       (ok (null (response-header res :content-encoding)))
-      (let ((text (babel:octets-to-string (response-body res) :errorp nil)))
-        (ok (search "gzipped" text :test #'char-equal))))))
+      (ok (plusp (length (response-body res)))))))
 
-(deftest live-https-brotli
-  "Decode br when http-encoding-brotli is available (CDN negotiation)."
+(deftest live-default-accept-encoding-gzip
+  "requests default_headers include gzip — /gzip must still decode."
+  (with-live (eb el)
+    (ignore-errors (asdf:load-system "http-encoding-brotli"))
+    (ignore-errors (asdf:load-system "http-encoding-zstd"))
+    (let* ((res (%await-promise
+                 (get-async (%live-url "/gzip")
+                            :accept-encoding :default
+                            :timeout 20.0)
+                 eb el :timeout 25.0))
+           (text (%body-text res)))
+      (ok (= 200 (response-status res)))
+      (ok (search "gzipped" text :test #'char-equal))
+      (ok (null (response-header res :content-encoding))))))
+
+(deftest live-decompress-brotli-optional
+  "requests FAQ: br when brotli available — CDN origin (httpbin has no /brotli)."
   (with-live (eb el)
     (unless (ignore-errors (asdf:load-system "http-encoding-brotli") t)
-      (skip "http-encoding-brotli not available"))
+      (skip "http-encoding-brotli not available (like requests without brotli pkg)"))
     (unless (content-coding-supported-p :br)
       (skip "br coding not registered"))
     (let* ((url (or (uiop:getenv "HTTP_ASYNC_LIVE_BR_URL")
                     "https://www.cloudflare.com/"))
            (res (%await-promise
-                 (get-async url
-                            :accept-encoding '(:br)
-                            :timeout 20.0)
+                 (get-async url :accept-encoding '(:br) :timeout 20.0)
                  eb el :timeout 25.0)))
       (unless (<= 200 (response-status res) 299)
         (skip (format nil "br origin returned ~A" (response-status res))))
-      ;; Either origin sent br (decoded → CE removed) or fell back to identity.
-      (ok (null (response-header res :content-encoding)))
-      (ok (plusp (length (response-body res)))))))
-
-(deftest live-https-accept-encoding-negotiated
-  "Ask for available codings against /gzip — body must decode."
-  (with-live (eb el)
-    (ignore-errors (asdf:load-system "http-encoding-brotli"))
-    (ignore-errors (asdf:load-system "http-encoding-zstd"))
-    (let ((res (%await-promise
-                (get-async (%live-url "/gzip")
-                           :accept-encoding :default
-                           :timeout 20.0)
-                eb el :timeout 25.0)))
-      (ok (= 200 (response-status res)))
       (ok (null (response-header res :content-encoding)))
       (ok (plusp (length (response-body res)))))))
