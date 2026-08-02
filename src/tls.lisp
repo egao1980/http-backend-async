@@ -1,7 +1,7 @@
 (in-package #:http-backend-async)
 
-;;; TLS via cl+ssl (+ optional cl-stack-ssl overlay).
-;;; After async TCP connect, handshake + HTTP exchange run to completion on the
+;;; TLS via cl+ssl (+ optional cl-stack-ssl overlay) over a usocket stream.
+;;; After TCP connect, handshake + HTTP exchange run to completion on the
 ;;; loop thread (cl+ssl socket-BIO waits internally). True nonblocking SSL later.
 
 (defun ensure-tls ()
@@ -15,16 +15,11 @@
         ((eq verify t) :required)
         (t verify)))
 
-(defun make-tls-stream (sock host &key (verify t))
-  "Blocking TLS client stream over SOCK for HOST (SNI)."
+(defun make-tls-stream (usock host &key (verify t))
+  "Blocking TLS client stream over USOCKET for HOST (SNI)."
   (ensure-tls)
-  (setf (non-blocking-mode sock) nil)
-  (let ((base (socket-make-stream sock
-                                  :input t
-                                  :output t
-                                  :element-type '(unsigned-byte 8)
-                                  :buffering :none
-                                  :auto-close nil)))
+  (set-socket-nonblocking usock nil)
+  (let ((base (socket-byte-stream usock)))
     (handler-case
         (cl+ssl:make-ssl-client-stream
          base
@@ -32,7 +27,6 @@
          :verify (%verify-arg verify)
          :unwrap-stream-p t)
       (error (e)
-        (ignore-errors (close base))
         (error 'http-tls-error
                :message (format nil "TLS handshake failed for ~A: ~A" host e))))))
 
@@ -42,8 +36,9 @@
 
 (defun tls-read-some (ssl buffer)
   "Read into BUFFER. Returns bytes read, or 0 on EOF."
-  (let ((n (read-sequence buffer ssl)))
-    n))
+  (handler-case
+      (read-sequence buffer ssl)
+    (end-of-file () 0)))
 
 (defun tls-close (ssl)
   (when ssl

@@ -1,7 +1,5 @@
 (defpackage #:http-backend-async
-  (:use #:cl
-        #:http-protocol
-        #:sb-bsd-sockets)
+  (:use #:cl #:http-protocol)
   (:import-from #:event-protocol
                 #:*event-backend*
                 #:*event-loop*
