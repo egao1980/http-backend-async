@@ -1,0 +1,105 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: http-backend-async-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SBCL_VERSION: 2.4.11
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            event_backend: libuv
+            apt: libuv1-dev
+            brew: libuv
+          - os: ubuntu-latest
+            event_backend: libev
+            apt: libev-dev
+            brew: libev
+          - os: macos-latest
+            event_backend: libuv
+            apt: ""
+            brew: libuv
+          - os: macos-latest
+            event_backend: libev
+            apt: ""
+            brew: libev
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/http-protocol
+          path: _sib/http-protocol
+
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/event-protocol
+          path: _sib/event-protocol
+
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/event-backend-libuv
+          path: _sib/event-backend-libuv
+
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/event-backend-libev
+          path: _sib/event-backend-libev
+
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/http-encoding-chipz
+          path: _sib/http-encoding-chipz
+
+      - name: Layout siblings
+        shell: bash
+        run: |
+          mkdir -p /tmp/ws
+          cp -a "$GITHUB_WORKSPACE" /tmp/ws/http-backend-async
+          for d in http-protocol event-protocol event-backend-libuv event-backend-libev http-encoding-chipz; do
+            cp -a "$GITHUB_WORKSPACE/_sib/$d" "/tmp/ws/$d"
+          done
+          # event backends expect event-protocol as nested sibling checkout in CI of those repos;
+          # here they sit as peers — also nest for qlfile locals that use ./event-protocol.
+          cp -a /tmp/ws/event-protocol /tmp/ws/event-backend-libuv/event-protocol
+          cp -a /tmp/ws/event-protocol /tmp/ws/event-backend-libev/event-protocol
+
+      - name: Install native event lib (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config ${{ matrix.apt }}
+
+      - name: Install native event lib (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ${{ matrix.brew }}
+          echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      - name: Install Roswell + test
+        working-directory: /tmp/ws/http-backend-async
+        shell: bash
+        env:
+          HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
+        run: |
+          curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          export PATH="$HOME/.roswell/bin:$PATH"
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
+          ros install "sbcl-bin/$SBCL_VERSION"
+          ros use "sbcl-bin/$SBCL_VERSION"
+          ros install qlot
+          qlot install
+          qlot exec ros -S . -e '(asdf:test-system "http-backend-async")'

@@ -1,0 +1,24 @@
+ql rove
+ql cffi
+ql quri
+ql fast-http
+ql babel
+ql alexandria
+ql blackbird
+ql chipz
+ql salza2
+ql trivial-gray-streams
+ql bordeaux-threads
+ql usocket
+# Siblings — CI checkouts + local workspace. Never qlot `github` (rate + /tmp race).
+local http-protocol ../http-protocol
+local event-protocol ../event-protocol
+local http-encoding-chipz ../http-encoding-chipz
+# Event backends selected at test time (matrix).
+local event-backend-libuv ../event-backend-libuv
+local event-backend-libev ../event-backend-libev
+# Optional CE overlays
+local http-encoding-brotli ../http-encoding-brotli
+local http-encoding-zstd ../http-encoding-zstd
+local cl-stack-brotli ../cl-stack-brotli
+local cl-stack-zstd ../cl-stack-zstd

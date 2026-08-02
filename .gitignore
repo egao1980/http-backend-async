@@ -1,0 +1,11 @@
+.qlot/
+*.fasl
+*.dx32fsl
+*.dx64fsl
+*.lx32fsl
+*.lx64fsl
+*.wx32fsl
+*.wx64fsl
+*~
+.DS_Store
+system-index.txt
