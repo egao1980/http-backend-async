@@ -22,17 +22,34 @@
       (babel:octets-to-string out :encoding :utf-8 :errorp nil))))
 
 (defun %default-handler (method path headers body)
+  "httpbin-shaped paths used by requests CE tests (/gzip /deflate)."
   (declare (ignore method headers))
   (cond
     ((string= path "/ok")
      (values 200 '(("content-type" . "text/plain"))
              (babel:string-to-octets "ok")))
     ((string= path "/gzip")
-     (let* ((raw (babel:string-to-octets "hello-gzip"))
+     ;; requests test_decompress_gzip — compressed JSON {"gzipped": true}
+     (let* ((raw (babel:string-to-octets "{\"gzipped\": true}"))
             (gz (encode-content-coding :gzip raw)))
        (values 200
-               '(("content-type" . "text/plain")
+               '(("content-type" . "application/json")
                  ("content-encoding" . "gzip"))
+               gz)))
+    ((string= path "/deflate")
+     (let* ((raw (babel:string-to-octets "{\"deflated\": true}"))
+            (df (encode-content-coding :deflate raw)))
+       (values 200
+               '(("content-type" . "application/json")
+                 ("content-encoding" . "deflate"))
+               df)))
+    ((string= path "/gzip-case")
+     ;; urllib3: Content-Encoding token is case-insensitive
+     (let* ((raw (babel:string-to-octets "{\"gzipped\": true}"))
+            (gz (encode-content-coding :gzip raw)))
+       (values 200
+               '(("content-type" . "application/json")
+                 ("content-encoding" . "GziP"))
                gz)))
     ((string= path "/echo")
      (values 200 '(("content-type" . "application/octet-stream"))

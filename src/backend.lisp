@@ -11,10 +11,11 @@
   (:default-initargs :name "async"))
 
 (defun make-async-backend ()
-  "Load chipz encoding (+ soft br/zstd) and return ASYNC-BACKEND."
+  "Load chipz encoding (+ soft br/zstd/TLS) and return ASYNC-BACKEND."
   (asdf:load-system "http-encoding-chipz")
   (ignore-errors (asdf:load-system "http-encoding-brotli"))
   (ignore-errors (asdf:load-system "http-encoding-zstd"))
+  (ignore-errors (ensure-tls))
   (make-instance 'async-backend))
 
 (defclass async-request-handle ()
@@ -22,6 +23,7 @@
    (io-handle :initform nil :accessor async-request-io-handle)
    (timer-handle :initform nil :accessor async-request-timer-handle)
    (socket :initform nil :accessor async-request-socket)
+   (tls-stream :initform nil :accessor async-request-tls-stream)
    (event-backend :initarg :event-backend :reader async-request-event-backend)
    (event-loop :initarg :event-loop :reader async-request-event-loop)))
 
@@ -33,6 +35,8 @@
         (ignore-errors (cancel eb io)))
       (when-let ((tm (async-request-timer-handle handle)))
         (ignore-errors (cancel eb tm))))
+    (tls-close (async-request-tls-stream handle))
+    (setf (async-request-tls-stream handle) nil)
     (close-socket (async-request-socket handle)))
   handle)
 
@@ -65,11 +69,7 @@
                    (error 'http-connection-error :message "URL missing host")))
          (port (or (quri:uri-port uri)
                    (if (string-equal scheme "https") 443 80))))
-    (when (string-equal scheme "https")
-      (error 'unsupported-operation
-             :operation 'https
-             :message "HTTPS not yet in http-backend-async wave-1 (cleartext HTTP on event-protocol first; TLS next)"))
-    (unless (string-equal scheme "http")
+    (unless (member scheme '("http" "https") :test #'string-equal)
       (error 'http-protocol-error
              :message (format nil "unsupported scheme ~A" scheme)))
     (values host port scheme)))
@@ -86,9 +86,11 @@
          (eb-cb (or error-callback
                     (lambda (c) (error c))))
          (uri (quri:uri (http-request-url request))))
-    (multiple-value-bind (host port) (%uri-host-port uri)
+    (multiple-value-bind (host port scheme) (%uri-host-port uri)
       (multiple-value-bind (event-backend event-loop) (%ensure-event-context)
-        (let* ((handle (make-instance 'async-request-handle
+        (let* ((https (string-equal scheme "https"))
+               (verify (http-client-verify client))
+               (handle (make-instance 'async-request-handle
                                       :event-backend event-backend
                                       :event-loop event-loop))
                (sock (make-nonblocking-tcp))
@@ -109,10 +111,8 @@
           (unless (assoc "host" headers :test #'string-equal)
             (setf headers
                   (acons "host"
-                         (if (or (and (string-equal (quri:uri-scheme uri) "http")
-                                      (= port 80))
-                                 (and (string-equal (quri:uri-scheme uri) "https")
-                                      (= port 443)))
+                         (if (or (and (string-equal scheme "http") (= port 80))
+                                 (and (string-equal scheme "https") (= port 443)))
                              host
                              (format nil "~A:~A" host port))
                          headers)))
@@ -140,6 +140,8 @@
                        (ignore-errors (cancel event-backend io)))
                      (when-let ((tm (async-request-timer-handle handle)))
                        (ignore-errors (cancel event-backend tm)))
+                     (tls-close (async-request-tls-stream handle))
+                     (setf (async-request-tls-stream handle) nil)
                      (close-socket sock)
                      (setf (async-request-socket handle) nil)
                      (handler-case (funcall eb-cb condition)
@@ -151,6 +153,8 @@
                        (ignore-errors (cancel event-backend io)))
                      (when-let ((tm (async-request-timer-handle handle)))
                        (ignore-errors (cancel event-backend tm)))
+                     (tls-close (async-request-tls-stream handle))
+                     (setf (async-request-tls-stream handle) nil)
                      (close-socket sock)
                      (setf (async-request-socket handle) nil)
                      (handler-case (funcall cb res)
@@ -171,6 +175,50 @@
                                      (format nil "HTTP/~A"
                                              (fast-http:http-version http))
                                      :request request))))
+                 (https-exchange ()
+                   "TLS handshake + HTTP on loop thread (run-to-completion)."
+                   (when-let ((io (async-request-io-handle handle)))
+                     (ignore-errors (cancel event-backend io))
+                     (setf (async-request-io-handle handle) nil))
+                   (handler-case
+                       (let ((ssl (make-tls-stream sock host :verify verify)))
+                         (setf (async-request-tls-stream handle) ssl)
+                         (tls-write-all ssl req-octets)
+                         (loop
+                           (when (async-request-canceled-p handle) (return))
+                           (let ((n (tls-read-some ssl recv-buf)))
+                             (cond
+                               ((zerop n)
+                                (funcall parse! #())
+                                (if (funcall finishedp)
+                                    (finish-response)
+                                    (fail (make-condition
+                                           'http-protocol-error
+                                           :message "incomplete HTTPS response")))
+                                (return))
+                               (t
+                                (when (funcall parse! recv-buf :end n)
+                                  (finish-response)
+                                  (return)))))))
+                     (http-error (e) (fail e))
+                     (error (e)
+                       (fail (make-condition 'http-tls-error
+                                             :message (princ-to-string e))))))
+                 (on-connected ()
+                   ;; Drop connect write interest before any further work —
+                   ;; otherwise poll keeps re-entering :connect (libev storm).
+                   (when-let ((io (async-request-io-handle handle)))
+                     (ignore-errors (cancel event-backend io))
+                     (setf (async-request-io-handle handle) nil))
+                   (if https
+                       (progn
+                         (setf phase :tls)
+                         (defer event-backend event-loop #'https-exchange))
+                       (progn
+                         (setf phase :write)
+                         (arm-io :write)
+                         (defer event-backend event-loop
+                           (lambda () (on-io :ok))))))
                  (on-io (status)
                    (when (async-request-canceled-p handle)
                      (return-from on-io nil))
@@ -181,9 +229,10 @@
                    (handler-case
                        (ecase phase
                          (:connect
-                          (setf phase :write)
-                          (arm-io :write)
-                          (on-io :ok))
+                          (on-connected))
+                         (:tls
+                          ;; HTTPS runs via deferred https-exchange; ignore stray IO.
+                          nil)
                          (:write
                           (loop
                             (when (>= wpos (length req-octets))
@@ -201,7 +250,6 @@
                               (cond
                                 ((null n) (return))
                                 ((zerop n)
-                                 ;; peer closed — parse what we have
                                  (funcall parse! #())
                                  (if (funcall finishedp)
                                      (finish-response)
@@ -230,11 +278,7 @@
                   (let ((st (begin-connect sock host port)))
                     (ecase st
                       (:connected
-                       (setf phase :write)
-                       (arm-io :write)
-                       ;; Kick write on next tick (fd may already be writable).
-                       (defer event-backend event-loop
-                         (lambda () (on-io :ok))))
+                       (on-connected))
                       (:pending
                        (arm-io :write)))))))
             handle))))))

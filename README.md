@@ -9,9 +9,11 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
 ## Status (wave-1)
 
 - HTTP/1.1 cleartext over nonblocking TCP (`sb-bsd-sockets`)
+- HTTPS via `cl+ssl` / `cl-stack-ssl`: async TCP connect, then TLS+HTTP
+  run-to-completion on the loop thread (cl+ssl socket-BIO waits)
 - `send-async` + `cancel-request`; facade promises via `http:*-async`
 - Content-Encoding decode (chipz; soft-load br/zstd)
-- HTTPS/TLS: deferred (next slice on `cl-stack-ssl`)
+- Live CE tests: `HTTP_ASYNC_LIVE=1` (default in CI) → httpbingo `/gzip` `/brotli`
 
 ## Use
 

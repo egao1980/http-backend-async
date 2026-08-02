@@ -49,37 +49,72 @@
     (when err (error err))
     result))
 
-(deftest get-ok-lib-matrix
+(defun %body-text (res)
+  (babel:octets-to-string (response-body res) :encoding :utf-8 :errorp nil))
+
+;;; --- requests-shaped local fixture (httpbin paths) ---
+
+(deftest test-http-200-ok-get
+  "requests: TestRequests.test_HTTP_200_OK_GET_ALTERNATIVE (local fixture)."
   (with-http-fixture ()
     (with-async-test (eb el hb)
       (declare (ignore hb))
-      (let* ((url (fixture-url "/ok"))
-             (res (%await-promise (get-async url) eb el)))
+      (let ((res (%await-promise (get-async (fixture-url "/ok")) eb el)))
         (ok (= 200 (response-status res)))
         (ok (equalp (babel:string-to-octets "ok") (response-body res)))))))
 
-(deftest get-gzip-decoded
+(deftest test-decompress-gzip
+  "requests: TestRequests.test_decompress_gzip — body decodes after CE gzip."
   (with-http-fixture ()
     (with-async-test (eb el hb)
       (declare (ignore hb))
-      (let* ((url (fixture-url "/gzip"))
-             (res (%await-promise (get-async url) eb el)))
+      (let* ((res (%await-promise
+                   (get-async (fixture-url "/gzip") :accept-encoding '(:gzip))
+                   eb el))
+             (text (%body-text res)))
         (ok (= 200 (response-status res)))
-        (ok (equalp (babel:string-to-octets "hello-gzip") (response-body res)))
-        (ok (null (response-header res :content-encoding)))))))
+        ;; Our policy: strip CE after decode (stricter than stock requests headers).
+        (ok (null (response-header res :content-encoding)))
+        (ok (search "gzipped" text :test #'char-equal))
+        ;; requests asserts r.content.decode("ascii") succeeds
+        (ok (every (lambda (c) (< (char-code c) 128)) text))))))
 
-(deftest post-echo
+(deftest test-decompress-deflate
+  "urllib3 test_decode_deflate / httpbin /deflate."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let* ((res (%await-promise
+                   (get-async (fixture-url "/deflate") :accept-encoding '(:deflate))
+                   eb el))
+             (text (%body-text res)))
+        (ok (= 200 (response-status res)))
+        (ok (null (response-header res :content-encoding)))
+        (ok (search "deflated" text :test #'char-equal))))))
+
+(deftest test-content-encoding-case-insensitive
+  "urllib3 test_decode_deflate_case_insensitve — CE token case."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let* ((res (%await-promise
+                   (get-async (fixture-url "/gzip-case") :accept-encoding '(:gzip))
+                   eb el))
+             (text (%body-text res)))
+        (ok (= 200 (response-status res)))
+        (ok (search "gzipped" text :test #'char-equal))))))
+
+(deftest test-post-echo
   (with-http-fixture ()
     (with-async-test (eb el hb)
       (declare (ignore hb))
       (let* ((payload (babel:string-to-octets "ping"))
-             (url (fixture-url "/echo"))
              (res (%await-promise
-                   (post-async url :content payload) eb el)))
+                   (post-async (fixture-url "/echo") :content payload) eb el)))
         (ok (= 200 (response-status res)))
         (ok (equalp payload (response-body res)))))))
 
-(deftest cancel-in-flight
+(deftest test-cancel-in-flight
   (with-http-fixture ()
     (with-async-test (eb el hb)
       (let* ((url (fixture-url "/ok"))
@@ -96,8 +131,7 @@
                    (setf canceled t))
                  (stop eb el)))))
         (cancel-request hb handle)
-        ;; Drive a tick so cleanup can settle; request should not complete OK.
         (defer eb el (lambda () (stop eb el)))
         (event-protocol:run eb el :stop-when-idle t)
         (ok (async-request-canceled-p handle))
-        (ok (null canceled)))))) ; cancel-request does not invoke error-callback
+        (ok (null canceled))))))

@@ -12,6 +12,7 @@ concurrency:
 
 env:
   SBCL_VERSION: 2.4.11
+  HTTP_ASYNC_LIVE: "1"
 
 jobs:
   test:
@@ -42,9 +43,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: egao1980/http-protocol
-          # Needs send-async callback contract + http:*-async (egao1980/http-protocol#3).
-          # Flip to main after that PR merges.
-          ref: cursor/async-facade-a88c
           path: _sib/http-protocol
 
       - uses: actions/checkout@v4
@@ -67,36 +65,52 @@ jobs:
           repository: egao1980/http-encoding-chipz
           path: _sib/http-encoding-chipz
 
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/http-encoding-brotli
+          path: _sib/http-encoding-brotli
+
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/cl-stack-brotli
+          path: _sib/cl-stack-brotli
+
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/cl-stack-ssl
+          path: _sib/cl-stack-ssl
+
       - name: Layout siblings
         shell: bash
         run: |
           mkdir -p /tmp/ws
           cp -a "$GITHUB_WORKSPACE" /tmp/ws/http-backend-async
-          for d in http-protocol event-protocol event-backend-libuv event-backend-libev http-encoding-chipz; do
+          for d in http-protocol event-protocol event-backend-libuv event-backend-libev \
+                   http-encoding-chipz http-encoding-brotli cl-stack-brotli cl-stack-ssl; do
             cp -a "$GITHUB_WORKSPACE/_sib/$d" "/tmp/ws/$d"
           done
-          # event backends expect event-protocol as nested sibling checkout in CI of those repos;
-          # here they sit as peers — also nest for qlfile locals that use ./event-protocol.
           cp -a /tmp/ws/event-protocol /tmp/ws/event-backend-libuv/event-protocol
           cp -a /tmp/ws/event-protocol /tmp/ws/event-backend-libev/event-protocol
 
-      - name: Install native event lib (Linux)
+      - name: Install native deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config ${{ matrix.apt }}
+          sudo apt-get install -y build-essential pkg-config libssl-dev libbrotli-dev ${{ matrix.apt }}
 
-      - name: Install native event lib (macOS)
+      - name: Install native deps (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install ${{ matrix.brew }}
+          brew install ${{ matrix.brew }} openssl@3 brotli
           echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Install Roswell + test
         working-directory: /tmp/ws/http-backend-async
         shell: bash
         env:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
+          HTTP_ASYNC_LIVE: "1"
         run: |
           curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           export PATH="$HOME/.roswell/bin:$PATH"
