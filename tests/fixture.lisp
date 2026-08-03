@@ -69,6 +69,30 @@
              '(("location" . "/ok")
                ("content-type" . "text/plain"))
              (babel:string-to-octets "go")))
+    ((string= path "/redirect/2")
+     (values 302
+             '(("location" . "/redirect/1")
+               ("content-type" . "text/plain"))
+             (babel:string-to-octets "go2")))
+    ((string= path "/redirect/set-cookie")
+     ;; Set-Cookie on redirect hop, then final /cookies echoes Cookie.
+     (values 302
+             '(("location" . "/cookies")
+               ("set-cookie" . "redir=1; Path=/")
+               ("content-type" . "text/plain"))
+             (babel:string-to-octets "go")))
+    ((and (>= (length path) 10)
+          (string= (subseq path 0 10) "/absolute/"))
+     ;; /absolute/<port>/ok → absolute Location to same fixture host
+     (let* ((rest (subseq path 10))
+            (slash (position #\/ rest))
+            (port* (subseq rest 0 slash))
+            (target (subseq rest (1+ slash))))
+       (values 302
+               (list (cons "location"
+                           (format nil "http://127.0.0.1:~A/~A" port* target))
+                     (cons "content-type" "text/plain"))
+               (babel:string-to-octets "abs"))))
     (t
      (values 404 '(("content-type" . "text/plain"))
              (babel:string-to-octets "nope")))))

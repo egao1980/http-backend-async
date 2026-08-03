@@ -12,6 +12,7 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
 - HTTPS via `cl+ssl` / `cl-stack-ssl`: usocket connect, then TLS+HTTP
   run-to-completion on the loop thread (cl+ssl socket-BIO waits)
 - `send-async` + `cancel-request`; facade promises via `http:*-async`
+- Cookie-jar (cl-cookie) + redirect follow (`response-history`; 301/302/303→GET)
 - Content-Encoding decode (chipz; soft-load br/zstd)
 - Live CE tests: `HTTP_ASYNC_LIVE=1` (default in CI) → httpbingo `/gzip` `/brotli`
 

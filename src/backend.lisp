@@ -63,17 +63,6 @@
           ((and (consp t*) (getf t* :read)) (float (getf t* :read) 1.0d0))
           (t 30.0))))
 
-(defun %uri-host-port (uri)
-  (let* ((scheme (or (quri:uri-scheme uri) "http"))
-         (host (or (quri:uri-host uri)
-                   (error 'http-connection-error :message "URL missing host")))
-         (port (or (quri:uri-port uri)
-                   (if (string-equal scheme "https") 443 80))))
-    (unless (member scheme '("http" "https") :test #'string-equal)
-      (error 'http-protocol-error
-             :message (format nil "unsupported scheme ~A" scheme)))
-    (values host port scheme)))
-
 (defmethod send ((backend async-backend) client request &key)
   (declare (ignore client request))
   (error 'unsupported-operation
@@ -85,7 +74,13 @@
   (let* ((cb (or callback (lambda (r) (declare (ignore r)))))
          (eb-cb (or error-callback
                     (lambda (c) (error c))))
-         (uri (quri:uri (http-request-url request))))
+         (uri (quri:uri (http-request-url request)))
+         (method (http-request-method request))
+         (max-redirects (or (http-request-max-redirects request)
+                            (http-client-max-redirects client)
+                            5))
+         (redirect-hops 0)
+         (history nil))
     (multiple-value-bind (host port scheme) (%uri-host-port uri)
       (multiple-value-bind (event-backend event-loop) (%ensure-event-context)
         (let* ((https (string-equal scheme "https"))
@@ -97,198 +92,263 @@
                (fd nil)
                (cookie-jar (resolve-cookie-jar client request
                                                :url (http-request-url request)))
-               (headers (%merge-headers (http-client-headers client)
-                                        (http-request-headers request)))
                (ae (%accept-encoding-header
                     (http-request-accept-encoding request)))
+               (headers nil)
+               (body-octets #())
                (phase :connect)
                (wpos 0)
                (req-octets nil)
-               (recv-buf (make-array 65536 :element-type '(unsigned-byte 8))))
-          (when ae
-            (setf headers (acons "accept-encoding" ae
-                                 (remove "accept-encoding" headers
-                                         :key #'car :test #'string-equal))))
-          (unless (assoc "host" headers :test #'string-equal)
-            (setf headers
-                  (acons "host"
-                         (if (or (and (string-equal scheme "http") (= port 80))
-                                 (and (string-equal scheme "https") (= port 443)))
-                             host
-                             (format nil "~A:~A" host port))
-                         headers)))
-          (setf headers (inject-cookie-header headers cookie-jar
-                                              (quri:render-uri uri)))
-          (multiple-value-bind (body ce-header)
-              (%prepare-content (http-request-content request)
-                                (http-request-content-encoding request))
-            (when ce-header
-              (setf headers (acons "content-encoding" ce-header
-                                   (remove "content-encoding" headers
-                                           :key #'car :test #'string-equal))))
-            (setf req-octets (build-request-octets
-                              (http-request-method request) uri headers body)))
-          (multiple-value-bind (http hdrs body finishedp parse!)
-              (make-response-accumulator)
-            (labels
-                ((arm-io (direction)
-                   (unless fd
-                     (error 'http-connection-error :message "arm-io before connect"))
-                   (when-let ((old (async-request-io-handle handle)))
-                     (ignore-errors (cancel event-backend old)))
-                   (setf (async-request-io-handle handle)
-                         (register-io event-backend event-loop fd direction #'on-io)))
-                 (do-connect ()
-                   "usocket connect on the loop thread, then continue."
-                   (handler-case
-                       (progn
-                         (setf sock (tcp-connect host port)
-                               (async-request-socket handle) sock
-                               fd (socket-fd sock))
-                         (unless https
-                           (set-socket-nonblocking sock t))
-                         (on-connected))
-                     (http-error (e) (fail e))
-                     (error (e)
-                       (fail (make-condition 'http-connection-error
-                                             :message (princ-to-string e))))))
-                 (fail (condition)
-                   (unless (async-request-canceled-p handle)
-                     (setf (async-request-canceled-p handle) t)
-                     (when-let ((io (async-request-io-handle handle)))
-                       (ignore-errors (cancel event-backend io)))
-                     (when-let ((tm (async-request-timer-handle handle)))
-                       (ignore-errors (cancel event-backend tm)))
-                     (tls-close (async-request-tls-stream handle))
-                     (setf (async-request-tls-stream handle) nil)
-                     (close-socket sock)
-                     (setf (async-request-socket handle) nil)
-                     (handler-case (funcall eb-cb condition)
-                       (error (e) (warn "error-callback failed: ~A" e)))))
-                 (succeed (res)
-                   (unless (async-request-canceled-p handle)
-                     (setf (async-request-canceled-p handle) t)
-                     (when-let ((io (async-request-io-handle handle)))
-                       (ignore-errors (cancel event-backend io)))
-                     (when-let ((tm (async-request-timer-handle handle)))
-                       (ignore-errors (cancel event-backend tm)))
-                     (tls-close (async-request-tls-stream handle))
-                     (setf (async-request-tls-stream handle) nil)
-                     (close-socket sock)
-                     (setf (async-request-socket handle) nil)
-                     (handler-case (funcall cb res)
-                       (error (e) (warn "callback failed: ~A" e)))))
-                 (finish-response ()
-                   (let* ((final-url (quri:render-uri uri))
-                          (set-cookies (merge-response-cookies
-                                        cookie-jar final-url hdrs)))
-                     (multiple-value-bind (body* headers*)
-                         (apply-response-content-encoding
-                          (coerce body '(simple-array (unsigned-byte 8) (*)))
-                          hdrs
-                          :decompress (http-request-decompress request))
-                       (succeed
-                        (make-instance 'http-response
-                                       :status (fast-http:http-status http)
-                                       :headers headers*
-                                       :body body*
-                                       :url final-url
-                                       :cookies set-cookies
-                                       :http-version
-                                       (format nil "HTTP/~A"
-                                               (fast-http:http-version http))
-                                       :request request)))))
-                 (https-exchange ()
-                   "TLS handshake + HTTP on loop thread (run-to-completion)."
+               (recv-buf (make-array 65536 :element-type '(unsigned-byte 8)))
+               (http nil)
+               (hdrs nil)
+               (body nil)
+               (finishedp nil)
+               (parse! nil))
+          (labels
+              ((build-headers-and-body ()
+                 (setf headers (%merge-headers (http-client-headers client)
+                                               (http-request-headers request)))
+                 (when ae
+                   (setf headers (acons "accept-encoding" ae
+                                        (remove "accept-encoding" headers
+                                                :key #'car :test #'string-equal))))
+                 (unless (assoc "host" headers :test #'string-equal)
+                   (setf headers
+                         (acons "host"
+                                (if (or (and (string-equal scheme "http") (= port 80))
+                                        (and (string-equal scheme "https") (= port 443)))
+                                    host
+                                    (format nil "~A:~A" host port))
+                                headers)))
+                 (setf headers (inject-cookie-header headers cookie-jar
+                                                     (quri:render-uri uri)))
+                 (multiple-value-bind (content ce-header)
+                     (%prepare-content (http-request-content request)
+                                       (http-request-content-encoding request))
+                   (when ce-header
+                     (setf headers (acons "content-encoding" ce-header
+                                          (remove "content-encoding" headers
+                                                  :key #'car :test #'string-equal))))
+                   (setf body-octets (or content #())))
+                 (setf req-octets (build-request-octets method uri headers body-octets)
+                       wpos 0))
+               (reset-parser ()
+                 (multiple-value-bind (h hd b f p)
+                     (make-response-accumulator)
+                   (setf http h hdrs hd body b finishedp f parse! p)))
+               (close-connection ()
+                 (when-let ((io (async-request-io-handle handle)))
+                   (ignore-errors (cancel event-backend io))
+                   (setf (async-request-io-handle handle) nil))
+                 (tls-close (async-request-tls-stream handle))
+                 (setf (async-request-tls-stream handle) nil)
+                 (close-socket sock)
+                 (setf (async-request-socket handle) nil
+                       sock nil
+                       fd nil))
+               (arm-io (direction)
+                 (unless fd
+                   (error 'http-connection-error :message "arm-io before connect"))
+                 (when-let ((old (async-request-io-handle handle)))
+                   (ignore-errors (cancel event-backend old)))
+                 (setf (async-request-io-handle handle)
+                       (register-io event-backend event-loop fd direction #'on-io)))
+               (do-connect ()
+                 (handler-case
+                     (progn
+                       (setf sock (tcp-connect host port)
+                             (async-request-socket handle) sock
+                             fd (socket-fd sock))
+                       (unless https
+                         (set-socket-nonblocking sock t))
+                       (on-connected))
+                   (http-error (e) (fail e))
+                   (error (e)
+                     (fail (make-condition 'http-connection-error
+                                           :message (princ-to-string e))))))
+               (fail (condition)
+                 (unless (async-request-canceled-p handle)
+                   (setf (async-request-canceled-p handle) t)
                    (when-let ((io (async-request-io-handle handle)))
-                     (ignore-errors (cancel event-backend io))
-                     (setf (async-request-io-handle handle) nil))
-                   (handler-case
-                       (let ((ssl (make-tls-stream sock host :verify verify)))
-                         (setf (async-request-tls-stream handle) ssl)
-                         (tls-write-all ssl req-octets)
-                         (loop
-                           (when (async-request-canceled-p handle) (return))
-                           (let ((n (tls-read-some ssl recv-buf)))
-                             (cond
-                               ((zerop n)
-                                (funcall parse! #())
-                                (if (funcall finishedp)
-                                    (finish-response)
-                                    (fail (make-condition
-                                           'http-protocol-error
-                                           :message "incomplete HTTPS response")))
-                                (return))
-                               (t
-                                (when (funcall parse! recv-buf :end n)
+                     (ignore-errors (cancel event-backend io)))
+                   (when-let ((tm (async-request-timer-handle handle)))
+                     (ignore-errors (cancel event-backend tm)))
+                   (close-connection)
+                   (handler-case (funcall eb-cb condition)
+                     (error (e) (warn "error-callback failed: ~A" e)))))
+               (succeed (res)
+                 (unless (async-request-canceled-p handle)
+                   (setf (async-request-canceled-p handle) t)
+                   (when-let ((io (async-request-io-handle handle)))
+                     (ignore-errors (cancel event-backend io)))
+                   (when-let ((tm (async-request-timer-handle handle)))
+                     (ignore-errors (cancel event-backend tm)))
+                   (close-connection)
+                   (handler-case (funcall cb res)
+                     (error (e) (warn "callback failed: ~A" e)))))
+               (make-hop-response (status headers* body* set-cookies final-url
+                                    &key (history-for-final nil))
+                 (make-instance 'http-response
+                                :status status
+                                :headers headers*
+                                :body body*
+                                :url final-url
+                                :cookies set-cookies
+                                :history history-for-final
+                                :http-version
+                                (format nil "HTTP/~A"
+                                        (fast-http:http-version http))
+                                :request request))
+               (follow-redirect (status headers* body* set-cookies final-url)
+                 (let ((location (gethash "location" headers*)))
+                   (cond
+                     ((or (null location) (not (redirect-status-p status)))
+                      (succeed (make-hop-response
+                                status headers* body* set-cookies final-url
+                                :history-for-final (nreverse history))))
+                     ((zerop max-redirects)
+                      ;; allow_redirects=False analogue
+                      (succeed (make-hop-response
+                                status headers* body* set-cookies final-url
+                                :history-for-final (nreverse history))))
+                     ((>= redirect-hops max-redirects)
+                      (fail (make-condition
+                             'http-redirect-error
+                             :message (format nil "exceeded max-redirects (~D)"
+                                              max-redirects))))
+                     (t
+                      (push (make-hop-response status headers* body* set-cookies
+                                               final-url)
+                            history)
+                      (incf redirect-hops)
+                      (handler-case
+                          (let ((next (resolve-redirect-uri uri location)))
+                            (multiple-value-bind (m u h b ho po https?)
+                                (prepare-redirect-hop status next method body-octets
+                                                      headers cookie-jar ae)
+                              (setf method m
+                                    uri u
+                                    headers h
+                                    body-octets b
+                                    host ho
+                                    port po
+                                    https https?
+                                    scheme (if https? "https" "http")
+                                    req-octets (build-request-octets
+                                                method uri headers body-octets)
+                                    wpos 0
+                                    phase :connect)
+                              (close-connection)
+                              (reset-parser)
+                              (defer event-backend event-loop #'do-connect)))
+                        (http-error (e) (fail e))
+                        (error (e)
+                          (fail (make-condition 'http-redirect-error
+                                                :message (princ-to-string e)))))))))
+               (finish-response ()
+                 (let* ((final-url (quri:render-uri uri))
+                        (set-cookies (merge-response-cookies
+                                      cookie-jar final-url hdrs))
+                        (status (fast-http:http-status http)))
+                   (multiple-value-bind (body* headers*)
+                       (apply-response-content-encoding
+                        (coerce body '(simple-array (unsigned-byte 8) (*)))
+                        hdrs
+                        :decompress (http-request-decompress request))
+                     (follow-redirect status headers* body* set-cookies
+                                      final-url))))
+               (https-exchange ()
+                 (when-let ((io (async-request-io-handle handle)))
+                   (ignore-errors (cancel event-backend io))
+                   (setf (async-request-io-handle handle) nil))
+                 (handler-case
+                     (let ((ssl (make-tls-stream sock host :verify verify)))
+                       (setf (async-request-tls-stream handle) ssl)
+                       (tls-write-all ssl req-octets)
+                       (loop
+                         (when (async-request-canceled-p handle) (return))
+                         (let ((n (tls-read-some ssl recv-buf)))
+                           (cond
+                             ((zerop n)
+                              (funcall parse! #())
+                              (if (funcall finishedp)
                                   (finish-response)
-                                  (return)))))))
-                     (http-error (e) (fail e))
-                     (error (e)
-                       (fail (make-condition 'http-tls-error
-                                             :message (princ-to-string e))))))
-                 (on-connected ()
-                   (if https
-                       (progn
-                         (setf phase :tls)
-                         (defer event-backend event-loop #'https-exchange))
-                       (progn
-                         (setf phase :write)
-                         (arm-io :write)
-                         (defer event-backend event-loop
-                           (lambda () (on-io :ok))))))
-                 (on-io (status)
-                   (when (async-request-canceled-p handle)
-                     (return-from on-io nil))
-                   (when (eq status :error)
-                     (return-from on-io
-                       (fail (make-condition 'http-connection-error
-                                             :message "register-io error"))))
-                   (handler-case
-                       (ecase phase
-                         (:tls
-                          nil)
-                         (:write
-                          (loop
-                            (when (>= wpos (length req-octets))
-                              (setf phase :read)
-                              (arm-io :read)
-                              (return))
-                            (let ((n (socket-send-octets
-                                      sock req-octets wpos (length req-octets))))
-                              (cond ((null n) (return))
-                                    ((zerop n) (return))
-                                    (t (incf wpos n))))))
-                         (:read
-                          (loop
-                            (let ((n (socket-recv-octets sock recv-buf)))
-                              (cond
-                                ((null n) (return))
-                                ((zerop n)
-                                 (funcall parse! #())
-                                 (if (funcall finishedp)
-                                     (finish-response)
-                                     (fail (make-condition
-                                            'http-protocol-error
-                                            :message "incomplete HTTP response")))
-                                 (return))
-                                (t
-                                 (when (funcall parse! recv-buf :end n)
-                                   (finish-response)
-                                   (return))))))))
-                     (http-error (e) (fail e))
-                     (error (e)
-                       (fail (make-condition 'http-connection-error
-                                             :message (princ-to-string e)))))))
-              (with-event-backend (event-backend)
-                (with-event-loop-var (event-loop)
-                  (setf (async-request-timer-handle handle)
-                        (sleep* event-backend event-loop
-                                (%timeout-seconds request client)
-                                :callback
-                                (lambda ()
                                   (fail (make-condition
-                                         'http-timeout-error
-                                         :message "request timed out")))))
-                  (defer event-backend event-loop #'do-connect))))
+                                         'http-protocol-error
+                                         :message "incomplete HTTPS response")))
+                              (return))
+                             (t
+                              (when (funcall parse! recv-buf :end n)
+                                (finish-response)
+                                (return)))))))
+                   (http-error (e) (fail e))
+                   (error (e)
+                     (fail (make-condition 'http-tls-error
+                                           :message (princ-to-string e))))))
+               (on-connected ()
+                 (if https
+                     (progn
+                       (setf phase :tls)
+                       (defer event-backend event-loop #'https-exchange))
+                     (progn
+                       (setf phase :write)
+                       (arm-io :write)
+                       (defer event-backend event-loop
+                         (lambda () (on-io :ok))))))
+               (on-io (status)
+                 (when (async-request-canceled-p handle)
+                   (return-from on-io nil))
+                 (when (eq status :error)
+                   (return-from on-io
+                     (fail (make-condition 'http-connection-error
+                                           :message "register-io error"))))
+                 (handler-case
+                     (ecase phase
+                       (:tls nil)
+                       (:write
+                        (loop
+                          (when (>= wpos (length req-octets))
+                            (setf phase :read)
+                            (arm-io :read)
+                            (return))
+                          (let ((n (socket-send-octets
+                                    sock req-octets wpos (length req-octets))))
+                            (cond ((null n) (return))
+                                  ((zerop n) (return))
+                                  (t (incf wpos n))))))
+                       (:read
+                        (loop
+                          (let ((n (socket-recv-octets sock recv-buf)))
+                            (cond
+                              ((null n) (return))
+                              ((zerop n)
+                               (funcall parse! #())
+                               (if (funcall finishedp)
+                                   (finish-response)
+                                   (fail (make-condition
+                                          'http-protocol-error
+                                          :message "incomplete HTTP response")))
+                               (return))
+                              (t
+                               (when (funcall parse! recv-buf :end n)
+                                 (finish-response)
+                                 (return))))))))
+                   (http-error (e) (fail e))
+                   (error (e)
+                     (fail (make-condition 'http-connection-error
+                                           :message (princ-to-string e)))))))
+            (build-headers-and-body)
+            (reset-parser)
+            (with-event-backend (event-backend)
+              (with-event-loop-var (event-loop)
+                (setf (async-request-timer-handle handle)
+                      (sleep* event-backend event-loop
+                              (%timeout-seconds request client)
+                              :callback
+                              (lambda ()
+                                (fail (make-condition
+                                       'http-timeout-error
+                                       :message "request timed out")))))
+                (defer event-backend event-loop #'do-connect)))
             handle))))))

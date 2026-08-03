@@ -2,6 +2,17 @@
 
 ;;; HTTP/1.1 request build + fast-http response parse.
 
+(defun %uri-host-port (uri)
+  (let* ((scheme (or (quri:uri-scheme uri) "http"))
+         (host (or (quri:uri-host uri)
+                   (error 'http-connection-error :message "URL missing host")))
+         (port (or (quri:uri-port uri)
+                   (if (string-equal scheme "https") 443 80))))
+    (unless (member scheme '("http" "https") :test #'string-equal)
+      (error 'http-protocol-error
+             :message (format nil "unsupported scheme ~A" scheme)))
+    (values host port scheme)))
+
 (defun %header-alist (headers)
   (loop for pair in headers
         for name = (string-downcase
