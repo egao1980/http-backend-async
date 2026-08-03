@@ -16,6 +16,8 @@ env:
   CL_REPOSITORY_REF: "main"
   CL_STACK_SSL_VERSION: "3.4.1"
   HTTP_ASYNC_LIVE: "1"
+  # Override until http-protocol#9 is merged + OCI 0.1.0 republished.
+  HTTP_PROTOCOL_REF: "cursor/http-body-streams-a88c"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
@@ -40,6 +42,13 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout http-protocol sibling
+        uses: actions/checkout@v4
+        with:
+          repository: egao1980/http-protocol
+          ref: ${{ env.HTTP_PROTOCOL_REF }}
+          path: http-protocol
 
       - uses: actions/checkout@v4
         with:
@@ -85,7 +94,7 @@ jobs:
         env:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
         run: |
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
+          export CL_SOURCE_REGISTRY="$(pwd)/http-protocol/:$(pwd)//:$(pwd)/.cl-repository//:"
           ros -l scripts/ci-install.lisp -q
 
       - name: Stage OpenSSL overlay for test process
@@ -124,5 +133,5 @@ jobs:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
           HTTP_ASYNC_LIVE: "1"
         run: |
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
+          export CL_SOURCE_REGISTRY="$(pwd)/http-protocol/:$(pwd)//:$(pwd)/.cl-repository//:"
           ros -l scripts/ci-test.lisp -q

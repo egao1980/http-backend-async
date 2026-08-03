@@ -90,8 +90,19 @@
             (write-string text out))
           (format t "~&; ci: patched ~a~%" setup))))))
 
+(defun ci-use-sibling-http-protocol-p ()
+  (probe-file (merge-pathnames "http-protocol/http-protocol.asd"
+                               (uiop:getcwd))))
+
+(defun ci-register-sibling-http-protocol ()
+  (let ((dir (truename (merge-pathnames "http-protocol/" (uiop:getcwd)))))
+    (format t "~&; ci: sibling http-protocol → ~a~%" dir)
+    (pushnew dir asdf:*central-registry* :test #'equal)
+    dir))
+
 (let* ((backend (string-downcase (or (uiop:getenv "HTTP_ASYNC_EVENT_BACKEND") "libuv")))
        (cl-stack-ssl-version (or (uiop:getenv "CL_STACK_SSL_VERSION") "3.4.1"))
+       (sibling-p (ci-use-sibling-http-protocol-p))
        (event-sys (cond ((string= backend "libuv") "event-backend-libuv")
                         ((string= backend "libev") "event-backend-libev")
                         (t (error "Unknown HTTP_ASYNC_EVENT_BACKEND: ~a" backend)))))
@@ -100,7 +111,10 @@
    (lambda ()
      (ci-install "cl-plus-ssl" :version "latest")
      ;; All GHCR pulls before any ql:quickload / ASDF load.
-     (ci-fetch "http-protocol" :version "0.1.0")
+     (if sibling-p
+         ;; PR chain: prefer git checkout over stale OCI http-protocol:0.1.0
+         (ci-register-sibling-http-protocol)
+         (ci-fetch "http-protocol" :version "0.1.0"))
      (ci-fetch "http-encoding-chipz" :version "0.1.0")
      (ci-fetch "http-encoding-brotli" :version "0.1.0")
      (ci-fetch "cl-stack-brotli" :version "1.2.0")
@@ -115,7 +129,8 @@
      (ci-patch-stack-ssl cl-stack-ssl-version)
      ;; QL only after OCI HTTPS is done (image will be discarded before tests).
      (dolist (n '("rove" "fast-http" "babel" "usocket" "bordeaux-threads"
-                  "blackbird" "trivial-gray-streams" "cl-cookie" "cl-unicode"))
+                  "blackbird" "trivial-gray-streams" "cl-cookie" "cl-unicode"
+                  "cl-base64"))
        (unless (or (ci-on-disk-p n) (asdf:find-system n nil))
          (format t "~&; ci: ql fallback ~a~%" n)
          (ql:quickload n :silent t))))))
