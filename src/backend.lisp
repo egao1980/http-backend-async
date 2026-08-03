@@ -125,8 +125,11 @@
                (socks-wpos 0)
                (socks-in (make-array 0 :element-type '(unsigned-byte 8)
                                        :adjustable t :fill-pointer 0))
-               (keep-alive-p (not (null pool))))
-          (declare (ignorable pool-key*))
+               ;; Keep-alive only once POOL-ACQUIRE/RELEASE is wired for sockets.
+               ;; Advertising Connection: keep-alive without reuse hung want-stream
+               ;; tests (worker blocked; sleep* stop unreliable under backpressure).
+               (keep-alive-p nil))
+          (declare (ignorable pool pool-key*))
           (when proxy-url
             (when (eq proxy-url :system)
               (error 'unsupported-operation

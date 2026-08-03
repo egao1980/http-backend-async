@@ -18,4 +18,6 @@
            #:*event-backend-maker*
            #:*async-body-queue-limit*
            #:async-request-handle
-           #:async-request-canceled-p))
+           #:async-request-canceled-p
+           #:lru-connection-pool
+           #:make-lru-connection-pool))

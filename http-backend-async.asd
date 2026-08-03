@@ -18,6 +18,7 @@
   :serial t
   :pathname "src"
   :components ((:file "package")
+               (:file "pool")
                (:file "socket")
                (:file "socks")
                (:file "async-body-stream")
@@ -34,6 +35,7 @@
   :serial t
   :components ((:file "package")
                (:file "fixture")
+               (:file "pool-test")
                (:file "socks-test")
                (:file "backend-test")
                (:file "live-test"))
