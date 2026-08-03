@@ -25,7 +25,7 @@
                         out)))))))
 
 (let* ((name "http-backend-async")
-       (version (env "PKG_VERSION" "0.1.0"))
+       (version (env "PKG_VERSION" "0.1.1"))
        (source-dir (uiop:ensure-directory-pathname
                     (env "PKG_SOURCE_DIR" (namestring (uiop:getcwd)))))
        (_ (sync-asdf-version! source-dir version))
