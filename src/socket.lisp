@@ -208,7 +208,7 @@ Returns NIL if connect still pending (spurious wakeup)."
   #-sbcl
   (progn
     (set-socket-nonblocking usock t)
-    t)
+    t))
 
 (defun socket-send-octets (usock octets start end)
   "Write OCTETS[START,END). Returns bytes sent, or NIL if would-block."

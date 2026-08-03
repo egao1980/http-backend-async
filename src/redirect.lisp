@@ -34,7 +34,9 @@
                              accept-encoding-header)
   "After Location resolve: return (values method uri headers body host port https)."
   (let* ((new-method (if (redirect-preserves-method-p status) method :get))
-         (new-body (if (redirect-preserves-method-p status) body-octets #()))
+         (new-body (if (redirect-preserves-method-p status)
+                       body-octets
+                       (make-array 0 :element-type '(unsigned-byte 8))))
          (headers (copy-list headers)))
     (multiple-value-bind (host port scheme) (%uri-host-port uri)
       (setf headers (remove "host" headers :key #'car :test #'string-equal)
