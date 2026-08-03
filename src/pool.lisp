@@ -99,3 +99,25 @@
 (setf http-protocol:*connection-pool-constructor*
       (lambda (&key (max-size 8))
         (make-lru-connection-pool :max-size max-size)))
+
+(defun response-keeps-alive-p (headers &optional (http-version 1.1))
+  "T when the response allows connection reuse (HTTP/1.1 default keep-alive)."
+  (let* ((raw (or (and (hash-table-p headers) (gethash "connection" headers)) ""))
+         (close-p nil)
+         (ka-p nil))
+    (loop for start = 0 then (1+ pos)
+          for pos = (position #\, raw :start start)
+          for tok = (string-trim '(#\Space #\Tab #\Return #\Newline)
+                                 (subseq raw start (or pos (length raw))))
+          when (plusp (length tok))
+            do (cond
+                 ((string-equal tok "close") (setf close-p t))
+                 ((string-equal tok "keep-alive") (setf ka-p t)))
+          while pos)
+    (cond
+      (close-p nil)
+      (ka-p t)
+      (t (let ((v (if (numberp http-version)
+                      http-version
+                      (ignore-errors (read-from-string (string http-version))))))
+           (and v (>= (float v 1.0d0) 1.1d0)))))))

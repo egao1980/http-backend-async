@@ -21,6 +21,9 @@
            #:async-request-canceled-p
            #:lru-connection-pool
            #:make-lru-connection-pool
+           #:async-pooled-connection
+           #:make-async-pooled-connection
+           #:response-keeps-alive-p
            #:build-connect-request-octets
            #:connect-response-ok-p
            #:proxy-authorization-value))

@@ -33,3 +33,38 @@
     (let ((p (ensure-default-connection-pool :max-size 4)))
       (ok (typep p 'lru-connection-pool))
       (ok (eq p http-protocol:*default-connection-pool*)))))
+
+(deftest response-keeps-alive-parse
+  (let ((ht (make-hash-table :test #'equal)))
+    (setf (gethash "connection" ht) "keep-alive")
+    (ok (response-keeps-alive-p ht 1.1))
+    (setf (gethash "connection" ht) "close")
+    (ok (not (response-keeps-alive-p ht 1.1)))
+    (remhash "connection" ht)
+    (ok (response-keeps-alive-p ht 1.1))
+    (ok (not (response-keeps-alive-p ht 1.0)))))
+
+(deftest fixture-pool-reuses-tcp
+  "Two GETs with keep-alive fixture → one TCP accept, two HTTP requests."
+  (let ((http-protocol:*default-connection-pool* nil))
+    (with-http-fixture
+        ((lambda (method path headers body)
+           (declare (ignore method headers body))
+           (values 200
+                   '(("content-type" . "text/plain"))
+                   (babel:string-to-octets path)))
+         :keep-alive t)
+      (with-async-test (eb el hb)
+        (let* ((pool (make-lru-connection-pool :max-size 4))
+               (client (make-http-client hb :pool pool)))
+          (let ((r1 (%await-promise
+                     (get-async (fixture-url "/a") :client client) eb el)))
+            (ok (= 200 (response-status r1))))
+          (let ((r2 (%await-promise
+                     (get-async (fixture-url "/b") :client client) eb el)))
+            (ok (= 200 (response-status r2)))
+            (ok (string= "/b" (babel:octets-to-string (response-body r2)
+                                                      :encoding :utf-8))))
+          (ok (= 1 *fixture-accept-count*))
+          (ok (= 2 *fixture-request-count*))
+          (pool-clear pool))))))

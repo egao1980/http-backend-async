@@ -9,6 +9,12 @@
   "Function (method path headers body) → (values status header-alist body-octets)")
 (defvar *fixture-last-request-target* nil
   "Raw request-target from the last fixture request (origin- or absolute-form).")
+(defvar *fixture-keep-alive* nil
+  "When T, respond with Connection: keep-alive and accept pipelined/reuse.")
+(defvar *fixture-accept-count* 0
+  "Number of accepted TCP clients (for connection-pool reuse tests).")
+(defvar *fixture-request-count* 0
+  "Number of HTTP requests served.")
 
 ;;; Shared async test harness (must load before other test files that use it).
 
@@ -251,6 +257,7 @@
           (multiple-value-bind (status hdrs resp-body)
               (funcall (or *fixture-handler* #'%default-handler)
                        method path (nreverse headers) body)
+            (incf *fixture-request-count*)
             (let* ((body* (or resp-body #()))
                    (hdr-str
                     (with-output-to-string (s)
@@ -260,12 +267,14 @@
                       (unless (assoc "content-length" hdrs :test #'string-equal)
                         (format s "Content-Length: ~D~C~C" (length body*)
                                 #\Return #\Newline))
-                      (format s "Connection: close~C~C~C~C"
+                      (format s "Connection: ~A~C~C~C~C"
+                              (if *fixture-keep-alive* "keep-alive" "close")
                               #\Return #\Newline #\Return #\Newline)))
                    (head (babel:string-to-octets hdr-str)))
               (write-sequence head stream)
               (write-sequence body* stream)
-              (force-output stream)))))
+              (force-output stream)
+              *fixture-keep-alive*))))
     (error () nil)))
 
 (defun split-sequence (delimiter string)
@@ -274,10 +283,14 @@
         collect (subseq string start (or pos (length string)))
         while pos))
 
-(defun start-http-fixture (&key (host "127.0.0.1") (handler nil))
+(defun start-http-fixture (&key (host "127.0.0.1") (handler nil) (keep-alive nil))
   (when *fixture-thread*
     (stop-http-fixture))
-  (setf *fixture-handler* handler)
+  ;; SETF (not dynamic bind): fixture thread must see the same value.
+  (setf *fixture-handler* handler
+        *fixture-keep-alive* keep-alive
+        *fixture-accept-count* 0
+        *fixture-request-count* 0)
   (let* ((server (usocket:socket-listen host 0
                                         :reuseaddress t
                                         :element-type '(unsigned-byte 8)))
@@ -292,9 +305,13 @@
                (handler-case
                    (let ((client (usocket:socket-accept server
                                                         :element-type '(unsigned-byte 8))))
+                     (incf *fixture-accept-count*)
                      (unwind-protect
-                          (%serve-one (usocket:socket-stream client))
-                       (usocket:socket-close client)))
+                          (let ((stream (usocket:socket-stream client)))
+                            (loop
+                              (unless (%serve-one stream) (return))
+                              (unless *fixture-keep-alive* (return))))
+                       (ignore-errors (usocket:socket-close client))))
                  (error ()
                    (when (null *fixture-socket*) (return))))))
            :name "http-backend-async-fixture"))
@@ -304,7 +321,8 @@
   (let ((s *fixture-socket*))
     (setf *fixture-socket* nil
           *fixture-port* nil
-          *fixture-handler* nil)
+          *fixture-handler* nil
+          *fixture-keep-alive* nil)
     (when s (ignore-errors (usocket:socket-close s)))
     (when (and *fixture-thread* (bt:thread-alive-p *fixture-thread*))
       (ignore-errors (bt:destroy-thread *fixture-thread*))
@@ -313,8 +331,8 @@
 (defun fixture-url (path)
   (format nil "http://127.0.0.1:~A~A" *fixture-port* path))
 
-(defmacro with-http-fixture ((&optional handler) &body body)
+(defmacro with-http-fixture ((&optional handler &key keep-alive) &body body)
   `(progn
-     (start-http-fixture :handler ,handler)
+     (start-http-fixture :handler ,handler :keep-alive ,keep-alive)
      (unwind-protect (progn ,@body)
        (stop-http-fixture))))

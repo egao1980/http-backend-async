@@ -20,6 +20,31 @@
   (ignore-errors (ensure-tls))
   (make-instance 'async-backend))
 
+(defclass async-pooled-connection ()
+  ((socket :initarg :socket :accessor async-conn-socket)
+   (tls :initarg :tls :accessor async-conn-tls :initform nil)
+   (https :initarg :https :accessor async-conn-https-p :initform nil)
+   (alive :initform t :accessor async-conn-alive-p)))
+
+(defun make-async-pooled-connection (socket &key tls https)
+  (make-instance 'async-pooled-connection
+                 :socket socket :tls tls :https https))
+
+(defmethod connection-alive-p ((c async-pooled-connection))
+  (and (async-conn-alive-p c)
+       (async-conn-socket c)
+       (ignore-errors
+         (open-stream-p (usocket:socket-stream (async-conn-socket c))))))
+
+(defmethod pool-discard ((pool lru-connection-pool) (c async-pooled-connection))
+  (declare (ignore pool))
+  (setf (async-conn-alive-p c) nil)
+  (tls-close (async-conn-tls c))
+  (setf (async-conn-tls c) nil)
+  (close-socket (async-conn-socket c))
+  (setf (async-conn-socket c) nil)
+  nil)
+
 (defclass async-request-handle ()
   ((canceled-p :initform nil :accessor async-request-canceled-p)
    (io-handle :initform nil :accessor async-request-io-handle)
@@ -135,11 +160,11 @@
                (socks-wpos 0)
                (socks-in (make-array 0 :element-type '(unsigned-byte 8)
                                        :adjustable t :fill-pointer 0))
-               ;; Keep-alive only once POOL-ACQUIRE/RELEASE is wired for sockets.
-               ;; Advertising Connection: keep-alive without reuse hung want-stream
-               ;; tests (worker blocked; sleep* stop unreliable under backpressure).
-               (keep-alive-p nil))
-          (declare (ignorable pool pool-key*))
+               ;; Pool present → advertise keep-alive; release only when the
+               ;; response also allows reuse (fixture often sends Connection: close).
+               (keep-alive-p (not (null pool)))
+               (reuse-ok-p nil)
+               (from-pool-p nil))
           (when proxy-url
             (multiple-value-bind (pscheme phost pport puser ppass)
                 (parse-proxy-uri proxy-url)
@@ -273,15 +298,54 @@
                                   (eq phase :reconnect))
                         (arm-io :read)
                         (do-read))))))
-               (complete-request ()
-                 "Stop IO/timer and close socket (after full response or stream EOF)."
+               (stop-io-and-timer ()
+                 (when-let ((io (async-request-io-handle handle)))
+                   (ignore-errors (cancel event-backend io))
+                   (setf (async-request-io-handle handle) nil))
+                 (when-let ((tm (async-request-timer-handle handle)))
+                   (ignore-errors (cancel event-backend tm))
+                   (setf (async-request-timer-handle handle) nil))
+                 (setf io-dir nil))
+               (close-connection ()
+                 (stop-io-and-timer)
+                 (tls-close tls)
+                 (setf tls nil
+                       (async-request-tls-stream handle) nil)
+                 (close-socket sock)
+                 (setf (async-request-socket handle) nil
+                       sock nil
+                       fd nil
+                       from-pool-p nil
+                       reuse-ok-p nil))
+               (detach-connection ()
+                 "Hand socket/TLS to a pool entry without closing."
+                 (stop-io-and-timer)
+                 (let ((conn (make-async-pooled-connection
+                              sock :tls tls :https https)))
+                   (setf sock nil
+                         tls nil
+                         fd nil
+                         (async-request-socket handle) nil
+                         (async-request-tls-stream handle) nil
+                         from-pool-p nil)
+                   conn))
+               (release-or-close (&key (force-close nil))
+                 "Return connection to POOL when keep-alive+reuse; else close."
+                 (cond
+                   ((or force-close
+                        (null pool)
+                        (null sock)
+                        (not keep-alive-p)
+                        (not reuse-ok-p))
+                    (close-connection))
+                   (t
+                    (let ((conn (detach-connection)))
+                      (pool-release pool pool-key* conn)))))
+               (complete-request (&key (force-close nil))
+                 "Stop IO/timer; pool or close after full response / stream EOF."
                  (unless (async-request-canceled-p handle)
                    (setf (async-request-canceled-p handle) t)
-                   (when-let ((io (async-request-io-handle handle)))
-                     (ignore-errors (cancel event-backend io)))
-                   (when-let ((tm (async-request-timer-handle handle)))
-                     (ignore-errors (cancel event-backend tm)))
-                   (close-connection)))
+                   (release-or-close :force-close force-close)))
                (will-follow-redirect-p (status headers*)
                  (let ((location (gethash "location" headers*)))
                    (and location
@@ -293,7 +357,11 @@
                  (let* ((final-url (quri:render-uri uri))
                         (set-cookies (merge-response-cookies
                                       cookie-jar final-url headers*)))
-                   (setf body-feed
+                   (setf reuse-ok-p
+                         (and keep-alive-p
+                              (response-keeps-alive-p
+                               headers* (fast-http:http-version http)))
+                         body-feed
                          (make-async-body-input-stream
                           :on-space #'unpause-read)
                          streaming-final-p t)
@@ -330,19 +398,21 @@
                          set-body-fn set-body
                          body-feed nil
                          streaming-final-p nil
-                         read-paused-p nil)))
-               (close-connection ()
-                 (when-let ((io (async-request-io-handle handle)))
-                   (ignore-errors (cancel event-backend io))
-                   (setf (async-request-io-handle handle) nil))
-                 (tls-close tls)
-                 (setf tls nil
-                       (async-request-tls-stream handle) nil)
-                 (close-socket sock)
-                 (setf (async-request-socket handle) nil
-                       sock nil
-                       fd nil
-                       io-dir nil))
+                         read-paused-p nil
+                         reuse-ok-p nil)))
+               (adopt-pooled (conn)
+                 "Reuse CONN for the next HTTP request (skip TCP/TLS/proxy)."
+                 (setf sock (async-conn-socket conn)
+                       tls (async-conn-tls conn)
+                       https (async-conn-https-p conn)
+                       (async-request-socket handle) sock
+                       (async-request-tls-stream handle) tls
+                       fd (socket-fd sock)
+                       from-pool-p t
+                       phase :write
+                       io-dir nil)
+                 (arm-io :write)
+                 (next-tick (lambda () (on-io :ok))))
                (next-tick (fn)
                  ;; Prefer sleep* 0 over defer/idle: libev idle is starved while a
                  ;; socket remains writable under :read-write interest.
@@ -370,25 +440,31 @@
                            (next-tick #'register))
                          (register)))))
                (do-connect ()
-                 (handler-case
-                     (multiple-value-bind (usock status)
-                         (tcp-connect-nb connect-host connect-port)
-                       (setf sock usock
-                             (async-request-socket handle) sock
-                             fd (socket-fd sock)
-                             phase :connecting)
-                       (ecase status
-                         (:connected (on-connected))
-                         (:pending (arm-io :write))))
-                   (http-error (e) (fail e))
-                   (error (e)
-                     (fail (make-condition 'http-connection-error
-                                           :message (princ-to-string e))))))
+                 (let ((conn (and pool (pool-acquire pool pool-key*))))
+                   (cond
+                     (conn
+                      (adopt-pooled conn))
+                     (t
+                      (handler-case
+                          (multiple-value-bind (usock status)
+                              (tcp-connect-nb connect-host connect-port)
+                            (setf sock usock
+                                  (async-request-socket handle) sock
+                                  fd (socket-fd sock)
+                                  from-pool-p nil
+                                  phase :connecting)
+                            (ecase status
+                              (:connected (on-connected))
+                              (:pending (arm-io :write))))
+                        (http-error (e) (fail e))
+                        (error (e)
+                          (fail (make-condition 'http-connection-error
+                                                :message (princ-to-string e)))))))))
                (fail (condition)
                  (when body-feed
                    (async-body-fail body-feed condition))
                  (unless (async-request-canceled-p handle)
-                   (complete-request)
+                   (complete-request :force-close t)
                    (unless headers-delivered-p
                      (handler-case (funcall eb-cb condition)
                        (error (e) (warn "error-callback failed: ~A" e))))))
@@ -421,10 +497,18 @@
                  (let ((location (gethash "location" headers*)))
                    (cond
                      ((or (null location) (not (redirect-status-p status)))
+                      (setf reuse-ok-p
+                            (and keep-alive-p
+                                 (response-keeps-alive-p
+                                  headers* (fast-http:http-version http))))
                       (succeed (make-hop-response
                                 status headers* body* set-cookies final-url
                                 :history-for-final (nreverse history))))
                      ((zerop max-redirects)
+                      (setf reuse-ok-p
+                            (and keep-alive-p
+                                 (response-keeps-alive-p
+                                  headers* (fast-http:http-version http))))
                       (succeed (make-hop-response
                                 status headers* body* set-cookies final-url
                                 :history-for-final (nreverse history))))
@@ -438,6 +522,10 @@
                                                final-url)
                             history)
                       (incf redirect-hops)
+                      (setf reuse-ok-p
+                            (and keep-alive-p
+                                 (response-keeps-alive-p
+                                  headers* (fast-http:http-version http))))
                       (handler-case
                           (let ((next (resolve-redirect-uri uri location)))
                             (when (and chunked-p
@@ -465,13 +553,17 @@
                                                 :absolute-p proxied-http-p
                                                 :keep-alive keep-alive-p)
                                     wpos 0
-                                    phase :reconnect)
+                                    phase :reconnect
+                                    pool-key* (pool-key scheme host port
+                                                        :proxy proxy-url))
                               (reset-parser)
                               (next-tick
                                (lambda ()
                                  (unless (async-request-canceled-p handle)
-                                   (close-connection)
-                                   (setf io-dir nil)
+                                   ;; Prefer pool release over hard close when
+                                   ;; the redirect hop can reuse the socket.
+                                   (release-or-close)
+                                   (setf (async-request-canceled-p handle) nil)
                                    (do-connect))))))
                         (http-error (e) (fail e))
                         (error (e)
