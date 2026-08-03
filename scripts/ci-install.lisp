@@ -38,6 +38,7 @@
          (cl-repo:load-system name)))))
 
 (let* ((backend (string-downcase (or (uiop:getenv "HTTP_ASYNC_EVENT_BACKEND") "libuv")))
+       (cl-stack-ssl-version (or (uiop:getenv "CL_STACK_SSL_VERSION") "3.4.1"))
        (event-sys (cond ((string= backend "libuv") "event-backend-libuv")
                         ((string= backend "libev") "event-backend-libev")
                         (t (error "Unknown HTTP_ASYNC_EVENT_BACKEND: ~a" backend)))))
@@ -45,10 +46,10 @@
   (call-with-ci-muffles
    (lambda ()
      (ci-install "cl-plus-ssl" :version "latest")
-     (ci-install "cl-stack-ssl" :version "3.4.1")
+     (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)
      (let ((setup (probe-file
                    (merge-pathnames
-                    "cl-stack-ssl/3.4.1/src/setup.lisp"
+                    (format nil "cl-stack-ssl/~a/src/setup.lisp" cl-stack-ssl-version)
                     (cl-repository-client/installer:systems-root)))))
        (when setup
          (let* ((text (uiop:read-file-string setup))
