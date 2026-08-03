@@ -14,9 +14,8 @@ env:
   SBCL_VERSION: 2.4.11
   ROSWELL_VERSION: "26.02.116"
   CL_REPOSITORY_REF: "main"
-  CL_STACK_SSL_VERSION: "3.4.1"
+  # CL_STACK_SSL_VERSION unset → ci-install.lisp resolves newest tag → GITHUB_ENV
   HTTP_ASYNC_LIVE: "1"
-  HTTP_PROTOCOL_VERSION: "0.1.0"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
