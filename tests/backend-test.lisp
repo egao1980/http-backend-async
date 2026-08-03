@@ -160,3 +160,66 @@
                      (text (%body-text res2)))
                 (ok (= 200 (response-status res2)))
                 (ok (search "session=abc" text))))))))))
+
+(deftest test-redirect-follow
+  "requests: follow 302 → final 200; history has the redirect hop."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let ((res (%await-promise (get-async (fixture-url "/redirect/1")) eb el)))
+        (ok (= 200 (response-status res)))
+        (ok (equalp (babel:string-to-octets "ok") (response-body res)))
+        (ok (= 1 (length (response-history res))))
+        (ok (= 302 (response-status (first (response-history res)))))))))
+
+(deftest test-redirect-chain
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let ((res (%await-promise (get-async (fixture-url "/redirect/2")) eb el)))
+        (ok (= 200 (response-status res)))
+        (ok (= 2 (length (response-history res))))))))
+
+(deftest test-redirect-max-zero
+  "max-redirects 0 → return 302, empty history."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let ((res (%await-promise
+                  (get-async (fixture-url "/redirect/1") :max-redirects 0)
+                  eb el)))
+        (ok (= 302 (response-status res)))
+        (ok (null (response-history res)))))))
+
+(deftest test-redirect-exceeded
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (ok (signals
+           (%await-promise
+            (get-async (fixture-url "/redirect/2") :max-redirects 1)
+            eb el)
+           'http-redirect-error)))))
+
+(deftest test-redirect-set-cookie
+  "Set-Cookie on redirect hop is sent to the final URL."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (http:with-client (client)
+        (let* ((res (%await-promise
+                     (get-async (fixture-url "/redirect/set-cookie")
+                                :client client)
+                     eb el))
+               (text (%body-text res)))
+          (ok (= 200 (response-status res)))
+          (ok (search "redir=1" text)))))))
+
+(deftest test-redirect-absolute
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let* ((url (fixture-url (format nil "/absolute/~A/ok" *fixture-port*)))
+             (res (%await-promise (get-async url) eb el)))
+        (ok (= 200 (response-status res)))
+        (ok (equalp (babel:string-to-octets "ok") (response-body res)))))))

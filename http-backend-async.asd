@@ -10,6 +10,7 @@
                "fast-http"
                "babel"
                "alexandria"
+               "cffi"
                "usocket"
                "cl+ssl")
   :serial t
@@ -17,6 +18,7 @@
   :components ((:file "package")
                (:file "socket")
                (:file "http1")
+               (:file "redirect")
                (:file "tls")
                (:file "backend"))
   :in-order-to ((test-op (test-op "http-backend-async/tests"))))

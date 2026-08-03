@@ -8,10 +8,13 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
 
 ## Status (wave-1)
 
-- HTTP/1.1 over portable **usocket** TCP (FD → `event-protocol:register-io`)
-- HTTPS via `cl+ssl` / `cl-stack-ssl`: usocket connect, then TLS+HTTP
-  run-to-completion on the loop thread (cl+ssl socket-BIO waits)
+- HTTP/1.1 over portable **usocket** TCP (nonblocking connect on SBCL →
+  FD → `event-protocol:register-io` `:read-write`)
+- HTTPS via `cl+ssl` / `cl-stack-ssl` socket-BIO: `SSL_connect` /
+  `SSL_read` / `SSL_write` pumped with `WANT_READ`/`WANT_WRITE` on the
+  event loop (no blocking `ensure-ssl-funcall` / MemoryBIO)
 - `send-async` + `cancel-request`; facade promises via `http:*-async`
+- Cookie-jar (cl-cookie) + redirect follow (`response-history`; 301/302/303→GET)
 - Content-Encoding decode (chipz; soft-load br/zstd)
 - Live CE tests: `HTTP_ASYNC_LIVE=1` (default in CI) → httpbingo `/gzip` `/brotli`
 
