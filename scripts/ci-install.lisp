@@ -1,6 +1,6 @@
-;;;; Phase 1: fetch OCI deps with system OpenSSL. Do NOT ASDF-load them here.
-;;;; Loading event backends / cffi / cl-stack-ssl init rewires foreign state and
-;;;; breaks subsequent dexador HTTPS pulls (CL+SSL::PEM-PASSWORD-CALLBACK).
+;;;; Phase 1: fetch OCI deps with system OpenSSL. Do NOT ASDF-load / ql:quickload
+;;;; mid-flight — loading cffi/babel/event backends rewires foreign state and
+;;;; breaks subsequent dexador HTTPS (CL+SSL::PEM-PASSWORD-CALLBACK).
 ;;;; Phase 2 (ci-test.lisp) loads everything with overlay OpenSSL on the loader path.
 
 (setf *debugger-hook*
@@ -38,8 +38,11 @@
    "https://ghcr.io" (format nil "egao1980/cl-systems/~a" oci-name) version)
   (cl-repository-client/asdf-integration:configure-asdf-source-registry))
 
+(defun ci-on-disk-p (name)
+  (cl-repository-client/quickload::system-already-installed-p name))
+
 (defun ci-fetch (name &key version)
-  "Resolve + install NAME (and plan) without ASDF-loading / cl-repo-init."
+  "Resolve + install NAME (and OCI plan) without ASDF-load or ql:quickload."
   (format t "~&; ci: fetch ~a~@[:~a~]~%" name version)
   (cl-repository-client/source-policy:call-with-policy-overrides
    *ci-ql-sources* nil nil nil
@@ -52,7 +55,7 @@
          (let ((n (car entry))
                (ver (cdr entry)))
            (unless (or (cl-repository-client/source-policy:system-denied-p n)
-                       (and (cl-repository-client/quickload::system-already-installed-p n)
+                       (and (ci-on-disk-p n)
                             (let ((iv (cl-repository-client/quickload::installed-system-version n)))
                               (and iv (string= iv (princ-to-string ver))))))
              (format t "~&; ci: ensure-installed ~a~@[:~a~]~%" n ver)
@@ -60,12 +63,14 @@
                             n :version ver)))
                (when result
                  (cl-repository-client/asdf-integration:configure-asdf-source-registry))))))
-        (when cl-repository-client/quickload::*missing-deps-accumulator*
-          (cl-repository-client/quickload::try-quicklisp-fallback
-           cl-repository-client/quickload::*missing-deps-accumulator*)))))
+       ;; Do NOT try-quicklisp-fallback here — ql:quickload loads cffi/babel and
+       ;; breaks GHCR pulls. Unpublished deps are ql'd once at the end.
+       (when cl-repository-client/quickload::*missing-deps-accumulator*
+         (format t "~&; ci: deferring ql fallback: ~{~a~^, ~}~%"
+                 cl-repository-client/quickload::*missing-deps-accumulator*)))))
   (cl-repository-client/asdf-integration:configure-asdf-source-registry)
-  (unless (asdf:find-system name nil)
-    (error "ci-fetch: ~a not findable after install" name)))
+  (unless (ci-on-disk-p name)
+    (error "ci-fetch: ~a not on disk after install" name)))
 
 (defun ci-patch-stack-ssl (&optional (version "3.4.1"))
   "Patch stale OCI source (DEFCONSTANT -> DEFPARAMETER) until republished."
@@ -94,25 +99,26 @@
   (call-with-ci-muffles
    (lambda ()
      (ci-install "cl-plus-ssl" :version "latest")
+     ;; All GHCR pulls before any ql:quickload / ASDF load.
      (ci-fetch "http-protocol" :version "0.1.0")
-     (ci-fetch "event-protocol" :version "0.1.0")
-     (ci-fetch event-sys :version "0.1.0")
      (ci-fetch "http-encoding-chipz" :version "0.1.0")
      (ci-fetch "http-encoding-brotli" :version "0.1.0")
      (ci-fetch "cl-stack-brotli" :version "1.2.0")
      (ci-fetch "quri" :version "0.7.1")
      (ci-fetch "chipz" :version "0.8")
      (ci-fetch "salza2" :version "2.1")
-     (ci-fetch "cffi" :version "677cabae64b181330a3bbbda9c11891a2a8edcdc")
      (ci-fetch "alexandria" :version "1.0.1")
-     (dolist (n '("rove" "fast-http" "babel" "usocket" "bordeaux-threads"
-                  "blackbird" "trivial-gray-streams" "cl-cookie"))
-       (unless (asdf:find-system n nil)
-         (format t "~&; ci: ql fallback ~a~%" n)
-         (ql:quickload n :silent t)))
-     ;; LAST: overlay package on disk only (init loaded in phase 2).
+     (ci-fetch "cffi" :version "677cabae64b181330a3bbbda9c11891a2a8edcdc")
+     (ci-fetch "event-protocol" :version "0.1.0")
+     (ci-fetch event-sys :version "0.1.0")
      (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)
-     (ci-patch-stack-ssl cl-stack-ssl-version))))
+     (ci-patch-stack-ssl cl-stack-ssl-version)
+     ;; QL only after OCI HTTPS is done (image will be discarded before tests).
+     (dolist (n '("rove" "fast-http" "babel" "usocket" "bordeaux-threads"
+                  "blackbird" "trivial-gray-streams" "cl-cookie" "cl-unicode"))
+       (unless (or (ci-on-disk-p n) (asdf:find-system n nil))
+         (format t "~&; ci: ql fallback ~a~%" n)
+         (ql:quickload n :silent t))))))
 
 (format t "~&; ci: install phase done~%")
 (uiop:quit 0)
