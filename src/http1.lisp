@@ -43,12 +43,74 @@
   (prepare-request-body request))
 
 (defun %request-target (uri &key absolute-p)
-  "Origin-form path?query, or absolute-form for HTTP proxy (RFC 7230)."
+  "Origin-form path?query, or absolute-form for HTTP proxy (RFC 7230).
+   Absolute-form never includes userinfo (credentials → Proxy-Authorization)."
   (if absolute-p
-      (quri:render-uri uri)
+      (quri:render-uri (quri:copy-uri uri :userinfo nil :fragment nil))
       (let* ((path (or (quri:uri-path uri) "/"))
              (query (quri:uri-query uri)))
         (if query (format nil "~A?~A" path query) path))))
+
+(defun proxy-authorization-value (user password)
+  "Proxy-Authorization header value (Basic), or NIL when USER is NIL/empty.
+   Matches dexador make-proxy-authorization."
+  (when (and user (plusp (length user)))
+    (authorization-header-value (list :basic user (or password "")))))
+
+(defun build-connect-request-octets (host port &key proxy-authorization)
+  "HTTP CONNECT request octets (dexador write-connect-header).
+   HOST:PORT is the origin; PROXY-AUTHORIZATION is the full header value
+   (e.g. \"Basic …\") or NIL."
+  (let* ((authority (format-host-port host port))
+         (out (make-array 128 :element-type '(unsigned-byte 8)
+                             :adjustable t :fill-pointer 0))
+         (crlf (babel:string-to-octets (format nil "~C~C" #\Return #\Newline))))
+    (labels ((emit (octets)
+               (loop for b across octets do (vector-push-extend b out)))
+             (emit-line (string)
+               (emit (babel:string-to-octets string :encoding :utf-8))
+               (emit crlf)))
+      (emit-line (format nil "CONNECT ~A HTTP/1.1" authority))
+      (emit-line (format nil "Host: ~A" authority))
+      (when proxy-authorization
+        (emit-line (format nil "Proxy-Authorization: ~A" proxy-authorization)))
+      (emit crlf)
+      (coerce out '(simple-array (unsigned-byte 8) (*))))))
+
+(defun %header-block-end (buf &optional (end (length buf)))
+  "Index past CRLFCRLF in BUF[0:END], or NIL if incomplete."
+  (loop for i from 0 below (- end 3)
+        when (and (= (aref buf i) 13)
+                  (= (aref buf (1+ i)) 10)
+                  (= (aref buf (+ i 2)) 13)
+                  (= (aref buf (+ i 3)) 10))
+          return (+ i 4)))
+
+(defun connect-response-ok-p (buf &optional (end (length buf)))
+  "True if BUF starts with a successful CONNECT response (2xx).
+   Requires a complete header block (CRLFCRLF)."
+  (let ((hend (%header-block-end buf end)))
+    (when hend
+      (let* ((text (babel:octets-to-string buf :encoding :utf-8 :errorp nil
+                                           :end (min hend end)))
+             (line-end (or (search (format nil "~C~C" #\Return #\Newline) text)
+                           (length text)))
+             (status-line (subseq text 0 line-end)))
+        ;; HTTP/1.x 2xx …
+        (and (>= (length status-line) 12)
+             (string-equal "HTTP/" status-line :end2 5)
+             (let ((sp (position #\Space status-line)))
+               (when sp
+                 (let* ((code-start (1+ sp))
+                        (code-end (or (position #\Space status-line
+                                                :start code-start)
+                                      (length status-line)))
+                        (code (ignore-errors
+                               (parse-integer status-line
+                                              :start code-start
+                                              :end code-end
+                                              :junk-allowed t))))
+                   (and code (<= 200 code 299))))))))))
 
 (defun %emit-request-lines (method uri headers &key content-length chunked-p
                                                  absolute-p

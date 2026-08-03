@@ -20,4 +20,7 @@
            #:async-request-handle
            #:async-request-canceled-p
            #:lru-connection-pool
-           #:make-lru-connection-pool))
+           #:make-lru-connection-pool
+           #:build-connect-request-octets
+           #:connect-response-ok-p
+           #:proxy-authorization-value))

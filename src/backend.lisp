@@ -116,6 +116,14 @@
                (connect-host host)
                (connect-port port)
                (proxied-http-p nil)
+               (http-connect-p nil) ; HTTPS via HTTP proxy → CONNECT then TLS
+               (proxy-user nil)
+               (proxy-pass nil)
+               (connect-step nil)
+               (connect-out nil)
+               (connect-wpos 0)
+               (connect-in (make-array 0 :element-type '(unsigned-byte 8)
+                                         :adjustable t :fill-pointer 0))
                (socks-p nil)
                (socks-user nil)
                (socks-pass nil)
@@ -140,14 +148,13 @@
                 (parse-proxy-uri proxy-url)
               (ecase (proxy-kind proxy-url)
                 (:http
-                 (when https
-                   (error 'unsupported-operation
-                          :operation :https-proxy
-                          :message
-                          "HTTPS via HTTP proxy (CONNECT) not yet wired; use socks5h://"))
+                 ;; dexador: cleartext → absolute-form; https → CONNECT then TLS
                  (setf connect-host phost
                        connect-port pport
-                       proxied-http-p t))
+                       proxy-user puser
+                       proxy-pass ppass
+                       http-connect-p https
+                       proxied-http-p (not https)))
                 (:socks5
                  (setf connect-host phost
                        connect-port pport
@@ -155,7 +162,8 @@
                        socks-user puser
                        socks-pass ppass
                        socks-remote-dns (socks-remote-dns-p pscheme)
-                       proxied-http-p nil))
+                       proxied-http-p nil
+                       http-connect-p nil))
                 (:socks4
                  (error 'unsupported-operation
                         :operation :socks4-proxy
@@ -184,6 +192,13 @@
                                     host
                                     (format nil "~A:~A" host port))
                                 headers)))
+                 ;; Cleartext HTTP via proxy: Proxy-Authorization (dexador).
+                 (when (and proxied-http-p
+                            (not (assoc "proxy-authorization" headers
+                                        :test #'string-equal)))
+                   (let ((v (proxy-authorization-value proxy-user proxy-pass)))
+                     (when v
+                       (setf headers (acons "proxy-authorization" v headers)))))
                  (setf headers (inject-cookie-header headers cookie-jar
                                                      (quri:render-uri uri)))
                  (multiple-value-bind (content extra-headers content-length)
@@ -616,18 +631,77 @@
                    (error (e)
                      (fail (make-condition 'http-connection-error
                                            :message (princ-to-string e))))))
+               (%connect-append (octets n)
+                 (loop for i below n
+                       do (vector-push-extend (aref octets i) connect-in)))
+               (%connect-write-step ()
+                 (let ((n (socket-send-octets sock connect-out connect-wpos
+                                              (length connect-out))))
+                   (cond
+                     ((null n) (arm-io :write) nil)
+                     ((zerop n) (arm-io :write) nil)
+                     (t
+                      (incf connect-wpos n)
+                      (if (>= connect-wpos (length connect-out))
+                          t
+                          (progn (arm-io :write) nil))))))
+               (do-http-connect ()
+                 "HTTP CONNECT tunnel (dexador make-connect-stream) before TLS."
+                 (handler-case
+                     (ecase connect-step
+                       (:write
+                        (when (%connect-write-step)
+                          (setf connect-step :read
+                                (fill-pointer connect-in) 0)
+                          (arm-io :read)))
+                       (:read
+                        (let ((n (socket-recv-octets sock recv-buf)))
+                          (when (null n) (arm-io :read) (return-from do-http-connect))
+                          (when (zerop n)
+                            (return-from do-http-connect
+                              (fail (make-condition 'http-connection-error
+                                                    :message "proxy CONNECT EOF"))))
+                          (%connect-append recv-buf n)
+                          (let ((hend (%header-block-end connect-in)))
+                            (when hend
+                              (unless (connect-response-ok-p connect-in)
+                                (return-from do-http-connect
+                                  (fail (make-condition
+                                         'http-connection-error
+                                         :message
+                                         (format nil "proxy CONNECT failed: ~A"
+                                                 (babel:octets-to-string
+                                                  connect-in :end (min hend 120)
+                                                  :encoding :utf-8 :errorp nil))))))
+                              (begin-origin-io))))))
+                   (http-error (e) (fail e))
+                   (error (e)
+                     (fail (make-condition 'http-connection-error
+                                           :message (princ-to-string e))))))
                (on-connected ()
                  (set-socket-nonblocking sock t)
-                 (if socks-p
-                     (progn
-                       (setf phase :socks
-                             socks-step :greet-write
-                             socks-out (socks5-greeting :username socks-user)
-                             socks-wpos 0
-                             (fill-pointer socks-in) 0)
-                       (arm-io :write)
-                       (next-tick (lambda () (on-io :ok))))
-                     (begin-origin-io)))
+                 (cond
+                   (socks-p
+                    (setf phase :socks
+                          socks-step :greet-write
+                          socks-out (socks5-greeting :username socks-user)
+                          socks-wpos 0
+                          (fill-pointer socks-in) 0)
+                    (arm-io :write)
+                    (next-tick (lambda () (on-io :ok))))
+                   (http-connect-p
+                    (setf phase :http-connect
+                          connect-step :write
+                          connect-out (build-connect-request-octets
+                                       host port
+                                       :proxy-authorization
+                                       (proxy-authorization-value
+                                        proxy-user proxy-pass))
+                          connect-wpos 0
+                          (fill-pointer connect-in) 0)
+                    (arm-io :write)
+                    (next-tick (lambda () (on-io :ok))))
+                   (t (begin-origin-io))))
                (do-tls-hs ()
                  (loop
                    (ecase (tls-handshake-step tls)
@@ -741,6 +815,7 @@
                         (when (tcp-connect-finish sock)
                           (on-connected)))
                        (:socks (do-socks))
+                       (:http-connect (do-http-connect))
                        (:tls-hs (do-tls-hs))
                        (:write (do-write))
                        (:read (do-read)))

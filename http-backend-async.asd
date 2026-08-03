@@ -36,6 +36,7 @@
   :components ((:file "package")
                (:file "fixture")
                (:file "pool-test")
+               (:file "proxy-test")
                (:file "socks-test")
                (:file "backend-test")
                (:file "live-test"))
