@@ -12,7 +12,9 @@ concurrency:
 
 env:
   SBCL_VERSION: 2.4.11
+  ROSWELL_VERSION: "26.02.116"
   HTTP_ASYNC_LIVE: "1"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   test:
@@ -36,6 +38,11 @@ jobs:
             event_backend: libev
             apt: ""
             brew: libev
+          # Windows primary = libuv (libev is Unix-only).
+          - os: windows-latest
+            event_backend: libuv
+            apt: ""
+            brew: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +87,8 @@ jobs:
           repository: egao1980/cl-stack-ssl
           path: _sib/cl-stack-ssl
 
-      - name: Layout siblings
+      - name: Layout siblings (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p /tmp/ws
@@ -105,18 +113,96 @@ jobs:
           echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
-      - name: Install Roswell + test
+      - name: Install oras (Windows)
+        if: runner.os == 'Windows'
+        uses: oras-project/setup-oras@v1
+        with:
+          version: 1.2.3
+
+      # Prefer published windows overlays for OpenSSL/brotli (slow to rebuild).
+      # libuv: build from sibling source (same as event-backend-libuv CI) so grovel
+      # matches checkout tip; stage published grovel-cache to avoid MinGW when possible.
+      - name: Pull OpenSSL + brotli natives (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          mkdir -p /tmp/oci
+          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:3.4.1" --platform windows/amd64 -o /tmp/oci/ssl
+          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-brotli:1.2.0" --platform windows/amd64 -o /tmp/oci/brotli
+          oras pull "ghcr.io/egao1980/cl-systems/event-backend-libuv:0.1.0" --platform windows/amd64 -o /tmp/oci/libuv
+          mkdir -p /tmp/nat/ssl /tmp/nat/brotli /tmp/nat/libuv /tmp/nat/libuv-src
+          tar -xzf /tmp/oci/ssl/native-library.tar.gz -C /tmp/nat/ssl
+          tar -xzf /tmp/oci/brotli/native-library.tar.gz -C /tmp/nat/brotli
+          tar -xzf /tmp/oci/libuv/native-library.tar.gz -C /tmp/nat/libuv
+          # Published grovel-cache for windows (avoids MinGW grovel on consumer CI).
+          tar -xzf /tmp/oci/libuv/event-backend-libuv-0.1.0.tar.gz -C /tmp/nat/libuv-src
+          SSL_NAT="$(find /tmp/nat/ssl -type d -name native | head -1)"
+          BR_NAT="$(find /tmp/nat/brotli -type d -name native | head -1)"
+          UV_NAT="$(find /tmp/nat/libuv -type d -name native | head -1)"
+          echo "OPENSSL_NATIVE=$SSL_NAT" >> "$GITHUB_ENV"
+          echo "BROTLI_NATIVE=$BR_NAT" >> "$GITHUB_ENV"
+          echo "EVENT_PROTOCOL_NATIVE=$UV_NAT" >> "$GITHUB_ENV"
+          echo "$SSL_NAT" >> "$GITHUB_PATH"
+          echo "$BR_NAT" >> "$GITHUB_PATH"
+          echo "$UV_NAT" >> "$GITHUB_PATH"
+          # Install grovel-cache into sibling checkout when missing.
+          if [ ! -f "$GITHUB_WORKSPACE/_sib/event-backend-libuv/grovel-cache/grovel.cffi.lisp" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/_sib/event-backend-libuv/grovel-cache"
+            GROVEL="$(find /tmp/nat/libuv-src -name 'grovel.cffi.lisp' | head -1)"
+            cp "$GROVEL" "$GITHUB_WORKSPACE/_sib/event-backend-libuv/grovel-cache/grovel.cffi.lisp"
+          fi
+          ls -la "$SSL_NAT" "$BR_NAT" "$UV_NAT"
+
+      - name: Install Roswell (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
+
+      - name: Install Roswell (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -sL "https://github.com/roswell/roswell/releases/download/v${ROSWELL_VERSION}/roswell_${ROSWELL_VERSION}_amd64.zip" \
+            -o /tmp/roswell.zip
+          rm -rf /c/roswell && mkdir -p /c/roswell
+          unzip -qo /tmp/roswell.zip -d /c/roswell
+          echo "/c/roswell/roswell" >> "$GITHUB_PATH"
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
+
+      - name: Install SBCL
+        shell: bash
+        run: |
+          ros install "sbcl-bin/$SBCL_VERSION"
+          ros use "sbcl-bin/$SBCL_VERSION"
+
+      - name: Install Roswell + test (Unix)
+        if: runner.os != 'Windows'
         working-directory: /tmp/ws/http-backend-async
         shell: bash
         env:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
           HTTP_ASYNC_LIVE: "1"
         run: |
-          curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
-          export PATH="$HOME/.roswell/bin:$PATH"
-          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
-          ros install "sbcl-bin/$SBCL_VERSION"
-          ros use "sbcl-bin/$SBCL_VERSION"
           ros install qlot
           qlot install
           qlot exec ros -S . -e '(asdf:test-system "http-backend-async")'
+
+      - name: Test (Windows / libuv)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          HTTP_ASYNC_EVENT_BACKEND: libuv
+          HTTP_ASYNC_LIVE: "1"
+        run: |
+          export PATH="${OPENSSL_NATIVE}:${BROTLI_NATIVE}:${EVENT_PROTOCOL_NATIVE}:${PATH}"
+          # Nest event-protocol beside libuv for its qlfile/local layout expectations.
+          cp -a _sib/event-protocol _sib/event-backend-libuv/event-protocol
+          ros install rove cffi quri fast-http babel alexandria blackbird chipz salza2 \
+            trivial-gray-streams bordeaux-threads usocket cl+ssl
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/_sib/http-protocol//:$(pwd)/_sib/event-protocol//:$(pwd)/_sib/event-backend-libuv//:$(pwd)/_sib/http-encoding-chipz//:$(pwd)/_sib/http-encoding-brotli//:$(pwd)/_sib/cl-stack-brotli//:$(pwd)/_sib/cl-stack-ssl//:"
+          ros -e '(setf *debugger-hook* (lambda (c h) (declare (ignore h)) (format *error-output* "~&UNHANDLED: ~A~%" c) (uiop:quit 1)))' \
+              -e "(dolist (d (list (uiop:getenv \"OPENSSL_NATIVE\") (uiop:getenv \"BROTLI_NATIVE\") (uiop:getenv \"EVENT_PROTOCOL_NATIVE\"))) (when d (push (uiop:ensure-directory-pathname d) cffi:*foreign-library-directories*)))" \
+              -e '(asdf:test-system "http-backend-async")' -q
