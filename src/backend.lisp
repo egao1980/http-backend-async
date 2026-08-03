@@ -116,6 +116,15 @@
                (connect-host host)
                (connect-port port)
                (proxied-http-p nil)
+               (socks-p nil)
+               (socks-user nil)
+               (socks-pass nil)
+               (socks-remote-dns nil)
+               (socks-step nil)
+               (socks-out nil)
+               (socks-wpos 0)
+               (socks-in (make-array 0 :element-type '(unsigned-byte 8)
+                                       :adjustable t :fill-pointer 0))
                (keep-alive-p (not (null pool))))
           (declare (ignorable pool-key*))
           (when proxy-url
@@ -124,23 +133,34 @@
                      :operation :system-proxy
                      :message
                      "OS automatic proxy (:SYSTEM) not yet wired on async-backend"))
-            (multiple-value-bind (pscheme phost pport)
+            (multiple-value-bind (pscheme phost pport puser ppass)
                 (parse-proxy-uri proxy-url)
-              (declare (ignore pscheme))
-              (when https
-                (error 'unsupported-operation
-                       :operation :https-proxy
-                       :message
-                       "HTTPS via proxy (CONNECT) not yet wired on async-backend"))
-              (unless (member (string-downcase
-                               (or (quri:uri-scheme (quri:uri proxy-url)) "http"))
-                              '("http" "https") :test #'string=)
-                (error 'unsupported-operation
-                       :operation :socks-proxy
-                       :message "SOCKS proxy not yet wired on async-backend"))
-              (setf connect-host phost
-                    connect-port pport
-                    proxied-http-p t)))
+              (ecase (proxy-kind proxy-url)
+                (:http
+                 (when https
+                   (error 'unsupported-operation
+                          :operation :https-proxy
+                          :message
+                          "HTTPS via HTTP proxy (CONNECT) not yet wired; use socks5h://"))
+                 (setf connect-host phost
+                       connect-port pport
+                       proxied-http-p t))
+                (:socks5
+                 (setf connect-host phost
+                       connect-port pport
+                       socks-p t
+                       socks-user puser
+                       socks-pass ppass
+                       socks-remote-dns (socks-remote-dns-p pscheme)
+                       proxied-http-p nil))
+                (:socks4
+                 (error 'unsupported-operation
+                        :operation :socks4-proxy
+                        :message "SOCKS4 not implemented; use socks5:// or socks5h://"))
+                (:system
+                 (error 'unsupported-operation
+                        :operation :system-proxy
+                        :message "OS automatic proxy not yet wired")))))
           (labels
               ((build-headers-and-body ()
                  (setf headers (%merge-headers (http-client-headers client)
@@ -464,8 +484,8 @@
                            :decompress (http-request-decompress request))
                         (follow-redirect status headers* body* set-cookies
                                          final-url))))))
-               (on-connected ()
-                 (set-socket-nonblocking sock t)
+               (begin-origin-io ()
+                 "After TCP (and optional SOCKS), start TLS or HTTP write."
                  (if https
                      (progn
                        (setf tls (make-tls-session fd host :verify verify)
@@ -477,6 +497,134 @@
                        (setf phase :write)
                        (arm-io :write)
                        (next-tick (lambda () (on-io :ok))))))
+               (%socks-append (octets n)
+                 (loop for i below n
+                       do (vector-push-extend (aref octets i) socks-in)))
+               (%socks-write-step ()
+                 (let ((n (socket-send-octets sock socks-out socks-wpos
+                                              (length socks-out))))
+                   (cond
+                     ((null n) (arm-io :write) nil)
+                     ((zerop n) (arm-io :write) nil)
+                     (t
+                      (incf socks-wpos n)
+                      (if (>= socks-wpos (length socks-out))
+                          t
+                          (progn (arm-io :write) nil))))))
+               (do-socks ()
+                 "SOCKS5 state machine on the cleartext socket."
+                 (handler-case
+                     (ecase socks-step
+                       (:greet-write
+                        (when (%socks-write-step)
+                          (setf socks-step :greet-read
+                                (fill-pointer socks-in) 0)
+                          (arm-io :read)))
+                       (:greet-read
+                        (let ((n (socket-recv-octets sock recv-buf)))
+                          (when (null n) (arm-io :read) (return-from do-socks))
+                          (when (zerop n)
+                            (return-from do-socks
+                              (fail (make-condition 'http-connection-error
+                                                    :message "SOCKS5 EOF on greet"))))
+                          (%socks-append recv-buf n)
+                          (when (>= (fill-pointer socks-in) 2)
+                            (unless (= (aref socks-in 0) #x05)
+                              (return-from do-socks
+                                (fail (make-condition 'http-connection-error
+                                                      :message "not SOCKS5"))))
+                            (let ((method (aref socks-in 1)))
+                              (case method
+                                (#x00
+                                 (setf socks-out (socks5-connect-request
+                                                  host port
+                                                  :remote-dns socks-remote-dns)
+                                       socks-wpos 0
+                                       socks-step :connect-write)
+                                 (arm-io :write)
+                                 (next-tick #'do-socks))
+                                (#x02
+                                 (unless socks-user
+                                   (return-from do-socks
+                                     (fail (make-condition
+                                            'http-connection-error
+                                            :message "SOCKS5 auth required"))))
+                                 (setf socks-out (socks5-userpass-request
+                                                  socks-user socks-pass)
+                                       socks-wpos 0
+                                       socks-step :auth-write)
+                                 (arm-io :write)
+                                 (next-tick #'do-socks))
+                                (t
+                                 (fail (make-condition
+                                        'http-connection-error
+                                        :message
+                                        (format nil "SOCKS5 method ~D rejected"
+                                                method)))))))))
+                       (:auth-write
+                        (when (%socks-write-step)
+                          (setf socks-step :auth-read
+                                (fill-pointer socks-in) 0)
+                          (arm-io :read)))
+                       (:auth-read
+                        (let ((n (socket-recv-octets sock recv-buf)))
+                          (when (null n) (arm-io :read) (return-from do-socks))
+                          (when (zerop n)
+                            (return-from do-socks
+                              (fail (make-condition 'http-connection-error
+                                                    :message "SOCKS5 EOF on auth"))))
+                          (%socks-append recv-buf n)
+                          (when (>= (fill-pointer socks-in) 2)
+                            (unless (zerop (aref socks-in 1))
+                              (return-from do-socks
+                                (fail (make-condition 'http-connection-error
+                                                      :message "SOCKS5 auth failed"))))
+                            (setf socks-out (socks5-connect-request
+                                             host port
+                                             :remote-dns socks-remote-dns)
+                                  socks-wpos 0
+                                  socks-step :connect-write)
+                            (arm-io :write)
+                            (next-tick #'do-socks))))
+                       (:connect-write
+                        (when (%socks-write-step)
+                          (setf socks-step :connect-read
+                                (fill-pointer socks-in) 0)
+                          (arm-io :read)))
+                       (:connect-read
+                        (let ((n (socket-recv-octets sock recv-buf)))
+                          (when (null n) (arm-io :read) (return-from do-socks))
+                          (when (zerop n)
+                            (return-from do-socks
+                              (fail (make-condition 'http-connection-error
+                                                    :message "SOCKS5 EOF on connect"))))
+                          (%socks-append recv-buf n)
+                          (let ((len (socks5-reply-length socks-in)))
+                            (when len
+                              (unless (socks5-reply-ok-p socks-in)
+                                (return-from do-socks
+                                  (fail (make-condition
+                                         'http-connection-error
+                                         :message
+                                         (format nil "SOCKS5 CONNECT failed status=~D"
+                                                 (aref socks-in 1))))))
+                              (begin-origin-io))))))
+                   (http-error (e) (fail e))
+                   (error (e)
+                     (fail (make-condition 'http-connection-error
+                                           :message (princ-to-string e))))))
+               (on-connected ()
+                 (set-socket-nonblocking sock t)
+                 (if socks-p
+                     (progn
+                       (setf phase :socks
+                             socks-step :greet-write
+                             socks-out (socks5-greeting :username socks-user)
+                             socks-wpos 0
+                             (fill-pointer socks-in) 0)
+                       (arm-io :write)
+                       (next-tick (lambda () (on-io :ok))))
+                     (begin-origin-io)))
                (do-tls-hs ()
                  (loop
                    (ecase (tls-handshake-step tls)
@@ -589,6 +737,7 @@
                        (:connecting
                         (when (tcp-connect-finish sock)
                           (on-connected)))
+                       (:socks (do-socks))
                        (:tls-hs (do-tls-hs))
                        (:write (do-write))
                        (:read (do-read)))

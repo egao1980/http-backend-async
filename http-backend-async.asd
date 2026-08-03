@@ -19,6 +19,7 @@
   :pathname "src"
   :components ((:file "package")
                (:file "socket")
+               (:file "socks")
                (:file "async-body-stream")
                (:file "http1")
                (:file "redirect")
@@ -33,6 +34,7 @@
   :serial t
   :components ((:file "package")
                (:file "fixture")
+               (:file "socks-test")
                (:file "backend-test")
                (:file "live-test"))
   :perform (test-op (o c)
