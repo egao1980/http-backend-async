@@ -31,10 +31,11 @@
                  :socket socket :tls tls :https https))
 
 (defmethod connection-alive-p ((c async-pooled-connection))
+  "Alive if we still hold a usocket. Avoid probing the Lisp stream — on Windows
+   stream/socket-receive mixing breaks keep-alive reuse (INVALID-VERSION)."
   (and (async-conn-alive-p c)
        (async-conn-socket c)
-       (ignore-errors
-         (open-stream-p (usocket:socket-stream (async-conn-socket c))))))
+       (ignore-errors (usocket:socket (async-conn-socket c)))))
 
 (defmethod pool-discard ((pool lru-connection-pool) (c async-pooled-connection))
   (declare (ignore pool))

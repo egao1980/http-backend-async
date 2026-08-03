@@ -117,10 +117,12 @@
     (when (or (null stream)
               (not (streamp stream))
               (not (open-stream-p stream)))
+      ;; :none — we I/O via socket-send/receive + register-io, not the stream.
+      ;; :full buffering on Windows can desync keep-alive reuse (INVALID-VERSION).
       (setf (usocket:socket-stream usock)
             (sb-bsd-sockets:socket-make-stream
              impl
-             :input t :output t :buffering :full
+             :input t :output t :buffering :none
              :element-type '(unsigned-byte 8)))))
   usock)
 
