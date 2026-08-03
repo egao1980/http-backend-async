@@ -16,5 +16,14 @@
   (:export #:async-backend
            #:make-async-backend
            #:*event-backend-maker*
+           #:*async-body-queue-limit*
            #:async-request-handle
-           #:async-request-canceled-p))
+           #:async-request-canceled-p
+           #:lru-connection-pool
+           #:make-lru-connection-pool
+           #:async-pooled-connection
+           #:make-async-pooled-connection
+           #:response-keeps-alive-p
+           #:build-connect-request-octets
+           #:connect-response-ok-p
+           #:proxy-authorization-value))

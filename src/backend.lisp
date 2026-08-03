@@ -20,6 +20,32 @@
   (ignore-errors (ensure-tls))
   (make-instance 'async-backend))
 
+(defclass async-pooled-connection ()
+  ((socket :initarg :socket :accessor async-conn-socket)
+   (tls :initarg :tls :accessor async-conn-tls :initform nil)
+   (https :initarg :https :accessor async-conn-https-p :initform nil)
+   (alive :initform t :accessor async-conn-alive-p)))
+
+(defun make-async-pooled-connection (socket &key tls https)
+  (make-instance 'async-pooled-connection
+                 :socket socket :tls tls :https https))
+
+(defmethod connection-alive-p ((c async-pooled-connection))
+  "Alive if we still hold a usocket. Avoid probing the Lisp stream — on Windows
+   stream/socket-receive mixing breaks keep-alive reuse (INVALID-VERSION)."
+  (and (async-conn-alive-p c)
+       (async-conn-socket c)
+       (ignore-errors (usocket:socket (async-conn-socket c)))))
+
+(defmethod pool-discard ((pool lru-connection-pool) (c async-pooled-connection))
+  (declare (ignore pool))
+  (setf (async-conn-alive-p c) nil)
+  (tls-close (async-conn-tls c))
+  (setf (async-conn-tls c) nil)
+  (close-socket (async-conn-socket c))
+  (setf (async-conn-socket c) nil)
+  nil)
+
 (defclass async-request-handle ()
   ((canceled-p :initform nil :accessor async-request-canceled-p)
    (io-handle :initform nil :accessor async-request-io-handle)
@@ -57,37 +83,26 @@
          (values backend loop))))))
 
 (defun %timeout-seconds (request client)
-  (let ((t* (or (http-request-timeout request)
-                (http-client-timeout client))))
-    (cond ((null t*) 30.0)
-          ((numberp t*) (float t* 1.0d0))
-          ((and (consp t*) (getf t* :total)) (float (getf t* :total) 1.0d0))
-          ((and (consp t*) (getf t* :read)) (float (getf t* :read) 1.0d0))
-          (t 30.0))))
-
-(defmethod send ((backend async-backend) client request &key)
-  (declare (ignore client request))
-  (error 'unsupported-operation
-         :operation 'send
-         :message "async-backend is non-blocking; use SEND-ASYNC (or http:*-async)"))
+  (timeout-total-seconds (effective-timeout request client)))
 
 (defmethod send-async ((backend async-backend) client request
                        &key callback error-callback)
-  (when (http-request-want-stream request)
-    (error 'unsupported-operation
-           :operation :want-stream
-           :message
-           "http-backend-async: response body streams not implemented yet (cl-stack#71); use http-backend-dexador :want-stream t for buffered download"))
   (let* ((cb (or callback (lambda (r) (declare (ignore r)))))
          (eb-cb (or error-callback
                     (lambda (c) (error c))))
+         (want-stream-p (http-request-want-stream request))
          (uri (quri:uri (http-request-url request)))
          (method (http-request-method request))
          (max-redirects (or (http-request-max-redirects request)
                             (http-client-max-redirects client)
                             5))
          (redirect-hops 0)
-         (history nil))
+         (history nil)
+         (proxy-cfg (effective-proxy-config request client))
+         ;; Usocket path (dexador-usocket): URL or NIL (direct).
+         ;; SYSTEM-AUTOMATIC-P / PAC/WPAD is WinHTTP-only — ignored here.
+         (proxy-url (resolve-proxy proxy-cfg uri))
+         (pool (effective-connection-pool client)))
     (multiple-value-bind (host port scheme) (%uri-host-port uri)
       (multiple-value-bind (event-backend event-loop) (%ensure-event-context)
         (let* ((https (string-equal scheme "https"))
@@ -119,7 +134,63 @@
                (hdrs nil)
                (body nil)
                (finishedp nil)
-               (parse! nil))
+               (parse! nil)
+               (set-body-fn nil)
+               (body-feed nil)
+               (streaming-final-p nil)
+               (headers-delivered-p nil)
+               (read-paused-p nil)
+               (pool-key* (pool-key scheme host port :proxy proxy-url))
+               (connect-host host)
+               (connect-port port)
+               (proxied-http-p nil)
+               (http-connect-p nil) ; HTTPS via HTTP proxy → CONNECT then TLS
+               (proxy-user nil)
+               (proxy-pass nil)
+               (connect-step nil)
+               (connect-out nil)
+               (connect-wpos 0)
+               (connect-in (make-array 0 :element-type '(unsigned-byte 8)
+                                         :adjustable t :fill-pointer 0))
+               (socks-p nil)
+               (socks-user nil)
+               (socks-pass nil)
+               (socks-remote-dns nil)
+               (socks-step nil)
+               (socks-out nil)
+               (socks-wpos 0)
+               (socks-in (make-array 0 :element-type '(unsigned-byte 8)
+                                       :adjustable t :fill-pointer 0))
+               ;; Pool present → advertise keep-alive; release only when the
+               ;; response also allows reuse (fixture often sends Connection: close).
+               (keep-alive-p (not (null pool)))
+               (reuse-ok-p nil)
+               (from-pool-p nil))
+          (when proxy-url
+            (multiple-value-bind (pscheme phost pport puser ppass)
+                (parse-proxy-uri proxy-url)
+              (ecase (proxy-kind proxy-url)
+                (:http
+                 ;; dexador: cleartext → absolute-form; https → CONNECT then TLS
+                 (setf connect-host phost
+                       connect-port pport
+                       proxy-user puser
+                       proxy-pass ppass
+                       http-connect-p https
+                       proxied-http-p (not https)))
+                (:socks5
+                 (setf connect-host phost
+                       connect-port pport
+                       socks-p t
+                       socks-user puser
+                       socks-pass ppass
+                       socks-remote-dns (socks-remote-dns-p pscheme)
+                       proxied-http-p nil
+                       http-connect-p nil))
+                (:socks4
+                 (error 'unsupported-operation
+                        :operation :socks4-proxy
+                        :message "SOCKS4 not implemented; use socks5:// or socks5h://")))))
           (labels
               ((build-headers-and-body ()
                  (setf headers (%merge-headers (http-client-headers client)
@@ -140,6 +211,13 @@
                                     host
                                     (format nil "~A:~A" host port))
                                 headers)))
+                 ;; Cleartext HTTP via proxy: Proxy-Authorization (dexador).
+                 (when (and proxied-http-p
+                            (not (assoc "proxy-authorization" headers
+                                        :test #'string-equal)))
+                   (let ((v (proxy-authorization-value proxy-user proxy-pass)))
+                     (when v
+                       (setf headers (acons "proxy-authorization" v headers)))))
                  (setf headers (inject-cookie-header headers cookie-jar
                                                      (quri:render-uri uri)))
                  (multiple-value-bind (content extra-headers content-length)
@@ -171,7 +249,9 @@
                             req-octets (build-request-header-octets
                                         method uri headers
                                         :chunked-p chunked-p
-                                        :content-length content-length)
+                                        :content-length content-length
+                                        :absolute-p proxied-http-p
+                                        :keep-alive keep-alive-p)
                             wpos 0
                             chunk-frame nil))
                      (t
@@ -180,7 +260,9 @@
                             stream-body-p nil
                             chunked-p nil
                             req-octets (build-request-octets
-                                        method uri headers body-octets)
+                                        method uri headers body-octets
+                                        :absolute-p proxied-http-p
+                                        :keep-alive keep-alive-p)
                             wpos 0
                             chunk-frame nil)))))
                (%write-octets (octets from to)
@@ -208,14 +290,25 @@
                            (t nil))
                          wpos 0)
                    n))
-               (reset-parser ()
-                 (multiple-value-bind (h hd b f p)
-                     (make-response-accumulator)
-                   (setf http h hdrs hd body b finishedp f parse! p)))
-               (close-connection ()
+               (unpause-read ()
+                 (when read-paused-p
+                   (setf read-paused-p nil)
+                   (next-tick
+                    (lambda ()
+                      (unless (or (async-request-canceled-p handle)
+                                  (eq phase :reconnect))
+                        (arm-io :read)
+                        (do-read))))))
+               (stop-io-and-timer ()
                  (when-let ((io (async-request-io-handle handle)))
                    (ignore-errors (cancel event-backend io))
                    (setf (async-request-io-handle handle) nil))
+                 (when-let ((tm (async-request-timer-handle handle)))
+                   (ignore-errors (cancel event-backend tm))
+                   (setf (async-request-timer-handle handle) nil))
+                 (setf io-dir nil))
+               (close-connection ()
+                 (stop-io-and-timer)
                  (tls-close tls)
                  (setf tls nil
                        (async-request-tls-stream handle) nil)
@@ -223,7 +316,104 @@
                  (setf (async-request-socket handle) nil
                        sock nil
                        fd nil
-                       io-dir nil))
+                       from-pool-p nil
+                       reuse-ok-p nil))
+               (detach-connection ()
+                 "Hand socket/TLS to a pool entry without closing."
+                 (stop-io-and-timer)
+                 (let ((conn (make-async-pooled-connection
+                              sock :tls tls :https https)))
+                   (setf sock nil
+                         tls nil
+                         fd nil
+                         (async-request-socket handle) nil
+                         (async-request-tls-stream handle) nil
+                         from-pool-p nil)
+                   conn))
+               (release-or-close (&key (force-close nil))
+                 "Return connection to POOL when keep-alive+reuse; else close."
+                 (cond
+                   ((or force-close
+                        (null pool)
+                        (null sock)
+                        (not keep-alive-p)
+                        (not reuse-ok-p))
+                    (close-connection))
+                   (t
+                    (let ((conn (detach-connection)))
+                      (pool-release pool pool-key* conn)))))
+               (complete-request (&key (force-close nil))
+                 "Stop IO/timer; pool or close after full response / stream EOF."
+                 (unless (async-request-canceled-p handle)
+                   (setf (async-request-canceled-p handle) t)
+                   (release-or-close :force-close force-close)))
+               (will-follow-redirect-p (status headers*)
+                 (let ((location (gethash "location" headers*)))
+                   (and location
+                        (redirect-status-p status)
+                        (plusp max-redirects)
+                        (< redirect-hops max-redirects))))
+               (begin-stream-body (status headers*)
+                 "Switch parser body sink to ASYNC-BODY-INPUT-STREAM and deliver."
+                 (let* ((final-url (quri:render-uri uri))
+                        (set-cookies (merge-response-cookies
+                                      cookie-jar final-url headers*)))
+                   (setf reuse-ok-p
+                         (and keep-alive-p
+                              (response-keeps-alive-p
+                               headers* (fast-http:http-version http)))
+                         body-feed
+                         (make-async-body-input-stream
+                          :on-space #'unpause-read)
+                         streaming-final-p t)
+                   (funcall set-body-fn
+                            (lambda (data start end)
+                              (async-body-feed body-feed data
+                                               :start start :end end)
+                              (when (async-body-full-p body-feed)
+                                (setf read-paused-p t)
+                                (when-let ((io (async-request-io-handle handle)))
+                                  (ignore-errors (cancel event-backend io))
+                                  (setf (async-request-io-handle handle) nil
+                                        io-dir nil)))))
+                   (multiple-value-bind (app-stream headers**)
+                       (apply-response-content-encoding
+                        body-feed headers*
+                        :decompress (http-request-decompress request))
+                     (deliver-stream
+                      (make-hop-response
+                       status headers** app-stream set-cookies final-url
+                       :history-for-final (nreverse (copy-list history)))))))
+               (on-response-headers (http-obj headers*)
+                 (declare (ignore http-obj))
+                 (when (and want-stream-p
+                            (not streaming-final-p)
+                            (not (will-follow-redirect-p
+                                  (fast-http:http-status http) headers*)))
+                   (begin-stream-body (fast-http:http-status http) headers*)))
+               (reset-parser ()
+                 (multiple-value-bind (h hd b f p set-body)
+                     (make-response-accumulator
+                      :on-headers #'on-response-headers)
+                   (setf http h hdrs hd body b finishedp f parse! p
+                         set-body-fn set-body
+                         body-feed nil
+                         streaming-final-p nil
+                         read-paused-p nil
+                         reuse-ok-p nil)))
+               (adopt-pooled (conn)
+                 "Reuse CONN for the next HTTP request (skip TCP/TLS/proxy)."
+                 (setf sock (async-conn-socket conn)
+                       tls (async-conn-tls conn)
+                       https (async-conn-https-p conn)
+                       (async-request-socket handle) sock
+                       (async-request-tls-stream handle) tls
+                       fd (socket-fd sock)
+                       from-pool-p t
+                       phase :write
+                       io-dir nil)
+                 (arm-io :write)
+                 (next-tick (lambda () (on-io :ok))))
                (next-tick (fn)
                  ;; Prefer sleep* 0 over defer/idle: libev idle is starved while a
                  ;; socket remains writable under :read-write interest.
@@ -251,38 +441,44 @@
                            (next-tick #'register))
                          (register)))))
                (do-connect ()
-                 (handler-case
-                     (multiple-value-bind (usock status)
-                         (tcp-connect-nb host port)
-                       (setf sock usock
-                             (async-request-socket handle) sock
-                             fd (socket-fd sock)
-                             phase :connecting)
-                       (ecase status
-                         (:connected (on-connected))
-                         (:pending (arm-io :write))))
-                   (http-error (e) (fail e))
-                   (error (e)
-                     (fail (make-condition 'http-connection-error
-                                           :message (princ-to-string e))))))
+                 (let ((conn (and pool (pool-acquire pool pool-key*))))
+                   (cond
+                     (conn
+                      (adopt-pooled conn))
+                     (t
+                      (handler-case
+                          (multiple-value-bind (usock status)
+                              (tcp-connect-nb connect-host connect-port)
+                            (setf sock usock
+                                  (async-request-socket handle) sock
+                                  fd (socket-fd sock)
+                                  from-pool-p nil
+                                  phase :connecting)
+                            (ecase status
+                              (:connected (on-connected))
+                              (:pending (arm-io :write))))
+                        (http-error (e) (fail e))
+                        (error (e)
+                          (fail (make-condition 'http-connection-error
+                                                :message (princ-to-string e)))))))))
                (fail (condition)
+                 (when body-feed
+                   (async-body-fail body-feed condition))
                  (unless (async-request-canceled-p handle)
-                   (setf (async-request-canceled-p handle) t)
-                   (when-let ((io (async-request-io-handle handle)))
-                     (ignore-errors (cancel event-backend io)))
-                   (when-let ((tm (async-request-timer-handle handle)))
-                     (ignore-errors (cancel event-backend tm)))
-                   (close-connection)
-                   (handler-case (funcall eb-cb condition)
-                     (error (e) (warn "error-callback failed: ~A" e)))))
+                   (complete-request :force-close t)
+                   (unless headers-delivered-p
+                     (handler-case (funcall eb-cb condition)
+                       (error (e) (warn "error-callback failed: ~A" e))))))
                (succeed (res)
+                 "Non-streaming completion: deliver response and tear down."
                  (unless (async-request-canceled-p handle)
-                   (setf (async-request-canceled-p handle) t)
-                   (when-let ((io (async-request-io-handle handle)))
-                     (ignore-errors (cancel event-backend io)))
-                   (when-let ((tm (async-request-timer-handle handle)))
-                     (ignore-errors (cancel event-backend tm)))
-                   (close-connection)
+                   (complete-request)
+                   (handler-case (funcall cb res)
+                     (error (e) (warn "callback failed: ~A" e)))))
+               (deliver-stream (res)
+                 "Streaming: deliver headers+body stream; keep socket feeding."
+                 (unless headers-delivered-p
+                   (setf headers-delivered-p t)
                    (handler-case (funcall cb res)
                      (error (e) (warn "callback failed: ~A" e)))))
                (make-hop-response (status headers* body* set-cookies final-url
@@ -302,10 +498,18 @@
                  (let ((location (gethash "location" headers*)))
                    (cond
                      ((or (null location) (not (redirect-status-p status)))
+                      (setf reuse-ok-p
+                            (and keep-alive-p
+                                 (response-keeps-alive-p
+                                  headers* (fast-http:http-version http))))
                       (succeed (make-hop-response
                                 status headers* body* set-cookies final-url
                                 :history-for-final (nreverse history))))
                      ((zerop max-redirects)
+                      (setf reuse-ok-p
+                            (and keep-alive-p
+                                 (response-keeps-alive-p
+                                  headers* (fast-http:http-version http))))
                       (succeed (make-hop-response
                                 status headers* body* set-cookies final-url
                                 :history-for-final (nreverse history))))
@@ -319,6 +523,10 @@
                                                final-url)
                             history)
                       (incf redirect-hops)
+                      (setf reuse-ok-p
+                            (and keep-alive-p
+                                 (response-keeps-alive-p
+                                  headers* (fast-http:http-version http))))
                       (handler-case
                           (let ((next (resolve-redirect-uri uri location)))
                             (when (and chunked-p
@@ -342,34 +550,46 @@
                                     https https?
                                     scheme (if https? "https" "http")
                                     req-octets (build-request-octets
-                                                method uri headers body-octets)
+                                                method uri headers body-octets
+                                                :absolute-p proxied-http-p
+                                                :keep-alive keep-alive-p)
                                     wpos 0
-                                    phase :reconnect)
+                                    phase :reconnect
+                                    pool-key* (pool-key scheme host port
+                                                        :proxy proxy-url))
                               (reset-parser)
                               (next-tick
                                (lambda ()
                                  (unless (async-request-canceled-p handle)
-                                   (close-connection)
-                                   (setf io-dir nil)
+                                   ;; Prefer pool release over hard close when
+                                   ;; the redirect hop can reuse the socket.
+                                   (release-or-close)
+                                   (setf (async-request-canceled-p handle) nil)
                                    (do-connect))))))
                         (http-error (e) (fail e))
                         (error (e)
                           (fail (make-condition 'http-redirect-error
                                                 :message (princ-to-string e)))))))))
                (finish-response ()
-                 (let* ((final-url (quri:render-uri uri))
-                        (set-cookies (merge-response-cookies
-                                      cookie-jar final-url hdrs))
-                        (status (fast-http:http-status http)))
-                   (multiple-value-bind (body* headers*)
-                       (apply-response-content-encoding
-                        (coerce body '(simple-array (unsigned-byte 8) (*)))
-                        hdrs
-                        :decompress (http-request-decompress request))
-                     (follow-redirect status headers* body* set-cookies
-                                      final-url))))
-               (on-connected ()
-                 (set-socket-nonblocking sock t)
+                 (cond
+                   (streaming-final-p
+                    (when body-feed
+                      (async-body-eof body-feed))
+                    (complete-request))
+                   (t
+                    (let* ((final-url (quri:render-uri uri))
+                           (set-cookies (merge-response-cookies
+                                         cookie-jar final-url hdrs))
+                           (status (fast-http:http-status http)))
+                      (multiple-value-bind (body* headers*)
+                          (apply-response-content-encoding
+                           (coerce body '(simple-array (unsigned-byte 8) (*)))
+                           hdrs
+                           :decompress (http-request-decompress request))
+                        (follow-redirect status headers* body* set-cookies
+                                         final-url))))))
+               (begin-origin-io ()
+                 "After TCP (and optional SOCKS), start TLS or HTTP write."
                  (if https
                      (progn
                        (setf tls (make-tls-session fd host :verify verify)
@@ -381,6 +601,193 @@
                        (setf phase :write)
                        (arm-io :write)
                        (next-tick (lambda () (on-io :ok))))))
+               (%socks-append (octets n)
+                 (loop for i below n
+                       do (vector-push-extend (aref octets i) socks-in)))
+               (%socks-write-step ()
+                 (let ((n (socket-send-octets sock socks-out socks-wpos
+                                              (length socks-out))))
+                   (cond
+                     ((null n) (arm-io :write) nil)
+                     ((zerop n) (arm-io :write) nil)
+                     (t
+                      (incf socks-wpos n)
+                      (if (>= socks-wpos (length socks-out))
+                          t
+                          (progn (arm-io :write) nil))))))
+               (do-socks ()
+                 "SOCKS5 state machine on the cleartext socket."
+                 (handler-case
+                     (ecase socks-step
+                       (:greet-write
+                        (when (%socks-write-step)
+                          (setf socks-step :greet-read
+                                (fill-pointer socks-in) 0)
+                          (arm-io :read)))
+                       (:greet-read
+                        (let ((n (socket-recv-octets sock recv-buf)))
+                          (when (null n) (arm-io :read) (return-from do-socks))
+                          (when (zerop n)
+                            (return-from do-socks
+                              (fail (make-condition 'http-connection-error
+                                                    :message "SOCKS5 EOF on greet"))))
+                          (%socks-append recv-buf n)
+                          (when (>= (fill-pointer socks-in) 2)
+                            (unless (= (aref socks-in 0) #x05)
+                              (return-from do-socks
+                                (fail (make-condition 'http-connection-error
+                                                      :message "not SOCKS5"))))
+                            (let ((method (aref socks-in 1)))
+                              (case method
+                                (#x00
+                                 (setf socks-out (socks5-connect-request
+                                                  host port
+                                                  :remote-dns socks-remote-dns)
+                                       socks-wpos 0
+                                       socks-step :connect-write)
+                                 (arm-io :write)
+                                 (next-tick #'do-socks))
+                                (#x02
+                                 (unless socks-user
+                                   (return-from do-socks
+                                     (fail (make-condition
+                                            'http-connection-error
+                                            :message "SOCKS5 auth required"))))
+                                 (setf socks-out (socks5-userpass-request
+                                                  socks-user socks-pass)
+                                       socks-wpos 0
+                                       socks-step :auth-write)
+                                 (arm-io :write)
+                                 (next-tick #'do-socks))
+                                (t
+                                 (fail (make-condition
+                                        'http-connection-error
+                                        :message
+                                        (format nil "SOCKS5 method ~D rejected"
+                                                method)))))))))
+                       (:auth-write
+                        (when (%socks-write-step)
+                          (setf socks-step :auth-read
+                                (fill-pointer socks-in) 0)
+                          (arm-io :read)))
+                       (:auth-read
+                        (let ((n (socket-recv-octets sock recv-buf)))
+                          (when (null n) (arm-io :read) (return-from do-socks))
+                          (when (zerop n)
+                            (return-from do-socks
+                              (fail (make-condition 'http-connection-error
+                                                    :message "SOCKS5 EOF on auth"))))
+                          (%socks-append recv-buf n)
+                          (when (>= (fill-pointer socks-in) 2)
+                            (unless (zerop (aref socks-in 1))
+                              (return-from do-socks
+                                (fail (make-condition 'http-connection-error
+                                                      :message "SOCKS5 auth failed"))))
+                            (setf socks-out (socks5-connect-request
+                                             host port
+                                             :remote-dns socks-remote-dns)
+                                  socks-wpos 0
+                                  socks-step :connect-write)
+                            (arm-io :write)
+                            (next-tick #'do-socks))))
+                       (:connect-write
+                        (when (%socks-write-step)
+                          (setf socks-step :connect-read
+                                (fill-pointer socks-in) 0)
+                          (arm-io :read)))
+                       (:connect-read
+                        (let ((n (socket-recv-octets sock recv-buf)))
+                          (when (null n) (arm-io :read) (return-from do-socks))
+                          (when (zerop n)
+                            (return-from do-socks
+                              (fail (make-condition 'http-connection-error
+                                                    :message "SOCKS5 EOF on connect"))))
+                          (%socks-append recv-buf n)
+                          (let ((len (socks5-reply-length socks-in)))
+                            (when len
+                              (unless (socks5-reply-ok-p socks-in)
+                                (return-from do-socks
+                                  (fail (make-condition
+                                         'http-connection-error
+                                         :message
+                                         (format nil "SOCKS5 CONNECT failed status=~D"
+                                                 (aref socks-in 1))))))
+                              (begin-origin-io))))))
+                   (http-error (e) (fail e))
+                   (error (e)
+                     (fail (make-condition 'http-connection-error
+                                           :message (princ-to-string e))))))
+               (%connect-append (octets n)
+                 (loop for i below n
+                       do (vector-push-extend (aref octets i) connect-in)))
+               (%connect-write-step ()
+                 (let ((n (socket-send-octets sock connect-out connect-wpos
+                                              (length connect-out))))
+                   (cond
+                     ((null n) (arm-io :write) nil)
+                     ((zerop n) (arm-io :write) nil)
+                     (t
+                      (incf connect-wpos n)
+                      (if (>= connect-wpos (length connect-out))
+                          t
+                          (progn (arm-io :write) nil))))))
+               (do-http-connect ()
+                 "HTTP CONNECT tunnel (dexador make-connect-stream) before TLS."
+                 (handler-case
+                     (ecase connect-step
+                       (:write
+                        (when (%connect-write-step)
+                          (setf connect-step :read
+                                (fill-pointer connect-in) 0)
+                          (arm-io :read)))
+                       (:read
+                        (let ((n (socket-recv-octets sock recv-buf)))
+                          (when (null n) (arm-io :read) (return-from do-http-connect))
+                          (when (zerop n)
+                            (return-from do-http-connect
+                              (fail (make-condition 'http-connection-error
+                                                    :message "proxy CONNECT EOF"))))
+                          (%connect-append recv-buf n)
+                          (let ((hend (%header-block-end connect-in)))
+                            (when hend
+                              (unless (connect-response-ok-p connect-in)
+                                (return-from do-http-connect
+                                  (fail (make-condition
+                                         'http-connection-error
+                                         :message
+                                         (format nil "proxy CONNECT failed: ~A"
+                                                 (babel:octets-to-string
+                                                  connect-in :end (min hend 120)
+                                                  :encoding :utf-8 :errorp nil))))))
+                              (begin-origin-io))))))
+                   (http-error (e) (fail e))
+                   (error (e)
+                     (fail (make-condition 'http-connection-error
+                                           :message (princ-to-string e))))))
+               (on-connected ()
+                 (set-socket-nonblocking sock t)
+                 (cond
+                   (socks-p
+                    (setf phase :socks
+                          socks-step :greet-write
+                          socks-out (socks5-greeting :username socks-user)
+                          socks-wpos 0
+                          (fill-pointer socks-in) 0)
+                    (arm-io :write)
+                    (next-tick (lambda () (on-io :ok))))
+                   (http-connect-p
+                    (setf phase :http-connect
+                          connect-step :write
+                          connect-out (build-connect-request-octets
+                                       host port
+                                       :proxy-authorization
+                                       (proxy-authorization-value
+                                        proxy-user proxy-pass))
+                          connect-wpos 0
+                          (fill-pointer connect-in) 0)
+                    (arm-io :write)
+                    (next-tick (lambda () (on-io :ok))))
+                   (t (begin-origin-io))))
                (do-tls-hs ()
                  (loop
                    (ecase (tls-handshake-step tls)
@@ -453,7 +860,11 @@
                       (arm-io :read)
                       (return)))))
                (do-read ()
+                 (when read-paused-p
+                   (return-from do-read nil))
                  (loop
+                   (when read-paused-p
+                     (return))
                    (multiple-value-bind (n want)
                        (if https
                            (tls-read-octets tls recv-buf)
@@ -471,8 +882,21 @@
                                    :message "incomplete HTTP response")))
                         (return))
                        (t
-                        (when (funcall parse! recv-buf :end n)
+                        (when (handler-case
+                                  (funcall parse! recv-buf :end n)
+                                (error (e)
+                                  ;; Keep raw bytes: reuse bugs (pooled sockets)
+                                  ;; show up as mid-stream parses.
+                                  (error 'http-protocol-error
+                                         :message
+                                         (format nil "response parse failed (pooled=~A n=~D): ~A; bytes: ~S"
+                                                 from-pool-p n e
+                                                 (babel:octets-to-string
+                                                  recv-buf :end (min n 160)
+                                                  :encoding :utf-8 :errorp nil)))))
                           (finish-response)
+                          (return))
+                        (when read-paused-p
                           (return)))))))
                (on-io (status)
                  (when (or (async-request-canceled-p handle)
@@ -487,6 +911,8 @@
                        (:connecting
                         (when (tcp-connect-finish sock)
                           (on-connected)))
+                       (:socks (do-socks))
+                       (:http-connect (do-http-connect))
                        (:tls-hs (do-tls-hs))
                        (:write (do-write))
                        (:read (do-read)))

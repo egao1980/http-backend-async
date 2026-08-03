@@ -1,57 +1,5 @@
 (in-package #:http-backend-async/tests)
 
-(defun %make-event-backend ()
-  (let* ((name (or (uiop:getenv "HTTP_ASYNC_EVENT_BACKEND") "libuv"))
-         (key (intern (string-upcase name) :keyword))
-         (sys (ecase key
-                (:libuv "event-backend-libuv")
-                (:libev "event-backend-libev")))
-         (pkg (ecase key
-                (:libuv :event-backend-libuv)
-                (:libev :event-backend-libev)))
-         (maker-name (ecase key
-                       (:libuv "MAKE-LIBUV-BACKEND")
-                       (:libev "MAKE-LIBEV-BACKEND"))))
-    (asdf:load-system sys)
-    (funcall (symbol-function (find-symbol maker-name pkg)))))
-
-(defmacro with-async-test ((backend-var loop-var http-backend-var) &body body)
-  `(let* ((,backend-var (%make-event-backend))
-          (,loop-var (make-event-loop ,backend-var))
-          (,http-backend-var (make-async-backend))
-          (*event-backend-maker* (lambda () ,backend-var)))
-     (with-event-backend (,backend-var)
-       (with-event-loop-var (,loop-var)
-         (let ((*http-backend* ,http-backend-var))
-           ,@body)))))
-
-(defun %await-promise (promise event-backend event-loop &key (timeout 5.0))
-  "Run EVENT-LOOP until PROMISE finishes or TIMEOUT. Returns response or signals."
-  (let ((result nil)
-        (err nil)
-        (done nil))
-    (blackbird:catcher
-      (blackbird:attach promise
-                        (lambda (v)
-                          (setf result v done t)
-                          (stop event-backend event-loop)))
-      (error (e)
-        (setf err e done t)
-        (stop event-backend event-loop)))
-    (sleep* event-backend event-loop timeout
-            :callback (lambda ()
-                        (unless done
-                          (setf err (make-condition 'http-timeout-error
-                                                    :message "test await timed out")
-                                done t)
-                          (stop event-backend event-loop))))
-    (event-protocol:run event-backend event-loop :stop-when-idle nil)
-    (when err (error err))
-    result))
-
-(defun %body-text (res)
-  (babel:octets-to-string (response-body res) :encoding :utf-8 :errorp nil))
-
 ;;; --- requests-shaped local fixture (httpbin paths) ---
 
 (deftest test-http-200-ok-get
@@ -259,5 +207,61 @@
       (declare (ignore hb))
       (let* ((url (fixture-url (format nil "/absolute/~A/ok" *fixture-port*)))
              (res (%await-promise (get-async url) eb el)))
+        (ok (= 200 (response-status res)))
+        (ok (equalp (babel:string-to-octets "ok") (response-body res)))))))
+
+(deftest test-want-stream-body
+  "cl-stack#71: async :want-stream delivers a readable Gray stream (not a vector)."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (multiple-value-bind (res octets)
+          (%await-stream-promise
+           (http:stream-async :get (fixture-url "/bytes/64"))
+           eb el)
+        (ok (= 200 (response-status res)))
+        (ok (streamp (response-body res)))
+        (ok (= 64 (length octets)))
+        (ok (equalp (loop for i below 64 collect (mod i 256))
+                    (coerce octets 'list)))))))
+
+(deftest test-want-stream-gzip
+  "cl-stack#71: streamed response + CE decode via Gray wrap."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (multiple-value-bind (res octets)
+          (%await-stream-promise
+           (http:stream-async :get (fixture-url "/gzip")
+                              :accept-encoding '(:gzip))
+           eb el)
+        (ok (= 200 (response-status res)))
+        (ok (streamp (response-body res)))
+        (ok (null (response-header res :content-encoding)))
+        (let ((text (babel:octets-to-string octets :encoding :utf-8 :errorp nil)))
+          (ok (search "gzipped" text :test #'char-equal)))))))
+
+(deftest test-want-stream-redirect
+  "want-stream follows redirect; final body is a stream."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (multiple-value-bind (res octets)
+          (%await-stream-promise
+           (http:stream-async :get (fixture-url "/redirect/1"))
+           eb el)
+        (ok (= 200 (response-status res)))
+        (ok (streamp (response-body res)))
+        (ok (equalp (babel:string-to-octets "ok") octets))
+        (ok (= 1 (length (response-history res))))))))
+
+(deftest test-sync-send-awaits-async
+  "Blocking SEND on async-backend runs the event loop to completion."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore eb el))
+      (let* ((client (make-http-client hb :timeout (make-http-timeout :total 5)))
+             (res (send hb client (make-http-request :method :get
+                                                     :url (fixture-url "/ok")))))
         (ok (= 200 (response-status res)))
         (ok (equalp (babel:string-to-octets "ok") (response-body res)))))))
