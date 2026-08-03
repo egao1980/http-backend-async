@@ -24,6 +24,17 @@
 (cl-repository-client/asdf-integration:configure-asdf-source-registry)
 (cl-repository-client/asdf-integration:load-system-init-files)
 
+(defun ci-assert-http-protocol-api ()
+  "Fail fast if OCI/sibling http-protocol lacks prepare-request-body (#73)."
+  (asdf:load-system "http-protocol")
+  (format t "~&; ci: http-protocol from ~a~%"
+          (asdf:system-source-directory (asdf:find-system "http-protocol")))
+  (unless (and (find-package :http-protocol)
+               (fboundp (find-symbol "PREPARE-REQUEST-BODY" :http-protocol))
+               (boundp (find-symbol "*HTTP-STREAM-BUFFER-SIZE*" :http-protocol)))
+    (error "http-protocol missing prepare-request-body / *http-stream-buffer-size* ~
+(need republished OCI 0.1.0 from http-protocol#9)")))
+
 (let* ((backend (string-downcase (or (uiop:getenv "HTTP_ASYNC_EVENT_BACKEND") "libuv")))
        (event-sys (cond ((string= backend "libuv") "event-backend-libuv")
                         ((string= backend "libev") "event-backend-libev")
@@ -39,6 +50,7 @@
      (asdf:load-system "cl+ssl")
      (asdf:load-system "cl-stack-ssl")
      (asdf:load-system event-sys)
+     (ci-assert-http-protocol-api)
      (asdf:load-system "http-backend-async")
      (asdf:test-system "http-backend-async"))))
 
