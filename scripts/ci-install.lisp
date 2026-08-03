@@ -124,7 +124,7 @@
      (ci-install "cl-plus-ssl" :version "latest") ; real :latest tag
      ;; All GHCR pulls before any ql:quickload / ASDF load.
      ;; Omit :version → cl-repo picks newest published tag.
-     (ci-fetch "http-protocol")
+     (ci-fetch "http-protocol" :version "0.2.0")
      (ci-fetch "http-encoding-chipz")
      (ci-fetch "http-encoding-brotli")
      (ci-fetch "cl-stack-brotli")

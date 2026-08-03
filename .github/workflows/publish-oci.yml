@@ -16,8 +16,8 @@ on:
         default: "ghcr.io"
 
 env:
-  PACKAGE_VERSION_DEFAULT: "0.1.0"
-  PACKAGER_TAG: "0.8.0"
+  PACKAGE_VERSION_DEFAULT: "0.1.1"
+  PACKAGER_TAG: "0.10.0"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:

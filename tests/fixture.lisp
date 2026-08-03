@@ -161,6 +161,9 @@
             (buf (make-array n :element-type '(unsigned-byte 8))))
        (loop for i below n do (setf (aref buf i) (mod i 256)))
        (values 200 '(("content-type" . "application/octet-stream")) buf)))
+    ((string= path "/json")
+     (values 200 '(("content-type" . "application/json"))
+             (babel:string-to-octets "{\"ok\": true}")))
     ;; requests Session cookie persistence (set → echo Cookie header)
     ((string= path "/cookies/set")
      (values 200

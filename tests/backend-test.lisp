@@ -62,6 +62,44 @@
         (ok (= 200 (response-status res)))
         (ok (equalp payload (response-body res)))))))
 
+(deftest test-post-form-data-urlencoded
+  "http-protocol 0.2 :form-data → urlencoded body on the wire."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let ((res (%await-promise
+                  (post-async (fixture-url "/echo")
+                              :form-data '(("q" . "hi there") ("n" . "1")))
+                  eb el)))
+        (ok (= 200 (response-status res)))
+        (ok (equalp (babel:string-to-octets "q=hi+there&n=1")
+                    (response-body res)))))))
+
+(deftest test-post-typed-data-text
+  "http-protocol 0.2 :data + :data-type :text."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let ((res (%await-promise
+                  (post-async (fixture-url "/echo")
+                              :data "hello" :data-type :text)
+                  eb el)))
+        (ok (= 200 (response-status res)))
+        (ok (equalp (babel:string-to-octets "hello") (response-body res)))))))
+
+(deftest test-response-data-with-deserializer
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let ((res (%await-promise (get-async (fixture-url "/json")) eb el)))
+        (ok (= 200 (response-status res)))
+        (with-data-deserializer (:json (lambda (octets)
+                                         (babel:octets-to-string octets
+                                                                 :encoding :utf-8)))
+          (ok (search "ok"
+                      (response-data res :json)
+                      :test #'char-equal)))))))
+
 (deftest test-cancel-in-flight
   (with-http-fixture ()
     (with-async-test (eb el hb)
