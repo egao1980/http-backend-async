@@ -266,7 +266,11 @@ Returns NIL if connect still pending (spurious wakeup)."
              (eintr (%soft-class :sb-bsd-sockets "INTERRUPTED-ERROR"))
              (op-in-prog (%soft-class :sb-bsd-sockets "OPERATION-IN-PROGRESS")))
          (handler-case
-             (funcall send impl buf len)
+             (let ((n (funcall send impl buf len)))
+               ;; Same Windows guard as recv: -1 leaked as unsigned is not a count.
+               (if (and (integerp n) (<= 0 n len))
+                   n
+                   nil))
            (error (e)
              (cond
                ((and eintr (typep e eintr)) nil)
@@ -298,8 +302,13 @@ Returns NIL if connect still pending (spurious wakeup)."
              (multiple-value-bind (buf n)
                  (funcall recv impl buffer (length buffer))
                (declare (ignore buf))
-               ;; NIL length → would-block on nonblocking SBCL sockets
-               n)
+               ;; NIL length → would-block on nonblocking SBCL sockets.
+               ;; Windows SBCL can leak recv()'s -1 (WSAEWOULDBLOCK) as an
+               ;; unsigned count (4294967295) instead of signaling — treat any
+               ;; out-of-range count as would-block, never as data.
+               (if (and (integerp n) (<= 0 n (length buffer)))
+                   n
+                   nil))
            (error (e)
              (cond
                ((and eintr (typep e eintr)) nil)
