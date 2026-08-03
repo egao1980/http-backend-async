@@ -58,3 +58,47 @@
         (ok (and *fixture-last-request-target*
                  (string-equal "http://" *fixture-last-request-target* :end2 7)))
         (ok (search "/ok" *fixture-last-request-target*))))))
+
+(defun %call-with-env (bindings thunk)
+  (let ((saved (mapcar (lambda (b)
+                         (list (first b) (uiop:getenv (first b))))
+                       bindings)))
+    (unwind-protect
+         (progn
+           (dolist (b bindings)
+             (destructuring-bind (name value) b
+               (if value
+                   (setf (uiop:getenv name) value)
+                   #+sbcl (sb-posix:unsetenv name)
+                   #-sbcl (setf (uiop:getenv name) ""))))
+           (funcall thunk))
+      (dolist (b saved)
+        (destructuring-bind (name value) b
+          (if value
+              (setf (uiop:getenv name) value)
+              #+sbcl (sb-posix:unsetenv name)
+              #-sbcl (setf (uiop:getenv name) "")))))))
+
+(deftest http-proxy-from-env-system-automatic
+  "SYSTEM path: live HTTP_PROXY (env > registry) → absolute-form via async."
+  (setf *fixture-last-request-target* nil)
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (%call-with-env
+       `(("http_proxy" ,(format nil "http://127.0.0.1:~A" *fixture-port*))
+         ("HTTP_PROXY" nil)
+         ("https_proxy" nil) ("HTTPS_PROXY" nil)
+         ("all_proxy" nil) ("ALL_PROXY" nil)
+         ("no_proxy" nil) ("NO_PROXY" nil))
+       (lambda ()
+         (let* ((cfg (make-http-proxy-config :system nil
+                                             :system-automatic-p t
+                                             :proxy nil))
+                (client (make-http-client hb :proxy cfg :pool nil))
+                (res (%await-promise (get-async (fixture-url "/ok") :client client)
+                                     eb el)))
+           (ok (= 200 (response-status res)))
+           (ok (equalp (babel:string-to-octets "ok") (response-body res)))
+           (ok (and *fixture-last-request-target*
+                    (string-equal "http://" *fixture-last-request-target*
+                                  :end2 7)))))))))

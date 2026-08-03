@@ -4,8 +4,9 @@
 
 (defun %uri-host-port (uri)
   (let* ((scheme (or (quri:uri-scheme uri) "http"))
-         (host (or (quri:uri-host uri)
-                   (error 'http-connection-error :message "URL missing host")))
+         (host (strip-ipv6-brackets
+                (or (quri:uri-host uri)
+                    (error 'http-connection-error :message "URL missing host"))))
          (port (or (quri:uri-port uri)
                    (if (string-equal scheme "https") 443 80))))
     (unless (member scheme '("http" "https") :test #'string-equal)

@@ -73,7 +73,15 @@
          (redirect-hops 0)
          (history nil)
          (proxy-cfg (effective-proxy-config request client))
-         (proxy-url (resolve-proxy proxy-cfg uri))
+         ;; Protocol: env > registry/PAC. Residual :SYSTEM = WinHTTP AUTOMATIC.
+         (proxy-url
+          (let ((p (resolve-proxy proxy-cfg uri)))
+            (when (eq p :system)
+              (error 'unsupported-operation
+                     :operation :system-proxy
+                     :message
+                     "OS automatic proxy residual (:SYSTEM / PAC/WPAD) not wired on async-backend; set http(s)_proxy or an explicit :proxy"))
+            p))
          (pool (effective-connection-pool client)))
     (multiple-value-bind (host port scheme) (%uri-host-port uri)
       (multiple-value-bind (event-backend event-loop) (%ensure-event-context)
@@ -139,11 +147,6 @@
                (keep-alive-p nil))
           (declare (ignorable pool pool-key*))
           (when proxy-url
-            (when (eq proxy-url :system)
-              (error 'unsupported-operation
-                     :operation :system-proxy
-                     :message
-                     "OS automatic proxy (:SYSTEM) not yet wired on async-backend"))
             (multiple-value-bind (pscheme phost pport puser ppass)
                 (parse-proxy-uri proxy-url)
               (ecase (proxy-kind proxy-url)
