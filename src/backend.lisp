@@ -314,34 +314,39 @@
                      (:want-write
                       (arm-io :write)
                       (return)))))
+               (arm-tls-want (want)
+                 "Map TLS WANT_* to a single register-io direction (never :read-write)."
+                 (arm-io (ecase want
+                           (:want-read :read)
+                           (:want-write :write))))
                (do-write ()
                  (loop
                    (when (>= wpos (length req-octets))
                      (setf phase :read)
                      (arm-io :read)
                      (return))
-                   (let ((n (if https
-                                (tls-write-octets tls req-octets wpos
-                                                  (length req-octets))
-                                (socket-send-octets
-                                 sock req-octets wpos (length req-octets)))))
+                   (multiple-value-bind (n want)
+                       (if https
+                           (tls-write-octets tls req-octets wpos
+                                             (length req-octets))
+                           (values (socket-send-octets
+                                    sock req-octets wpos (length req-octets))
+                                   nil))
                      (cond
                        ((null n)
-                        (when https
-                          ;; TLS may WANT_READ while writing
-                          (arm-io :read-write))
+                        (when want (arm-tls-want want))
                         (return))
                        ((zerop n) (return))
                        (t (incf wpos n))))))
                (do-read ()
                  (loop
-                   (let ((n (if https
-                                (tls-read-octets tls recv-buf)
-                                (socket-recv-octets sock recv-buf))))
+                   (multiple-value-bind (n want)
+                       (if https
+                           (tls-read-octets tls recv-buf)
+                           (values (socket-recv-octets sock recv-buf) nil))
                      (cond
                        ((null n)
-                        (when https
-                          (arm-io :read-write))
+                        (when want (arm-tls-want want))
                         (return))
                        ((zerop n)
                         (funcall parse! #())

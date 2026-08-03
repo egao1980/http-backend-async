@@ -93,12 +93,18 @@
 ;;; --- nonblocking connect (SBCL) -------------------------------------------
 
 #+sbcl
-(defun %resolve-inet-address (host)
+(defun %resolve-inet-addresses (host)
+  "All A/AAAA addresses for HOST (same family mix as get-host-by-name)."
   (handler-case
       (let* ((ent (sb-bsd-sockets:get-host-by-name
                    (if (stringp host) host (princ-to-string host))))
-             (addr (sb-bsd-sockets:host-ent-address ent)))
-        (values addr (= 16 (length addr))))
+             (addrs (or (sb-bsd-sockets:host-ent-addresses ent)
+                        (list (sb-bsd-sockets:host-ent-address ent)))))
+        (unless addrs
+          (error 'http-connection-error
+                 :message (format nil "DNS returned no addresses for ~A" host)))
+        addrs)
+    (http-connection-error (e) (error e))
     (error (e)
       (error 'http-connection-error
              :message (format nil "DNS failed for ~A: ~A" host e)))))
@@ -143,45 +149,63 @@
             (cffi:mem-ref err :int))))
     (error () nil)))
 
+#+sbcl
+(defun %try-connect-addr (addr port)
+  "Nonblocking connect to one ADDR.
+Returns (values usock :connected|:pending), or (values nil error) on immediate failure."
+  (let* ((ipv6 (= 16 (length addr)))
+         (sock (make-instance (if ipv6
+                                  'sb-bsd-sockets:inet6-socket
+                                  'sb-bsd-sockets:inet-socket)
+                              :type :stream :protocol :tcp))
+         (usock nil)
+         (ok nil))
+    (unwind-protect
+         (progn
+           (ignore-errors
+             (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t))
+           (setf (sb-bsd-sockets:non-blocking-mode sock) t)
+           (setf usock (usocket::make-stream-socket
+                        :socket sock
+                        :stream usocket::*dummy-stream*))
+           (handler-case
+               (progn
+                 (sb-bsd-sockets:socket-connect sock addr port)
+                 (%ensure-connected-stream usock)
+                 (setf ok t)
+                 (values usock :connected))
+             (error (e)
+               (if (%in-progress-condition-p e)
+                   (progn
+                     (setf ok t)
+                     (values usock :pending))
+                   (values nil e)))))
+      (unless ok
+        (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+
 (defun tcp-connect-nb (host port)
   "Start TCP connect without blocking the event loop when possible.
 
 Returns (values usocket status) where STATUS is:
   :connected — ready for I/O
-  :pending   — arm register-io :write (or :read-write), then TCP-CONNECT-FINISH"
+  :pending   — arm register-io :write, then TCP-CONNECT-FINISH
+
+On SBCL, tries each DNS address until one connects or goes pending
+(immediate refusals/unreachable skip to the next; EINPROGRESS stops the walk)."
   #+sbcl
-  (multiple-value-bind (addr ipv6) (%resolve-inet-address host)
-    (let* ((sock (make-instance (if ipv6
-                                    'sb-bsd-sockets:inet6-socket
-                                    'sb-bsd-sockets:inet-socket)
-                                :type :stream :protocol :tcp))
-           (usock nil)
-           (ok nil))
-      (unwind-protect
-           (progn
-             (ignore-errors
-               (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t))
-             (setf (sb-bsd-sockets:non-blocking-mode sock) t)
-             (setf usock (usocket::make-stream-socket
-                          :socket sock
-                          :stream usocket::*dummy-stream*))
-             (handler-case
-                 (progn
-                   (sb-bsd-sockets:socket-connect sock addr port)
-                   (%ensure-connected-stream usock)
-                   (setf ok t)
-                   (values usock :connected))
-               (error (e)
-                 (cond
-                   ((%in-progress-condition-p e)
-                    (setf ok t)
-                    (values usock :pending))
-                   (t
-                    (error 'http-connection-error
-                           :message (format nil "connect ~A:~A failed: ~A"
-                                            host port e)))))))
-        (unless ok
-          (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+  (return-from tcp-connect-nb
+    (let ((addrs (%resolve-inet-addresses host))
+          (last-err nil))
+      (dolist (addr addrs
+               (error 'http-connection-error
+                      :message (format nil "connect ~A:~A failed: ~A"
+                                       host port
+                                       (or last-err "no addresses"))))
+        (multiple-value-bind (usock status-or-err)
+            (%try-connect-addr addr port)
+          (if usock
+              (return (values usock status-or-err))
+              (setf last-err status-or-err))))))
   #-sbcl
   (let ((usock (tcp-connect host port)))
     (set-socket-nonblocking usock t)
