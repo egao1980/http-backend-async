@@ -8,8 +8,8 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
 
 ## Status (wave-1)
 
-- HTTP/1.1 cleartext over nonblocking TCP (`sb-bsd-sockets`)
-- HTTPS via `cl+ssl` / `cl-stack-ssl`: async TCP connect, then TLS+HTTP
+- HTTP/1.1 over portable **usocket** TCP (FD → `event-protocol:register-io`)
+- HTTPS via `cl+ssl` / `cl-stack-ssl`: usocket connect, then TLS+HTTP
   run-to-completion on the loop thread (cl+ssl socket-BIO waits)
 - `send-async` + `cancel-request`; facade promises via `http:*-async`
 - Content-Encoding decode (chipz; soft-load br/zstd)

@@ -11,6 +11,7 @@ ql trivial-gray-streams
 ql bordeaux-threads
 ql usocket
 ql cl+ssl
+# usocket is the portable TCP layer (not sb-bsd-sockets / iolib).
 # Siblings — CI checkouts + local workspace. Never qlot `github` (rate + /tmp race).
 local http-protocol ../http-protocol
 local event-protocol ../event-protocol

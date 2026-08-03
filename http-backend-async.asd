@@ -10,7 +10,7 @@
                "fast-http"
                "babel"
                "alexandria"
-               "sb-bsd-sockets"
+               "usocket"
                "cl+ssl")
   :serial t
   :pathname "src"

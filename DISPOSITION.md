@@ -12,5 +12,5 @@
 **Reuse ideas, not the stack:** `fast-http` parse, request wire shape, promise DX
 at the facade. Do **not** pull cl-async drivers or Carrier’s loop.
 
-This repo is the thin rewrite: `sb-bsd-sockets` nonblocking TCP +
-`event-protocol:register-io` + HTTP/1.1.
+This repo is the thin rewrite: portable **usocket** TCP +
+`event-protocol:register-io` + HTTP/1.1 (not iolib — Unix-only / no Windows).

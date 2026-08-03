@@ -93,8 +93,8 @@
                (handle (make-instance 'async-request-handle
                                       :event-backend event-backend
                                       :event-loop event-loop))
-               (sock (make-nonblocking-tcp))
-               (fd (socket-fd sock))
+               (sock nil)
+               (fd nil)
                (headers (%merge-headers (http-client-headers client)
                                         (http-request-headers request)))
                (ae (%accept-encoding-header
@@ -103,7 +103,6 @@
                (wpos 0)
                (req-octets nil)
                (recv-buf (make-array 65536 :element-type '(unsigned-byte 8))))
-          (setf (async-request-socket handle) sock)
           (when ae
             (setf headers (acons "accept-encoding" ae
                                  (remove "accept-encoding" headers
@@ -129,10 +128,26 @@
               (make-response-accumulator)
             (labels
                 ((arm-io (direction)
+                   (unless fd
+                     (error 'http-connection-error :message "arm-io before connect"))
                    (when-let ((old (async-request-io-handle handle)))
                      (ignore-errors (cancel event-backend old)))
                    (setf (async-request-io-handle handle)
                          (register-io event-backend event-loop fd direction #'on-io)))
+                 (do-connect ()
+                   "usocket connect on the loop thread, then continue."
+                   (handler-case
+                       (progn
+                         (setf sock (tcp-connect host port)
+                               (async-request-socket handle) sock
+                               fd (socket-fd sock))
+                         (unless https
+                           (set-socket-nonblocking sock t))
+                         (on-connected))
+                     (http-error (e) (fail e))
+                     (error (e)
+                       (fail (make-condition 'http-connection-error
+                                             :message (princ-to-string e))))))
                  (fail (condition)
                    (unless (async-request-canceled-p handle)
                      (setf (async-request-canceled-p handle) t)
@@ -205,11 +220,6 @@
                        (fail (make-condition 'http-tls-error
                                              :message (princ-to-string e))))))
                  (on-connected ()
-                   ;; Drop connect write interest before any further work —
-                   ;; otherwise poll keeps re-entering :connect (libev storm).
-                   (when-let ((io (async-request-io-handle handle)))
-                     (ignore-errors (cancel event-backend io))
-                     (setf (async-request-io-handle handle) nil))
                    (if https
                        (progn
                          (setf phase :tls)
@@ -228,10 +238,7 @@
                                              :message "register-io error"))))
                    (handler-case
                        (ecase phase
-                         (:connect
-                          (on-connected))
                          (:tls
-                          ;; HTTPS runs via deferred https-exchange; ignore stray IO.
                           nil)
                          (:write
                           (loop
@@ -275,10 +282,5 @@
                                   (fail (make-condition
                                          'http-timeout-error
                                          :message "request timed out")))))
-                  (let ((st (begin-connect sock host port)))
-                    (ecase st
-                      (:connected
-                       (on-connected))
-                      (:pending
-                       (arm-io :write)))))))
+                  (defer event-backend event-loop #'do-connect))))
             handle))))))
