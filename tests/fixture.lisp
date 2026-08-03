@@ -54,6 +54,9 @@
     ((string= path "/echo")
      (values 200 '(("content-type" . "application/octet-stream"))
              (or body #())))
+    ((string= path "/json")
+     (values 200 '(("content-type" . "application/json"))
+             (babel:string-to-octets "{\"ok\": true}")))
     ;; requests Session cookie persistence (set → echo Cookie header)
     ((string= path "/cookies/set")
      (values 200
