@@ -10,11 +10,11 @@
 
 (asdf:load-system "cl-repository-client")
 
-(defun ci-load (name &key version (default-source :any))
+(defun ci-load (name &key version)
   (format t "~&; ci: cl-repo load ~a~@[:~a~]~%" name version)
-  (apply #'cl-repo:load-system name
-         :default-source default-source
-         (when version (list :version version))))
+  (if version
+      (cl-repo:load-system name :version version)
+      (cl-repo:load-system name)))
 
 (defun ci-ensure-ql (&rest names)
   "QL only for systems not yet published to egao1980/cl-systems."
