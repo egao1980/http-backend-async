@@ -39,28 +39,16 @@
   (string-upcase (string method)))
 
 (defun %prepare-content (content coding)
-  (if (null coding)
-      (values (etypecase content
-                (null #())
-                (stream (slurp-octets content))
-                ((or string vector) (coerce-to-octets content)))
-              nil)
-      (let* ((c (normalize-content-coding coding))
-             (octets (etypecase content
-                       (null (make-array 0 :element-type '(unsigned-byte 8)))
-                       (stream (slurp-octets content))
-                       ((or string vector) (coerce-to-octets content))))
-             (enc (encode-content-coding c octets)))
-        (values enc (string-downcase (symbol-name c))))))
+  "Buffered stream-aware prepare (cl-stack#71). May return a stream."
+  (prepare-request-content content :coding coding))
 
-(defun build-request-octets (method uri headers body)
-  "Build HTTP/1.1 request octets for absolute-form on origin (host already in headers)."
+(defun %emit-request-lines (method uri headers &key content-length chunked-p)
+  "Shared header serialization → adjustable octet vector (no body)."
   (let* ((path (or (quri:uri-path uri) "/"))
          (query (quri:uri-query uri))
          (target (if query (format nil "~A?~A" path query) path))
-         (body* (or body #()))
          (out (make-array 256 :element-type '(unsigned-byte 8)
-                              :adjustable t :fill-pointer 0))
+                             :adjustable t :fill-pointer 0))
          (crlf (babel:string-to-octets (format nil "~C~C" #\Return #\Newline))))
     (labels ((emit (octets)
                (loop for b across octets do (vector-push-extend b out)))
@@ -70,15 +58,53 @@
       (emit-line (format nil "~A ~A HTTP/1.1" (%method-string method) target))
       (dolist (h headers)
         (emit-line (format nil "~A: ~A" (car h) (cdr h))))
-      (unless (assoc "content-length" headers :test #'string-equal)
-        (when (plusp (length body*))
-          (emit-line (format nil "Content-Length: ~D" (length body*)))))
+      (cond
+        (chunked-p
+         (unless (assoc "transfer-encoding" headers :test #'string-equal)
+           (emit-line "Transfer-Encoding: chunked")))
+        ((and content-length (not (assoc "content-length" headers
+                                         :test #'string-equal)))
+         (emit-line (format nil "Content-Length: ~D" content-length)))
+        ((and (null content-length)
+              (not (assoc "content-length" headers :test #'string-equal)))
+         nil))
       (unless (assoc "connection" headers :test #'string-equal)
         (emit-line "Connection: close"))
       (emit crlf)
-      (when (plusp (length body*))
-        (emit body*))
-      (coerce out '(simple-array (unsigned-byte 8) (*))))))
+      out)))
+
+(defun build-request-header-octets (method uri headers &key chunked-p content-length)
+  "HTTP/1.1 request headers only (chunked streaming body follows)."
+  (coerce (%emit-request-lines method uri headers
+                               :chunked-p chunked-p
+                               :content-length content-length)
+          '(simple-array (unsigned-byte 8) (*))))
+
+(defun build-request-octets (method uri headers body)
+  "Build HTTP/1.1 request octets (headers + materialized BODY vector)."
+  (let* ((body* (or body #()))
+         (out (%emit-request-lines method uri headers
+                                   :content-length (length body*))))
+    (loop for b across body* do (vector-push-extend b out))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun make-chunk-frame (octets &key (start 0) (end (length octets)))
+  "Transfer-Encoding: chunked frame for OCTETS[START:END] (size CRLF data CRLF)."
+  (let* ((n (- end start))
+         (size-line (babel:string-to-octets
+                     (format nil "~X~C~C" n #\Return #\Newline)
+                     :encoding :utf-8))
+         (crlf (babel:string-to-octets (format nil "~C~C" #\Return #\Newline)))
+         (out (make-array (+ (length size-line) n (length crlf))
+                          :element-type '(unsigned-byte 8))))
+    (replace out size-line)
+    (replace out octets :start1 (length size-line) :start2 start :end2 end)
+    (replace out crlf :start1 (+ (length size-line) n))
+    out))
+
+(defparameter +chunked-terminator+
+  (babel:string-to-octets (format nil "0~C~C~C~C" #\Return #\Newline
+                                  #\Return #\Newline)))
 
 (defun apply-response-content-encoding (body headers &key (decompress t))
   "Decode BODY per Content-Encoding. Unlike dexador, we own the full decode path."

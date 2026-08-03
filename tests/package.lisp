@@ -4,7 +4,7 @@
         #:http-protocol
         #:http
         #:http-backend-async)
-  (:shadowing-import-from #:http #:get #:delete #:trace)
+  (:shadowing-import-from #:http #:get #:delete #:trace #:stream)
   (:import-from #:event-protocol
                 #:with-event-backend
                 #:with-event-loop-var
