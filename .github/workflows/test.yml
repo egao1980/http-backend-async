@@ -135,8 +135,9 @@ jobs:
           tar -xzf /tmp/oci/ssl/native-library.tar.gz -C /tmp/nat/ssl
           tar -xzf /tmp/oci/brotli/native-library.tar.gz -C /tmp/nat/brotli
           tar -xzf /tmp/oci/libuv/native-library.tar.gz -C /tmp/nat/libuv
-          # Published grovel-cache for windows (avoids MinGW grovel on consumer CI).
+          # Published grovel-cache (source + cffi-grovel-output layers both carry it).
           tar -xzf /tmp/oci/libuv/event-backend-libuv-0.1.0.tar.gz -C /tmp/nat/libuv-src
+          tar -xzf /tmp/oci/libuv/cffi-grovel-output.tar.gz -C /tmp/nat/libuv-src
           SSL_NAT="$(find /tmp/nat/ssl -type d -name native | head -1)"
           BR_NAT="$(find /tmp/nat/brotli -type d -name native | head -1)"
           UV_NAT="$(find /tmp/nat/libuv -type d -name native | head -1)"
@@ -149,11 +150,11 @@ jobs:
           echo "$SSL_NAT" >> "$GITHUB_PATH"
           echo "$BR_NAT" >> "$GITHUB_PATH"
           echo "$UV_NAT" >> "$GITHUB_PATH"
-          # Install grovel-cache from published windows bundle (overrides checkout grovel).
           mkdir -p "$GITHUB_WORKSPACE/_sib/event-backend-libuv/grovel-cache"
           GROVEL="$(find /tmp/nat/libuv-src -name 'grovel.cffi.lisp' | head -1)"
           : "${GROVEL:?Windows grovel.cffi.lisp not found in libuv bundle}"
           cp "$GROVEL" "$GITHUB_WORKSPACE/_sib/event-backend-libuv/grovel-cache/grovel.cffi.lisp"
+          ls -la "$GROVEL"
           # Stage DLLs into sibling native/ so overlay search paths find them.
           mkdir -p "$GITHUB_WORKSPACE/_sib/cl-stack-ssl/native" \
                    "$GITHUB_WORKSPACE/_sib/cl-stack-brotli/native" \
