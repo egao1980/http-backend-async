@@ -239,9 +239,15 @@
                                                 method uri headers body-octets)
                                     wpos 0
                                     phase :connect)
-                              (close-connection)
                               (reset-parser)
-                              (defer event-backend event-loop #'do-connect)))
+                              ;; Defer close+reconnect: canceling/closing the
+                              ;; active libuv poll from inside its callback
+                              ;; trips uv_poll_stop(!uv__is_closing).
+                              (defer event-backend event-loop
+                                (lambda ()
+                                  (unless (async-request-canceled-p handle)
+                                    (close-connection)
+                                    (do-connect))))))
                         (http-error (e) (fail e))
                         (error (e)
                           (fail (make-condition 'http-redirect-error
