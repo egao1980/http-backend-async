@@ -882,7 +882,18 @@
                                    :message "incomplete HTTP response")))
                         (return))
                        (t
-                        (when (funcall parse! recv-buf :end n)
+                        (when (handler-case
+                                  (funcall parse! recv-buf :end n)
+                                (error (e)
+                                  ;; Keep raw bytes: reuse bugs (pooled sockets)
+                                  ;; show up as mid-stream parses.
+                                  (error 'http-protocol-error
+                                         :message
+                                         (format nil "response parse failed (pooled=~A n=~D): ~A; bytes: ~S"
+                                                 from-pool-p n e
+                                                 (babel:octets-to-string
+                                                  recv-buf :end (min n 160)
+                                                  :encoding :utf-8 :errorp nil)))))
                           (finish-response)
                           (return))
                         (when read-paused-p

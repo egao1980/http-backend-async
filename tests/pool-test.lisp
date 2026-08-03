@@ -46,11 +46,6 @@
 
 (deftest fixture-pool-reuses-tcp
   "Two GETs with keep-alive fixture → one TCP accept, two HTTP requests."
-  ;; Windows CI: keep-alive reuse has hit INVALID-VERSION on the second read
-  ;; (socket stream buffering / register-io). Skip e2e there; LRU unit tests cover pool.
-  #+(or win32 windows)
-  (skip "keep-alive TCP reuse e2e unstable on Windows CI")
-  #-(or win32 windows)
   (let ((http-protocol:*default-connection-pool* nil))
     (with-http-fixture
         ((lambda (method path headers body)
