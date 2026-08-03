@@ -119,6 +119,11 @@
                (keep-alive-p (not (null pool))))
           (declare (ignorable pool-key*))
           (when proxy-url
+            (when (eq proxy-url :system)
+              (error 'unsupported-operation
+                     :operation :system-proxy
+                     :message
+                     "OS automatic proxy (:SYSTEM) not yet wired on async-backend"))
             (multiple-value-bind (pscheme phost pport)
                 (parse-proxy-uri proxy-url)
               (declare (ignore pscheme))
