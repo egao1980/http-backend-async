@@ -92,8 +92,9 @@ jobs:
       - name: Verify
         env:
           PKG_VERSION: ${{ needs.resolve-version.outputs.version }}
+          OCI_REGISTRY: ${{ inputs.registry || 'ghcr.io' }}
         run: |
-          REF="ghcr.io/egao1980/cl-systems/http-backend-async:${PKG_VERSION}"
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          REF="${OCI_REGISTRY}/egao1980/cl-systems/http-backend-async:${PKG_VERSION}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login "$OCI_REGISTRY" -u "${{ github.actor }}" --password-stdin
           oras manifest fetch "$REF"
           echo "OK $REF"

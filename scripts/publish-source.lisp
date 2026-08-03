@@ -19,9 +19,7 @@
                     (env "PKG_SOURCE_DIR" (namestring (uiop:getcwd)))))
        (registry (env "OCI_REGISTRY" "ghcr.io"))
        (namespace (string-downcase (env "OCI_NAMESPACE" "egao1980/cl-systems")))
-       (registry-url (if (string= registry "ghcr.io")
-                         (format nil "https://~a" registry)
-                         (format nil "http://~a" registry)))
+       (registry-url (format nil "https://~a" registry))
        (skip-catalog (string-equal "true" (env "SKIP_CATALOG" "true")))
        (auth (cl-oci-client/auth:make-auth-config
               :username (env "GITHUB_ACTOR")
