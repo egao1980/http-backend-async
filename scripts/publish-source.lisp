@@ -13,10 +13,22 @@
 (defun env (name &optional default)
   (or (uiop:getenv name) default))
 
+(defun sync-asdf-version! (source-dir version)
+  (let ((asd (merge-pathnames "http-backend-async.asd" source-dir)))
+    (with-open-file (in asd :direction :input)
+      (let ((lines (loop for line = (read-line in nil nil) while line collect line)))
+        (with-open-file (out asd :direction :output :if-exists :supersede)
+          (dolist (line lines)
+            (write-line (if (search ":version \"" line)
+                            (format nil "  :version \"~a\"" version)
+                            line)
+                        out)))))))
+
 (let* ((name "http-backend-async")
        (version (env "PKG_VERSION" "0.1.0"))
        (source-dir (uiop:ensure-directory-pathname
                     (env "PKG_SOURCE_DIR" (namestring (uiop:getcwd)))))
+       (_ (sync-asdf-version! source-dir version))
        (registry (env "OCI_REGISTRY" "ghcr.io"))
        (namespace (string-downcase (env "OCI_NAMESPACE" "egao1980/cl-systems")))
        (registry-url (format nil "https://~a" registry))
