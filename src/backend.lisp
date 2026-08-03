@@ -113,6 +113,10 @@
               ((build-headers-and-body ()
                  (setf headers (%merge-headers (http-client-headers client)
                                                (http-request-headers request)))
+                 (setf headers (inject-auth-range-headers
+                                headers
+                                :auth (effective-auth client request)
+                                :range (http-request-range request)))
                  (when ae
                    (setf headers (acons "accept-encoding" ae
                                         (remove "accept-encoding" headers
