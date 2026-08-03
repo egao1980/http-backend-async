@@ -32,17 +32,36 @@
 
 (cl-repo:add-registry "https://ghcr.io" :namespace "egao1980/cl-systems" :priority :prepend)
 
-(defun ci-install (oci-name &key (version "latest"))
-  (format t "~&; ci: install ~a:~a~%" oci-name version)
-  (cl-repository-client/installer:install-system
-   "https://ghcr.io" (format nil "egao1980/cl-systems/~a" oci-name) version)
-  (cl-repository-client/asdf-integration:configure-asdf-source-registry))
+(defun ci-newest-tag (oci-name)
+  "Newest version tag on ghcr.io/egao1980/cl-systems/NAME (excludes 'latest')."
+  (let* ((token (or (uiop:getenv "GITHUB_TOKEN") (uiop:getenv "GH_TOKEN")))
+         (auth (when token
+                 (cl-oci-client/auth:make-auth-config
+                  :username (or (uiop:getenv "GITHUB_ACTOR") "x-access-token")
+                  :password token)))
+         (reg (cl-oci-client/registry:make-registry "https://ghcr.io" :auth auth))
+         (repo (format nil "egao1980/cl-systems/~a" oci-name))
+         (tags (cl-oci-client/content-discovery:list-tags reg repo))
+         (version-tags (remove "latest" tags :test #'string=)))
+    (or (cl-repository-client/version-utils:select-preferred-version version-tags)
+        (first tags)
+        (error "ci-newest-tag: no tags for ~a" oci-name))))
+
+(defun ci-install (oci-name &key version)
+  "Install OCI package. VERSION nil → newest published version tag."
+  (let ((version (or version (ci-newest-tag oci-name))))
+    (format t "~&; ci: install ~a:~a~%" oci-name version)
+    (cl-repository-client/installer:install-system
+     "https://ghcr.io" (format nil "egao1980/cl-systems/~a" oci-name) version)
+    (cl-repository-client/asdf-integration:configure-asdf-source-registry)
+    version))
 
 (defun ci-on-disk-p (name)
   (cl-repository-client/quickload::system-already-installed-p name))
 
 (defun ci-fetch (name &key version)
-  "Resolve + install NAME (and OCI plan) without ASDF-load or ql:quickload."
+  "Resolve + install NAME (and OCI plan) without ASDF-load or ql:quickload.
+   VERSION nil → newest published tag (cl-repo :latest)."
   (format t "~&; ci: fetch ~a~@[:~a~]~%" name version)
   (cl-repository-client/source-policy:call-with-policy-overrides
    *ci-ql-sources* nil nil nil
@@ -72,12 +91,16 @@
   (unless (ci-on-disk-p name)
     (error "ci-fetch: ~a not on disk after install" name)))
 
-(defun ci-patch-stack-ssl (&optional (version "3.4.1"))
+(defun ci-patch-stack-ssl (&optional version)
   "Patch stale OCI source (DEFCONSTANT -> DEFPARAMETER) until republished."
-  (let ((setup (probe-file
-                (merge-pathnames
-                 (format nil "cl-stack-ssl/~a/src/setup.lisp" version)
-                 (cl-repository-client/installer:systems-root)))))
+  (let* ((root (cl-repository-client/installer:systems-root))
+         (setup
+           (or (when version
+                 (probe-file
+                  (merge-pathnames
+                   (format nil "cl-stack-ssl/~a/src/setup.lisp" version) root)))
+               (first (directory
+                       (merge-pathnames "cl-stack-ssl/*/src/setup.lisp" root))))))
     (when setup
       (let* ((text (uiop:read-file-string setup))
              (fixed (search "(defconstant +openssl-version+" text :test #'char-equal)))
@@ -91,31 +114,38 @@
           (format t "~&; ci: patched ~a~%" setup))))))
 
 (let* ((backend (string-downcase (or (uiop:getenv "HTTP_ASYNC_EVENT_BACKEND") "libuv")))
-       (cl-stack-ssl-version (or (uiop:getenv "CL_STACK_SSL_VERSION") "3.4.1"))
+       (cl-stack-ssl-version (uiop:getenv "CL_STACK_SSL_VERSION"))
        (event-sys (cond ((string= backend "libuv") "event-backend-libuv")
                         ((string= backend "libev") "event-backend-libev")
                         (t (error "Unknown HTTP_ASYNC_EVENT_BACKEND: ~a" backend)))))
   (format t "~&; ci: event backend ~a -> ~a~%" backend event-sys)
   (call-with-ci-muffles
    (lambda ()
-     (ci-install "cl-plus-ssl" :version "latest")
+     (ci-install "cl-plus-ssl" :version "latest") ; real :latest tag
      ;; All GHCR pulls before any ql:quickload / ASDF load.
-     (ci-fetch "http-protocol" :version "0.1.0")
-     (ci-fetch "http-encoding-chipz" :version "0.1.0")
-     (ci-fetch "http-encoding-brotli" :version "0.1.0")
-     (ci-fetch "cl-stack-brotli" :version "1.2.0")
-     (ci-fetch "quri" :version "0.7.1")
-     (ci-fetch "chipz" :version "0.8")
-     (ci-fetch "salza2" :version "2.1")
-     (ci-fetch "alexandria" :version "1.0.1")
-     (ci-fetch "cffi" :version "677cabae64b181330a3bbbda9c11891a2a8edcdc")
-     (ci-fetch "event-protocol" :version "0.1.0")
-     (ci-fetch event-sys :version "0.1.0")
-     (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)
-     (ci-patch-stack-ssl cl-stack-ssl-version)
+     ;; Omit :version → cl-repo picks newest published tag.
+     (ci-fetch "http-protocol")
+     (ci-fetch "http-encoding-chipz")
+     (ci-fetch "http-encoding-brotli")
+     (ci-fetch "cl-stack-brotli")
+     (ci-fetch "quri")
+     (ci-fetch "chipz")
+     (ci-fetch "salza2")
+     (ci-fetch "alexandria")
+     (ci-fetch "cffi")
+     (ci-fetch "event-protocol")
+     (ci-fetch event-sys)
+     (let ((ssl-ver (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)))
+       (ci-patch-stack-ssl ssl-ver)
+       (when (uiop:getenv "GITHUB_ENV")
+         (with-open-file (out (uiop:getenv "GITHUB_ENV")
+                              :direction :output
+                              :if-exists :append :if-does-not-exist :create)
+           (format out "CL_STACK_SSL_VERSION=~a~%" ssl-ver))))
      ;; QL only after OCI HTTPS is done (image will be discarded before tests).
      (dolist (n '("rove" "fast-http" "babel" "usocket" "bordeaux-threads"
-                  "blackbird" "trivial-gray-streams" "cl-cookie" "cl-unicode"))
+                  "blackbird" "trivial-gray-streams" "cl-cookie" "cl-unicode"
+                  "cl-base64"))
        (unless (or (ci-on-disk-p n) (asdf:find-system n nil))
          (format t "~&; ci: ql fallback ~a~%" n)
          (ql:quickload n :silent t))))))

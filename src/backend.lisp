@@ -73,6 +73,11 @@
 
 (defmethod send-async ((backend async-backend) client request
                        &key callback error-callback)
+  (when (http-request-want-stream request)
+    (error 'unsupported-operation
+           :operation :want-stream
+           :message
+           "http-backend-async: response body streams not implemented yet (cl-stack#71); use http-backend-dexador :want-stream t for buffered download"))
   (let* ((cb (or callback (lambda (r) (declare (ignore r)))))
          (eb-cb (or error-callback
                     (lambda (c) (error c))))
@@ -100,6 +105,12 @@
                     (http-request-accept-encoding request)))
                (headers nil)
                (body-octets #())
+               (body-stream-src nil)
+               (chunked-p nil)
+               (stream-body-p nil) ; stream upload (chunked or content-length)
+               (chunk-frame nil)
+               (body-read-buf (make-array *http-stream-buffer-size*
+                                          :element-type '(unsigned-byte 8)))
                (phase :connect)
                (wpos 0)
                (req-octets nil)
@@ -131,16 +142,72 @@
                                 headers)))
                  (setf headers (inject-cookie-header headers cookie-jar
                                                      (quri:render-uri uri)))
-                 (multiple-value-bind (content ce-header)
-                     (%prepare-content (http-request-content request)
-                                       (http-request-content-encoding request))
-                   (when ce-header
-                     (setf headers (acons "content-encoding" ce-header
-                                          (remove "content-encoding" headers
+                 (multiple-value-bind (content extra-headers content-length)
+                     (%prepare-body request)
+                   (dolist (pair extra-headers)
+                     (setf headers (acons (car pair) (cdr pair)
+                                          (remove (car pair) headers
                                                   :key #'car :test #'string-equal))))
-                   (setf body-octets (or content #())))
-                 (setf req-octets (build-request-octets method uri headers body-octets)
-                       wpos 0))
+                   (cond
+                     ((streamp content)
+                      (setf body-stream-src content
+                            body-octets #()
+                            stream-body-p t
+                            chunked-p (null content-length)
+                            headers (if content-length
+                                        (acons "content-length"
+                                               (princ-to-string content-length)
+                                               (remove "content-length" headers
+                                                       :key #'car :test #'string-equal))
+                                        (remove "content-length" headers
+                                                :key #'car :test #'string-equal))
+                            headers (if chunked-p
+                                        (if (assoc "transfer-encoding" headers
+                                                   :test #'string-equal)
+                                            headers
+                                            (acons "transfer-encoding" "chunked"
+                                                   headers))
+                                        headers)
+                            req-octets (build-request-header-octets
+                                        method uri headers
+                                        :chunked-p chunked-p
+                                        :content-length content-length)
+                            wpos 0
+                            chunk-frame nil))
+                     (t
+                      (setf body-stream-src nil
+                            body-octets (or content #())
+                            stream-body-p nil
+                            chunked-p nil
+                            req-octets (build-request-octets
+                                        method uri headers body-octets)
+                            wpos 0
+                            chunk-frame nil)))))
+               (%write-octets (octets from to)
+                 "Write OCTETS[FROM:TO]. Returns (values new-pos done-p want)."
+                 (multiple-value-bind (n want)
+                     (if https
+                         (tls-write-octets tls octets from to)
+                         (values (socket-send-octets sock octets from to) nil))
+                   (cond
+                     ((null n) (values from nil want))
+                     ((zerop n) (values from nil nil))
+                     (t
+                      (let ((pos (+ from n)))
+                        (values pos (>= pos to) nil))))))
+               (%load-next-chunk ()
+                 "Fill CHUNK-FRAME from BODY-STREAM-SRC. Terminator when EOF (chunked)."
+                 (let ((n (read-sequence body-read-buf body-stream-src)))
+                   (setf chunk-frame
+                         (cond
+                           ((plusp n)
+                            (if chunked-p
+                                (make-chunk-frame body-read-buf :end n)
+                                (subseq body-read-buf 0 n)))
+                           (chunked-p +chunked-terminator+)
+                           (t nil))
+                         wpos 0)
+                   n))
                (reset-parser ()
                  (multiple-value-bind (h hd b f p)
                      (make-response-accumulator)
@@ -254,6 +321,11 @@
                       (incf redirect-hops)
                       (handler-case
                           (let ((next (resolve-redirect-uri uri location)))
+                            (when (and chunked-p
+                                       (redirect-preserves-method-p status))
+                              (error 'http-protocol-error
+                                     :message
+                                     "cannot replay streamed request body on redirect"))
                             (multiple-value-bind (m u h b ho po https?)
                                 (prepare-redirect-hop status next method body-octets
                                                       headers cookie-jar ae)
@@ -261,6 +333,10 @@
                                     uri u
                                     headers h
                                     body-octets b
+                                    body-stream-src nil
+                                    stream-body-p nil
+                                    chunked-p nil
+                                    chunk-frame nil
                                     host ho
                                     port po
                                     https https?
@@ -324,24 +400,58 @@
                            (:want-read :read)
                            (:want-write :write))))
                (do-write ()
+                 "Write headers (+ optional body vector), or streamed body."
                  (loop
-                   (when (>= wpos (length req-octets))
-                     (setf phase :read)
-                     (arm-io :read)
-                     (return))
-                   (multiple-value-bind (n want)
-                       (if https
-                           (tls-write-octets tls req-octets wpos
-                                             (length req-octets))
-                           (values (socket-send-octets
-                                    sock req-octets wpos (length req-octets))
-                                   nil))
-                     (cond
-                       ((null n)
-                        (when want (arm-tls-want want))
-                        (return))
-                       ((zerop n) (return))
-                       (t (incf wpos n))))))
+                   (cond
+                     ;; 1) headers / full materialized request
+                     ((and req-octets (< wpos (length req-octets)))
+                      (multiple-value-bind (pos done want)
+                          (%write-octets req-octets wpos (length req-octets))
+                        (setf wpos pos)
+                        (cond
+                          (want (arm-tls-want want) (return))
+                          ((not done) (return))
+                          ((not stream-body-p)
+                           (setf phase :read
+                                 req-octets nil)
+                           (arm-io :read)
+                           (return))
+                          (t
+                           (setf req-octets nil)
+                           (%load-next-chunk)
+                           (unless chunk-frame
+                             (setf phase :read)
+                             (arm-io :read)
+                             (return))))))
+                     ;; 2) stream body (chunked frames or raw length-delimited)
+                     (stream-body-p
+                      (unless chunk-frame
+                        (%load-next-chunk)
+                        (unless chunk-frame
+                          (setf phase :read)
+                          (arm-io :read)
+                          (return)))
+                      (multiple-value-bind (pos done want)
+                          (%write-octets chunk-frame wpos (length chunk-frame))
+                        (setf wpos pos)
+                        (cond
+                          (want (arm-tls-want want) (return))
+                          ((not done) (return))
+                          ((eq chunk-frame +chunked-terminator+)
+                           (setf phase :read
+                                 chunk-frame nil)
+                           (arm-io :read)
+                           (return))
+                          (t
+                           (%load-next-chunk)
+                           (unless chunk-frame
+                             (setf phase :read)
+                             (arm-io :read)
+                             (return))))))
+                     (t
+                      (setf phase :read)
+                      (arm-io :read)
+                      (return)))))
                (do-read ()
                  (loop
                    (multiple-value-bind (n want)
