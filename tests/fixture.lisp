@@ -54,6 +54,14 @@
     ((string= path "/echo")
      (values 200 '(("content-type" . "application/octet-stream"))
              (or body #())))
+    ((and (>= (length path) 7)
+          (string= (subseq path 0 7) "/bytes/"))
+     ;; /bytes/N → N octets (0..255 cycling) for stream tests
+     (let* ((n (or (parse-integer (subseq path 7) :junk-allowed t) 0))
+            (n (max 0 n))
+            (buf (make-array n :element-type '(unsigned-byte 8))))
+       (loop for i below n do (setf (aref buf i) (mod i 256)))
+       (values 200 '(("content-type" . "application/octet-stream")) buf)))
     ;; requests Session cookie persistence (set → echo Cookie header)
     ((string= path "/cookies/set")
      (values 200

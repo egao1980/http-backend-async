@@ -16,5 +16,6 @@
   (:export #:async-backend
            #:make-async-backend
            #:*event-backend-maker*
+           #:*async-body-queue-limit*
            #:async-request-handle
            #:async-request-canceled-p))

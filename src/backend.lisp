@@ -57,37 +57,24 @@
          (values backend loop))))))
 
 (defun %timeout-seconds (request client)
-  (let ((t* (or (http-request-timeout request)
-                (http-client-timeout client))))
-    (cond ((null t*) 30.0)
-          ((numberp t*) (float t* 1.0d0))
-          ((and (consp t*) (getf t* :total)) (float (getf t* :total) 1.0d0))
-          ((and (consp t*) (getf t* :read)) (float (getf t* :read) 1.0d0))
-          (t 30.0))))
-
-(defmethod send ((backend async-backend) client request &key)
-  (declare (ignore client request))
-  (error 'unsupported-operation
-         :operation 'send
-         :message "async-backend is non-blocking; use SEND-ASYNC (or http:*-async)"))
+  (timeout-total-seconds (effective-timeout request client)))
 
 (defmethod send-async ((backend async-backend) client request
                        &key callback error-callback)
-  (when (http-request-want-stream request)
-    (error 'unsupported-operation
-           :operation :want-stream
-           :message
-           "http-backend-async: response body streams not implemented yet (cl-stack#71); use http-backend-dexador :want-stream t for buffered download"))
   (let* ((cb (or callback (lambda (r) (declare (ignore r)))))
          (eb-cb (or error-callback
                     (lambda (c) (error c))))
+         (want-stream-p (http-request-want-stream request))
          (uri (quri:uri (http-request-url request)))
          (method (http-request-method request))
          (max-redirects (or (http-request-max-redirects request)
                             (http-client-max-redirects client)
                             5))
          (redirect-hops 0)
-         (history nil))
+         (history nil)
+         (proxy-cfg (effective-proxy-config request client))
+         (proxy-url (resolve-proxy proxy-cfg uri))
+         (pool (effective-connection-pool client)))
     (multiple-value-bind (host port scheme) (%uri-host-port uri)
       (multiple-value-bind (event-backend event-loop) (%ensure-event-context)
         (let* ((https (string-equal scheme "https"))
@@ -119,7 +106,36 @@
                (hdrs nil)
                (body nil)
                (finishedp nil)
-               (parse! nil))
+               (parse! nil)
+               (set-body-fn nil)
+               (body-feed nil)
+               (streaming-final-p nil)
+               (headers-delivered-p nil)
+               (read-paused-p nil)
+               (pool-key* (pool-key scheme host port :proxy proxy-url))
+               (connect-host host)
+               (connect-port port)
+               (proxied-http-p nil)
+               (keep-alive-p (not (null pool))))
+          (declare (ignorable pool-key*))
+          (when proxy-url
+            (multiple-value-bind (pscheme phost pport)
+                (parse-proxy-uri proxy-url)
+              (declare (ignore pscheme))
+              (when https
+                (error 'unsupported-operation
+                       :operation :https-proxy
+                       :message
+                       "HTTPS via proxy (CONNECT) not yet wired on async-backend"))
+              (unless (member (string-downcase
+                               (or (quri:uri-scheme (quri:uri proxy-url)) "http"))
+                              '("http" "https") :test #'string=)
+                (error 'unsupported-operation
+                       :operation :socks-proxy
+                       :message "SOCKS proxy not yet wired on async-backend"))
+              (setf connect-host phost
+                    connect-port pport
+                    proxied-http-p t)))
           (labels
               ((build-headers-and-body ()
                  (setf headers (%merge-headers (http-client-headers client)
@@ -171,7 +187,9 @@
                             req-octets (build-request-header-octets
                                         method uri headers
                                         :chunked-p chunked-p
-                                        :content-length content-length)
+                                        :content-length content-length
+                                        :absolute-p proxied-http-p
+                                        :keep-alive keep-alive-p)
                             wpos 0
                             chunk-frame nil))
                      (t
@@ -180,7 +198,9 @@
                             stream-body-p nil
                             chunked-p nil
                             req-octets (build-request-octets
-                                        method uri headers body-octets)
+                                        method uri headers body-octets
+                                        :absolute-p proxied-http-p
+                                        :keep-alive keep-alive-p)
                             wpos 0
                             chunk-frame nil)))))
                (%write-octets (octets from to)
@@ -208,10 +228,73 @@
                            (t nil))
                          wpos 0)
                    n))
+               (unpause-read ()
+                 (when read-paused-p
+                   (setf read-paused-p nil)
+                   (next-tick
+                    (lambda ()
+                      (unless (or (async-request-canceled-p handle)
+                                  (eq phase :reconnect))
+                        (arm-io :read)
+                        (do-read))))))
+               (complete-request ()
+                 "Stop IO/timer and close socket (after full response or stream EOF)."
+                 (unless (async-request-canceled-p handle)
+                   (setf (async-request-canceled-p handle) t)
+                   (when-let ((io (async-request-io-handle handle)))
+                     (ignore-errors (cancel event-backend io)))
+                   (when-let ((tm (async-request-timer-handle handle)))
+                     (ignore-errors (cancel event-backend tm)))
+                   (close-connection)))
+               (will-follow-redirect-p (status headers*)
+                 (let ((location (gethash "location" headers*)))
+                   (and location
+                        (redirect-status-p status)
+                        (plusp max-redirects)
+                        (< redirect-hops max-redirects))))
+               (begin-stream-body (status headers*)
+                 "Switch parser body sink to ASYNC-BODY-INPUT-STREAM and deliver."
+                 (let* ((final-url (quri:render-uri uri))
+                        (set-cookies (merge-response-cookies
+                                      cookie-jar final-url headers*)))
+                   (setf body-feed
+                         (make-async-body-input-stream
+                          :on-space #'unpause-read)
+                         streaming-final-p t)
+                   (funcall set-body-fn
+                            (lambda (data start end)
+                              (async-body-feed body-feed data
+                                               :start start :end end)
+                              (when (async-body-full-p body-feed)
+                                (setf read-paused-p t)
+                                (when-let ((io (async-request-io-handle handle)))
+                                  (ignore-errors (cancel event-backend io))
+                                  (setf (async-request-io-handle handle) nil
+                                        io-dir nil)))))
+                   (multiple-value-bind (app-stream headers**)
+                       (apply-response-content-encoding
+                        body-feed headers*
+                        :decompress (http-request-decompress request))
+                     (deliver-stream
+                      (make-hop-response
+                       status headers** app-stream set-cookies final-url
+                       :history-for-final (nreverse (copy-list history)))))))
+               (on-response-headers (http-obj headers*)
+                 (declare (ignore http-obj))
+                 (when (and want-stream-p
+                            (not streaming-final-p)
+                            (not (will-follow-redirect-p
+                                  (fast-http:http-status http) headers*)))
+                   (begin-stream-body (fast-http:http-status http) headers*)))
                (reset-parser ()
-                 (multiple-value-bind (h hd b f p)
-                     (make-response-accumulator)
-                   (setf http h hdrs hd body b finishedp f parse! p)))
+                 (multiple-value-bind (h hd b f p set-body)
+                     (make-response-accumulator
+                      :on-headers #'on-response-headers)
+                   (setf http h hdrs hd body b finishedp f parse! p
+                         set-body-fn set-body
+                         body-feed nil
+                         streaming-final-p nil
+                         read-paused-p nil)))
                (close-connection ()
                  (when-let ((io (async-request-io-handle handle)))
                    (ignore-errors (cancel event-backend io))
@@ -253,7 +336,7 @@
                (do-connect ()
                  (handler-case
                      (multiple-value-bind (usock status)
-                         (tcp-connect-nb host port)
+                         (tcp-connect-nb connect-host connect-port)
                        (setf sock usock
                              (async-request-socket handle) sock
                              fd (socket-fd sock)
@@ -266,23 +349,23 @@
                      (fail (make-condition 'http-connection-error
                                            :message (princ-to-string e))))))
                (fail (condition)
+                 (when body-feed
+                   (async-body-fail body-feed condition))
                  (unless (async-request-canceled-p handle)
-                   (setf (async-request-canceled-p handle) t)
-                   (when-let ((io (async-request-io-handle handle)))
-                     (ignore-errors (cancel event-backend io)))
-                   (when-let ((tm (async-request-timer-handle handle)))
-                     (ignore-errors (cancel event-backend tm)))
-                   (close-connection)
-                   (handler-case (funcall eb-cb condition)
-                     (error (e) (warn "error-callback failed: ~A" e)))))
+                   (complete-request)
+                   (unless headers-delivered-p
+                     (handler-case (funcall eb-cb condition)
+                       (error (e) (warn "error-callback failed: ~A" e))))))
                (succeed (res)
+                 "Non-streaming completion: deliver response and tear down."
                  (unless (async-request-canceled-p handle)
-                   (setf (async-request-canceled-p handle) t)
-                   (when-let ((io (async-request-io-handle handle)))
-                     (ignore-errors (cancel event-backend io)))
-                   (when-let ((tm (async-request-timer-handle handle)))
-                     (ignore-errors (cancel event-backend tm)))
-                   (close-connection)
+                   (complete-request)
+                   (handler-case (funcall cb res)
+                     (error (e) (warn "callback failed: ~A" e)))))
+               (deliver-stream (res)
+                 "Streaming: deliver headers+body stream; keep socket feeding."
+                 (unless headers-delivered-p
+                   (setf headers-delivered-p t)
                    (handler-case (funcall cb res)
                      (error (e) (warn "callback failed: ~A" e)))))
                (make-hop-response (status headers* body* set-cookies final-url
@@ -342,7 +425,9 @@
                                     https https?
                                     scheme (if https? "https" "http")
                                     req-octets (build-request-octets
-                                                method uri headers body-octets)
+                                                method uri headers body-octets
+                                                :absolute-p proxied-http-p
+                                                :keep-alive keep-alive-p)
                                     wpos 0
                                     phase :reconnect)
                               (reset-parser)
@@ -357,17 +442,23 @@
                           (fail (make-condition 'http-redirect-error
                                                 :message (princ-to-string e)))))))))
                (finish-response ()
-                 (let* ((final-url (quri:render-uri uri))
-                        (set-cookies (merge-response-cookies
-                                      cookie-jar final-url hdrs))
-                        (status (fast-http:http-status http)))
-                   (multiple-value-bind (body* headers*)
-                       (apply-response-content-encoding
-                        (coerce body '(simple-array (unsigned-byte 8) (*)))
-                        hdrs
-                        :decompress (http-request-decompress request))
-                     (follow-redirect status headers* body* set-cookies
-                                      final-url))))
+                 (cond
+                   (streaming-final-p
+                    (when body-feed
+                      (async-body-eof body-feed))
+                    (complete-request))
+                   (t
+                    (let* ((final-url (quri:render-uri uri))
+                           (set-cookies (merge-response-cookies
+                                         cookie-jar final-url hdrs))
+                           (status (fast-http:http-status http)))
+                      (multiple-value-bind (body* headers*)
+                          (apply-response-content-encoding
+                           (coerce body '(simple-array (unsigned-byte 8) (*)))
+                           hdrs
+                           :decompress (http-request-decompress request))
+                        (follow-redirect status headers* body* set-cookies
+                                         final-url))))))
                (on-connected ()
                  (set-socket-nonblocking sock t)
                  (if https
@@ -453,7 +544,11 @@
                       (arm-io :read)
                       (return)))))
                (do-read ()
+                 (when read-paused-p
+                   (return-from do-read nil))
                  (loop
+                   (when read-paused-p
+                     (return))
                    (multiple-value-bind (n want)
                        (if https
                            (tls-read-octets tls recv-buf)
@@ -473,6 +568,8 @@
                        (t
                         (when (funcall parse! recv-buf :end n)
                           (finish-response)
+                          (return))
+                        (when read-paused-p
                           (return)))))))
                (on-io (status)
                  (when (or (async-request-canceled-p handle)

@@ -10,6 +10,8 @@
                "fast-http"
                "babel"
                "alexandria"
+               "bordeaux-threads"
+               "trivial-gray-streams"
                "cffi"
                "usocket"
                "cl+ssl")
@@ -17,10 +19,12 @@
   :pathname "src"
   :components ((:file "package")
                (:file "socket")
+               (:file "async-body-stream")
                (:file "http1")
                (:file "redirect")
                (:file "tls")
-               (:file "backend"))
+               (:file "backend")
+               (:file "sync"))
   :in-order-to ((test-op (test-op "http-backend-async/tests"))))
 
 (defsystem "http-backend-async/tests"
