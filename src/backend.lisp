@@ -107,6 +107,7 @@
                (body-octets #())
                (body-stream-src nil)
                (chunked-p nil)
+               (stream-body-p nil) ; stream upload (chunked or content-length)
                (chunk-frame nil)
                (body-read-buf (make-array *http-stream-buffer-size*
                                           :element-type '(unsigned-byte 8)))
@@ -141,32 +142,42 @@
                                 headers)))
                  (setf headers (inject-cookie-header headers cookie-jar
                                                      (quri:render-uri uri)))
-                 (multiple-value-bind (content ce-header)
-                     (%prepare-content (http-request-content request)
-                                       (http-request-content-encoding request))
-                   (when ce-header
-                     (setf headers (acons "content-encoding" ce-header
-                                          (remove "content-encoding" headers
+                 (multiple-value-bind (content extra-headers content-length)
+                     (%prepare-body request)
+                   (dolist (pair extra-headers)
+                     (setf headers (acons (car pair) (cdr pair)
+                                          (remove (car pair) headers
                                                   :key #'car :test #'string-equal))))
                    (cond
                      ((streamp content)
                       (setf body-stream-src content
                             body-octets #()
-                            chunked-p t
-                            headers (remove "content-length" headers
-                                            :key #'car :test #'string-equal)
-                            headers (if (assoc "transfer-encoding" headers
-                                               :test #'string-equal)
-                                        headers
-                                        (acons "transfer-encoding" "chunked"
-                                               headers))
+                            stream-body-p t
+                            chunked-p (null content-length)
+                            headers (if content-length
+                                        (acons "content-length"
+                                               (princ-to-string content-length)
+                                               (remove "content-length" headers
+                                                       :key #'car :test #'string-equal))
+                                        (remove "content-length" headers
+                                                :key #'car :test #'string-equal))
+                            headers (if chunked-p
+                                        (if (assoc "transfer-encoding" headers
+                                                   :test #'string-equal)
+                                            headers
+                                            (acons "transfer-encoding" "chunked"
+                                                   headers))
+                                        headers)
                             req-octets (build-request-header-octets
-                                        method uri headers :chunked-p t)
+                                        method uri headers
+                                        :chunked-p chunked-p
+                                        :content-length content-length)
                             wpos 0
                             chunk-frame nil))
                      (t
                       (setf body-stream-src nil
                             body-octets (or content #())
+                            stream-body-p nil
                             chunked-p nil
                             req-octets (build-request-octets
                                         method uri headers body-octets)
@@ -185,11 +196,16 @@
                       (let ((pos (+ from n)))
                         (values pos (>= pos to) nil))))))
                (%load-next-chunk ()
-                 "Fill CHUNK-FRAME from BODY-STREAM-SRC. NIL frame → terminator done."
+                 "Fill CHUNK-FRAME from BODY-STREAM-SRC. Terminator when EOF (chunked)."
                  (let ((n (read-sequence body-read-buf body-stream-src)))
-                   (setf chunk-frame (if (plusp n)
-                                         (make-chunk-frame body-read-buf :end n)
-                                         +chunked-terminator+)
+                   (setf chunk-frame
+                         (cond
+                           ((plusp n)
+                            (if chunked-p
+                                (make-chunk-frame body-read-buf :end n)
+                                (subseq body-read-buf 0 n)))
+                           (chunked-p +chunked-terminator+)
+                           (t nil))
                          wpos 0)
                    n))
                (reset-parser ()
@@ -318,6 +334,7 @@
                                     headers h
                                     body-octets b
                                     body-stream-src nil
+                                    stream-body-p nil
                                     chunked-p nil
                                     chunk-frame nil
                                     host ho
@@ -383,7 +400,7 @@
                            (:want-read :read)
                            (:want-write :write))))
                (do-write ()
-                 "Write headers (+ optional body vector), or chunked stream body."
+                 "Write headers (+ optional body vector), or streamed body."
                  (loop
                    (cond
                      ;; 1) headers / full materialized request
@@ -394,19 +411,26 @@
                         (cond
                           (want (arm-tls-want want) (return))
                           ((not done) (return))
-                          ((not chunked-p)
+                          ((not stream-body-p)
                            (setf phase :read
                                  req-octets nil)
                            (arm-io :read)
                            (return))
-                          ;; headers done — drop header buffer, pull first chunk
                           (t
                            (setf req-octets nil)
-                           (%load-next-chunk)))))
-                     ;; 2) chunked: write current frame, then next / finish
-                     (chunked-p
+                           (%load-next-chunk)
+                           (unless chunk-frame
+                             (setf phase :read)
+                             (arm-io :read)
+                             (return))))))
+                     ;; 2) stream body (chunked frames or raw length-delimited)
+                     (stream-body-p
                       (unless chunk-frame
-                        (%load-next-chunk))
+                        (%load-next-chunk)
+                        (unless chunk-frame
+                          (setf phase :read)
+                          (arm-io :read)
+                          (return)))
                       (multiple-value-bind (pos done want)
                           (%write-octets chunk-frame wpos (length chunk-frame))
                         (setf wpos pos)
@@ -418,7 +442,12 @@
                                  chunk-frame nil)
                            (arm-io :read)
                            (return))
-                          (t (%load-next-chunk)))))
+                          (t
+                           (%load-next-chunk)
+                           (unless chunk-frame
+                             (setf phase :read)
+                             (arm-io :read)
+                             (return))))))
                      (t
                       (setf phase :read)
                       (arm-io :read)

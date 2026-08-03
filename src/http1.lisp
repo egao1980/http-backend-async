@@ -38,9 +38,9 @@
 (defun %method-string (method)
   (string-upcase (string method)))
 
-(defun %prepare-content (content coding)
-  "Buffered stream-aware prepare (cl-stack#71). May return a stream."
-  (prepare-request-content content :coding coding))
+(defun %prepare-body (request)
+  "Returns (values wire-content extra-headers content-length). Streams only."
+  (prepare-request-body request))
 
 (defun %emit-request-lines (method uri headers &key content-length chunked-p)
   "Shared header serialization → adjustable octet vector (no body)."
