@@ -56,8 +56,23 @@
         (ok (equalp (babel:string-to-octets "ok") (response-body res)))
         (ok *proxy-test-saw-auth*)
         (ok (and *fixture-last-request-target*
+                 (>= (length *fixture-last-request-target*) 7)
                  (string-equal "http://" *fixture-last-request-target* :end2 7)))
         (ok (search "/ok" *fixture-last-request-target*))))))
+
+(defun %apply-env-bindings (bindings)
+  "Apply BINDINGS = ((name value)…). VALUE NIL unsets.
+Unset before set so Windows case-insensitive env (http_proxy/HTTP_PROXY)
+does not wipe a just-set value when both casings appear."
+  (dolist (b bindings)
+    (destructuring-bind (name value) b
+      (unless value
+        #+sbcl (sb-posix:unsetenv name)
+        #-sbcl (setf (uiop:getenv name) ""))))
+  (dolist (b bindings)
+    (destructuring-bind (name value) b
+      (when value
+        (setf (uiop:getenv name) value)))))
 
 (defun %call-with-env (bindings thunk)
   (let ((saved (mapcar (lambda (b)
@@ -65,19 +80,9 @@
                        bindings)))
     (unwind-protect
          (progn
-           (dolist (b bindings)
-             (destructuring-bind (name value) b
-               (if value
-                   (setf (uiop:getenv name) value)
-                   #+sbcl (sb-posix:unsetenv name)
-                   #-sbcl (setf (uiop:getenv name) ""))))
+           (%apply-env-bindings bindings)
            (funcall thunk))
-      (dolist (b saved)
-        (destructuring-bind (name value) b
-          (if value
-              (setf (uiop:getenv name) value)
-              #+sbcl (sb-posix:unsetenv name)
-              #-sbcl (setf (uiop:getenv name) "")))))))
+      (%apply-env-bindings saved))))
 
 (deftest http-proxy-from-env-system-automatic
   "SYSTEM path: live HTTP_PROXY (env > registry) → absolute-form via async."
@@ -100,5 +105,6 @@
            (ok (= 200 (response-status res)))
            (ok (equalp (babel:string-to-octets "ok") (response-body res)))
            (ok (and *fixture-last-request-target*
+                    (>= (length *fixture-last-request-target*) 7)
                     (string-equal "http://" *fixture-last-request-target*
                                   :end2 7)))))))))
