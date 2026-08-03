@@ -1,4 +1,6 @@
 ;;;; Phase 1: install OCI deps with system OpenSSL. Fresh image loads natives later.
+;;;; Install cl-stack-ssl LAST — its cl-repo-init rewires CFFI and breaks
+;;;; subsequent HTTPS pulls (Undefined callback: CL+SSL::PEM-PASSWORD-CALLBACK).
 
 (setf *debugger-hook*
       (lambda (c h)
@@ -41,33 +43,37 @@
    (lambda ()
      (if version
          (cl-repo:load-system name :version version :sources *ci-ql-sources*)
-         (cl-repo:load-system name :sources *ci-ql-sources*)))))
+         (cl-repo:load-system name :sources *ci-ql-sources*))))
+  (unless (asdf:find-system name nil)
+    (error "ci-load: ~a not installed/findable" name)))
+
+(defun ci-patch-stack-ssl (&optional (version "3.4.1"))
+  "Patch stale OCI source (DEFCONSTANT -> DEFPARAMETER) until republished."
+  (let ((setup (probe-file
+                (merge-pathnames
+                 (format nil "cl-stack-ssl/~a/src/setup.lisp" version)
+                 (cl-repository-client/installer:systems-root)))))
+    (when setup
+      (let* ((text (uiop:read-file-string setup))
+             (fixed (search "(defconstant +openssl-version+" text :test #'char-equal)))
+        (when fixed
+          (setf text (concatenate 'string
+                                  (subseq text 0 fixed)
+                                  "(defparameter +openssl-version+"
+                                  (subseq text (+ fixed (length "(defconstant +openssl-version+")))))
+          (with-open-file (out setup :direction :output :if-exists :supersede)
+            (write-string text out))
+          (format t "~&; ci: patched ~a~%" setup))))))
 
 (let* ((backend (string-downcase (or (uiop:getenv "HTTP_ASYNC_EVENT_BACKEND") "libuv")))
        (cl-stack-ssl-version (or (uiop:getenv "CL_STACK_SSL_VERSION") "3.4.1"))
        (event-sys (cond ((string= backend "libuv") "event-backend-libuv")
                         ((string= backend "libev") "event-backend-libev")
                         (t (error "Unknown HTTP_ASYNC_EVENT_BACKEND: ~a" backend)))))
-  (format t "~&; ci: event backend ~a → ~a~%" backend event-sys)
+  (format t "~&; ci: event backend ~a -> ~a~%" backend event-sys)
   (call-with-ci-muffles
    (lambda ()
      (ci-install "cl-plus-ssl" :version "latest")
-     (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)
-     (let ((setup (probe-file
-                   (merge-pathnames
-                    (format nil "cl-stack-ssl/~a/src/setup.lisp" cl-stack-ssl-version)
-                    (cl-repository-client/installer:systems-root)))))
-       (when setup
-         (let* ((text (uiop:read-file-string setup))
-                (fixed (search "(defconstant +openssl-version+" text :test #'char-equal)))
-           (when fixed
-             (setf text (concatenate 'string
-                                     (subseq text 0 fixed)
-                                     "(defparameter +openssl-version+"
-                                     (subseq text (+ fixed (length "(defconstant +openssl-version+")))))
-             (with-open-file (out setup :direction :output :if-exists :supersede)
-               (write-string text out))
-             (format t "~&; ci: patched ~a~%" setup)))))
      (ci-load "http-protocol" :version "0.1.0")
      (ci-load "event-protocol" :version "0.1.0")
      (ci-load event-sys :version "0.1.0")
@@ -83,7 +89,10 @@
                   "blackbird" "trivial-gray-streams" "cl-cookie"))
        (unless (asdf:find-system n nil)
          (format t "~&; ci: ql fallback ~a~%" n)
-         (ql:quickload n :silent t))))))
+         (ql:quickload n :silent t)))
+     ;; LAST: overlay package (init rewires SSL; no more HTTPS pulls after this).
+     (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)
+     (ci-patch-stack-ssl cl-stack-ssl-version))))
 
 (format t "~&; ci: install phase done~%")
 (uiop:quit 0)
