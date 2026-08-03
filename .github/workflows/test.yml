@@ -93,7 +93,12 @@ jobs:
         run: |
           case "${RUNNER_OS}" in
             Linux)   plat=linux/amd64 ;;
-            macOS)   plat=darwin/arm64 ;;
+            macOS)
+              case "${RUNNER_ARCH}" in
+                ARM64) plat=darwin/arm64 ;;
+                X64)   plat=darwin/amd64 ;;
+                *) echo "unsupported arch ${RUNNER_ARCH}" >&2; exit 1 ;;
+              esac ;;
             Windows) plat=windows/amd64 ;;
             *) echo "unsupported OS ${RUNNER_OS}" >&2; exit 1 ;;
           esac
