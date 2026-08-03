@@ -60,9 +60,9 @@
                             n :version ver)))
                (when result
                  (cl-repository-client/asdf-integration:configure-asdf-source-registry))))))
-       (when cl-repository-client/quickload::*missing-deps-accumulator*
-         (cl-repository-client/quickload::try-quicklisp-fallback
-          cl-repository-client/quickload::*missing-deps-accumulator*))))
+        (when cl-repository-client/quickload::*missing-deps-accumulator*
+          (cl-repository-client/quickload::try-quicklisp-fallback
+           cl-repository-client/quickload::*missing-deps-accumulator*)))))
   (cl-repository-client/asdf-integration:configure-asdf-source-registry)
   (unless (asdf:find-system name nil)
     (error "ci-fetch: ~a not findable after install" name)))
