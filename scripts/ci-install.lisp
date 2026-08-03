@@ -21,6 +21,11 @@
 
 (call-with-ci-muffles (lambda () (asdf:load-system "cl-repository-client")))
 
+(defparameter *ci-ql-sources*
+  '(("babel" :ql)
+    ("trivial-features" :ql))
+  "Already loaded via client QL bootstrap — do not reinstall from OCI.")
+
 (cl-repo:add-registry "https://ghcr.io" :namespace "egao1980/cl-systems" :priority :prepend)
 
 (defun ci-install (oci-name &key (version "latest"))
@@ -34,8 +39,8 @@
   (call-with-ci-muffles
    (lambda ()
      (if version
-         (cl-repo:load-system name :version version)
-         (cl-repo:load-system name)))))
+         (cl-repo:load-system name :version version :sources *ci-ql-sources*)
+         (cl-repo:load-system name :sources *ci-ql-sources*)))))
 
 (let* ((backend (string-downcase (or (uiop:getenv "HTTP_ASYNC_EVENT_BACKEND") "libuv")))
        (cl-stack-ssl-version (or (uiop:getenv "CL_STACK_SSL_VERSION") "3.4.1"))
