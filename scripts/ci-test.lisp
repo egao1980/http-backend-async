@@ -36,7 +36,7 @@
 (defun ci-ensure-ql (&rest names)
   "QL only for systems not yet published to egao1980/cl-systems."
   (dolist (name names)
-    (unless (asdf:find-system name nil)
+    (unless (asdf:component-loaded-p name)
       (format t "~&; ci: ql fallback (unpublished) ~a~%" name)
       (ql:quickload name :silent t))))
 
