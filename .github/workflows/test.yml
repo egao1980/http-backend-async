@@ -51,31 +51,6 @@ jobs:
         with:
           version: 1.2.3
 
-      - name: Stage OpenSSL overlay for process loader
-        shell: bash
-        run: |
-          case "${RUNNER_OS}" in
-            Linux)   plat=linux/amd64 ;;
-            macOS)   plat=darwin/arm64 ;;
-            Windows) plat=windows/amd64 ;;
-            *) echo "unsupported OS ${RUNNER_OS}" >&2; exit 1 ;;
-          esac
-          echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
-          mkdir -p /tmp/ssl-pull /tmp/ssl-native
-          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:${CL_STACK_SSL_VERSION}" \
-            --platform "${plat}" -o /tmp/ssl-pull
-          tar -xzf /tmp/ssl-pull/native-library.tar.gz -C /tmp/ssl-native
-          NAT="$(find /tmp/ssl-native -type d -name native | head -1)"
-          : "${NAT:?native/ not found in cl-stack-ssl overlay}"
-          echo "OPENSSL_NATIVE=${NAT}" >> "$GITHUB_ENV"
-          if [ "${RUNNER_OS}" = "Windows" ]; then
-            echo "${NAT}" >> "$GITHUB_PATH"
-          else
-            echo "LD_LIBRARY_PATH=${NAT}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-            echo "DYLD_LIBRARY_PATH=${NAT}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-          fi
-          ls -la "${NAT}"
-
       - name: Install Roswell (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -105,7 +80,40 @@ jobs:
         run: |
           ros -e '(ql:quickload (quote ("yason" "ironclad" "babel" "dexador" "quri" "chipz" "flexi-streams" "cl-ppcre" "cl-base64" "trivial-features" "salza2" "archive")) :silent t)' -q
 
-      - name: cl-repo install deps + test
+      - name: cl-repo install deps
+        shell: bash
+        env:
+          HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
+        run: |
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
+          ros -l scripts/ci-install.lisp -q
+
+      - name: Stage OpenSSL overlay for test process
+        shell: bash
+        run: |
+          case "${RUNNER_OS}" in
+            Linux)   plat=linux/amd64 ;;
+            macOS)   plat=darwin/arm64 ;;
+            Windows) plat=windows/amd64 ;;
+            *) echo "unsupported OS ${RUNNER_OS}" >&2; exit 1 ;;
+          esac
+          echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          mkdir -p /tmp/ssl-pull /tmp/ssl-native
+          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:${CL_STACK_SSL_VERSION}" \
+            --platform "${plat}" -o /tmp/ssl-pull
+          tar -xzf /tmp/ssl-pull/native-library.tar.gz -C /tmp/ssl-native
+          NAT="$(find /tmp/ssl-native -type d -name native | head -1)"
+          : "${NAT:?native/ not found in cl-stack-ssl overlay}"
+          echo "OPENSSL_NATIVE=${NAT}" >> "$GITHUB_ENV"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            echo "${NAT}" >> "$GITHUB_PATH"
+          else
+            echo "LD_LIBRARY_PATH=${NAT}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            echo "DYLD_LIBRARY_PATH=${NAT}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+          ls -la "${NAT}"
+
+      - name: Test with overlay OpenSSL
         shell: bash
         env:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
