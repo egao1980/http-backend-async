@@ -10,6 +10,7 @@
                "fast-http"
                "babel"
                "alexandria"
+               "cffi"
                "usocket"
                "cl+ssl")
   :serial t

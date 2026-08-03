@@ -2,6 +2,11 @@
 
 ;;; Async http-protocol backend. One HTTP backend × N event-protocol loops.
 ;;; Carrier disposition: rejected (hard-wires cl-async/libuv). Thin rewrite here.
+;;;
+;;; I/O model: nonblocking TCP connect + register-io; cleartext send/recv on the
+;;; FD; HTTPS via cl+ssl socket-BIO pumped with WANT_READ/WANT_WRITE (no blocking
+;;; ensure-ssl-funcall on the loop thread). One :read-write watcher per connection
+;;; (avoids cancel/re-init races on the same FD).
 
 (defvar *event-backend-maker* nil
   "Thunk → EVENT-BACKEND. Tests/CI bind this to libuv or libev maker.")
@@ -23,7 +28,7 @@
    (io-handle :initform nil :accessor async-request-io-handle)
    (timer-handle :initform nil :accessor async-request-timer-handle)
    (socket :initform nil :accessor async-request-socket)
-   (tls-stream :initform nil :accessor async-request-tls-stream)
+   (tls-stream :initform nil :accessor async-request-tls-stream) ; tls-session
    (event-backend :initarg :event-backend :reader async-request-event-backend)
    (event-loop :initarg :event-loop :reader async-request-event-loop)))
 
@@ -90,6 +95,7 @@
                                       :event-loop event-loop))
                (sock nil)
                (fd nil)
+               (tls nil)
                (cookie-jar (resolve-cookie-jar client request
                                                :url (http-request-url request)))
                (ae (%accept-encoding-header
@@ -141,28 +147,34 @@
                  (when-let ((io (async-request-io-handle handle)))
                    (ignore-errors (cancel event-backend io))
                    (setf (async-request-io-handle handle) nil))
-                 (tls-close (async-request-tls-stream handle))
-                 (setf (async-request-tls-stream handle) nil)
+                 (tls-close tls)
+                 (setf tls nil
+                       (async-request-tls-stream handle) nil)
                  (close-socket sock)
                  (setf (async-request-socket handle) nil
                        sock nil
                        fd nil))
-               (arm-io (direction)
+               (arm-io ()
+                 "One :read-write watcher per connection — never re-arm same FD."
                  (unless fd
                    (error 'http-connection-error :message "arm-io before connect"))
-                 (when-let ((old (async-request-io-handle handle)))
-                   (ignore-errors (cancel event-backend old)))
+                 (when (async-request-io-handle handle)
+                   (error 'http-connection-error
+                          :message "arm-io: watcher already registered"))
                  (setf (async-request-io-handle handle)
-                       (register-io event-backend event-loop fd direction #'on-io)))
+                       (register-io event-backend event-loop fd :read-write
+                                    #'on-io)))
                (do-connect ()
                  (handler-case
-                     (progn
-                       (setf sock (tcp-connect host port)
+                     (multiple-value-bind (usock status)
+                         (tcp-connect-nb host port)
+                       (setf sock usock
                              (async-request-socket handle) sock
-                             fd (socket-fd sock))
-                       (unless https
-                         (set-socket-nonblocking sock t))
-                       (on-connected))
+                             fd (socket-fd sock)
+                             phase :connect)
+                       (ecase status
+                         (:connected (on-connected))
+                         (:pending (arm-io))))
                    (http-error (e) (fail e))
                    (error (e)
                      (fail (make-condition 'http-connection-error
@@ -208,7 +220,6 @@
                                 status headers* body* set-cookies final-url
                                 :history-for-final (nreverse history))))
                      ((zerop max-redirects)
-                      ;; allow_redirects=False analogue
                       (succeed (make-hop-response
                                 status headers* body* set-cookies final-url
                                 :history-for-final (nreverse history))))
@@ -240,9 +251,8 @@
                                     wpos 0
                                     phase :connect)
                               (reset-parser)
-                              ;; Defer close+reconnect: canceling/closing the
-                              ;; active libuv poll from inside its callback
-                              ;; trips uv_poll_stop(!uv__is_closing).
+                              ;; Defer close+reconnect: canceling the active
+                              ;; poll from inside its callback races libuv/libev.
                               (defer event-backend event-loop
                                 (lambda ()
                                   (unless (async-request-canceled-p handle)
@@ -264,44 +274,61 @@
                         :decompress (http-request-decompress request))
                      (follow-redirect status headers* body* set-cookies
                                       final-url))))
-               (https-exchange ()
-                 (when-let ((io (async-request-io-handle handle)))
-                   (ignore-errors (cancel event-backend io))
-                   (setf (async-request-io-handle handle) nil))
-                 (handler-case
-                     (let ((ssl (make-tls-stream sock host :verify verify)))
-                       (setf (async-request-tls-stream handle) ssl)
-                       (tls-write-all ssl req-octets)
-                       (loop
-                         (when (async-request-canceled-p handle) (return))
-                         (let ((n (tls-read-some ssl recv-buf)))
-                           (cond
-                             ((zerop n)
-                              (funcall parse! #())
-                              (if (funcall finishedp)
-                                  (finish-response)
-                                  (fail (make-condition
-                                         'http-protocol-error
-                                         :message "incomplete HTTPS response")))
-                              (return))
-                             (t
-                              (when (funcall parse! recv-buf :end n)
-                                (finish-response)
-                                (return)))))))
-                   (http-error (e) (fail e))
-                   (error (e)
-                     (fail (make-condition 'http-tls-error
-                                           :message (princ-to-string e))))))
                (on-connected ()
+                 (set-socket-nonblocking sock t)
+                 (unless (async-request-io-handle handle)
+                   (arm-io))
                  (if https
                      (progn
-                       (setf phase :tls)
-                       (defer event-backend event-loop #'https-exchange))
+                       (setf tls (make-tls-session fd host :verify verify)
+                             (async-request-tls-stream handle) tls
+                             phase :tls-hs)
+                       (defer event-backend event-loop
+                         (lambda () (on-io :ok))))
                      (progn
                        (setf phase :write)
-                       (arm-io :write)
                        (defer event-backend event-loop
                          (lambda () (on-io :ok))))))
+               (do-tls-hs ()
+                 (loop
+                   (ecase (tls-handshake-step tls)
+                     (:done
+                      (setf phase :write)
+                      (return (do-write)))
+                     (:want-read (return))
+                     (:want-write (return)))))
+               (do-write ()
+                 (loop
+                   (when (>= wpos (length req-octets))
+                     (setf phase :read)
+                     (return (do-read)))
+                   (let ((n (if https
+                                (tls-write-octets tls req-octets wpos
+                                                  (length req-octets))
+                                (socket-send-octets
+                                 sock req-octets wpos (length req-octets)))))
+                     (cond ((null n) (return)) ; WANT_* / would-block
+                           ((zerop n) (return))
+                           (t (incf wpos n))))))
+               (do-read ()
+                 (loop
+                   (let ((n (if https
+                                (tls-read-octets tls recv-buf)
+                                (socket-recv-octets sock recv-buf))))
+                     (cond
+                       ((null n) (return))
+                       ((zerop n)
+                        (funcall parse! #())
+                        (if (funcall finishedp)
+                            (finish-response)
+                            (fail (make-condition
+                                   'http-protocol-error
+                                   :message "incomplete HTTP response")))
+                        (return))
+                       (t
+                        (when (funcall parse! recv-buf :end n)
+                          (finish-response)
+                          (return))))))))
                (on-io (status)
                  (when (async-request-canceled-p handle)
                    (return-from on-io nil))
@@ -311,39 +338,17 @@
                                            :message "register-io error"))))
                  (handler-case
                      (ecase phase
-                       (:tls nil)
-                       (:write
-                        (loop
-                          (when (>= wpos (length req-octets))
-                            (setf phase :read)
-                            (arm-io :read)
-                            (return))
-                          (let ((n (socket-send-octets
-                                    sock req-octets wpos (length req-octets))))
-                            (cond ((null n) (return))
-                                  ((zerop n) (return))
-                                  (t (incf wpos n))))))
-                       (:read
-                        (loop
-                          (let ((n (socket-recv-octets sock recv-buf)))
-                            (cond
-                              ((null n) (return))
-                              ((zerop n)
-                               (funcall parse! #())
-                               (if (funcall finishedp)
-                                   (finish-response)
-                                   (fail (make-condition
-                                          'http-protocol-error
-                                          :message "incomplete HTTP response")))
-                               (return))
-                              (t
-                               (when (funcall parse! recv-buf :end n)
-                                 (finish-response)
-                                 (return))))))))
+                       (:connect
+                        (when (tcp-connect-finish sock)
+                          (on-connected)))
+                       (:tls-hs (do-tls-hs))
+                       (:write (do-write))
+                       (:read (do-read)))
                    (http-error (e) (fail e))
                    (error (e)
-                     (fail (make-condition 'http-connection-error
-                                           :message (princ-to-string e)))))))
+                     (fail (make-condition
+                            (if https 'http-tls-error 'http-connection-error)
+                            :message (princ-to-string e)))))))
             (build-headers-and-body)
             (reset-parser)
             (with-event-backend (event-backend)
