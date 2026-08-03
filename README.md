@@ -16,6 +16,7 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
 - `send-async` + `cancel-request`; facade promises via `http:*-async`
 - Cookie-jar (cl-cookie) + redirect follow (`response-history`; 301/302/303→GET)
 - Content-Encoding decode (chipz; soft-load br/zstd)
+- Bodies via `http-protocol` ≥ **0.2.0**: `:form-data` / typed `:data` / `:content` / streams
 - Live CE tests: `HTTP_ASYNC_LIVE=1` (default in CI) → httpbingo `/gzip` `/brotli`
 
 ## Use
