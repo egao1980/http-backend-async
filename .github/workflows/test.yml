@@ -13,7 +13,8 @@ concurrency:
 env:
   SBCL_VERSION: 2.4.11
   ROSWELL_VERSION: "26.02.116"
-  CL_REPOSITORY_REF: "v0.9.0"
+  CL_REPOSITORY_REF: "main"
+  CL_STACK_SSL_VERSION: "3.4.1"
   HTTP_ASYNC_LIVE: "1"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -31,7 +32,6 @@ jobs:
             event_backend: libuv
           - os: macos-latest
             event_backend: libev
-          # Windows primary = libuv (libev is Unix-only).
           - os: windows-latest
             event_backend: libuv
     runs-on: ${{ matrix.os }}
@@ -46,6 +46,35 @@ jobs:
           repository: egao1980/cl-repository
           ref: ${{ env.CL_REPOSITORY_REF }}
           path: .cl-repository
+
+      - uses: oras-project/setup-oras@v1
+        with:
+          version: 1.2.3
+
+      - name: Stage OpenSSL overlay for process loader
+        shell: bash
+        run: |
+          case "${RUNNER_OS}" in
+            Linux)   plat=linux/amd64 ;;
+            macOS)   plat=darwin/arm64 ;;
+            Windows) plat=windows/amd64 ;;
+            *) echo "unsupported OS ${RUNNER_OS}" >&2; exit 1 ;;
+          esac
+          echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          mkdir -p /tmp/ssl-pull /tmp/ssl-native
+          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:${CL_STACK_SSL_VERSION}" \
+            --platform "${plat}" -o /tmp/ssl-pull
+          tar -xzf /tmp/ssl-pull/native-library.tar.gz -C /tmp/ssl-native
+          NAT="$(find /tmp/ssl-native -type d -name native | head -1)"
+          : "${NAT:?native/ not found in cl-stack-ssl overlay}"
+          echo "OPENSSL_NATIVE=${NAT}" >> "$GITHUB_ENV"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            echo "${NAT}" >> "$GITHUB_PATH"
+          else
+            echo "LD_LIBRARY_PATH=${NAT}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            echo "DYLD_LIBRARY_PATH=${NAT}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+          ls -la "${NAT}"
 
       - name: Install Roswell (Unix)
         if: runner.os != 'Windows'

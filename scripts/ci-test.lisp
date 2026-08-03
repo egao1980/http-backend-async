@@ -27,9 +27,17 @@
 
 (defun ci-load (name &key version)
   (format t "~&; ci: cl-repo load ~a~@[:~a~]~%" name version)
-  (if version
-      (cl-repo:load-system name :version version)
-      (cl-repo:load-system name))
+  (flet ((do-load ()
+           (if version
+               (cl-repo:load-system name :version version)
+               (cl-repo:load-system name))))
+    ;; Stale OCI cl-stack-ssl used DEFCONSTANT on a string (fixed upstream to
+    ;; DEFPARAMETER). Continue past DEFCONSTANT-UNEQL until republished.
+    #+sbcl
+    (handler-bind ((sb-ext:defconstant-uneql (lambda (c) (declare (ignore c)) (invoke-restart 'continue))))
+      (do-load))
+    #-sbcl
+    (do-load))
   (unless (asdf:component-loaded-p name)
     (error "ci-load: ~a did not load" name)))
 
