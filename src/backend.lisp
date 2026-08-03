@@ -73,15 +73,9 @@
          (redirect-hops 0)
          (history nil)
          (proxy-cfg (effective-proxy-config request client))
-         ;; Protocol: env > registry/PAC. Residual :SYSTEM = WinHTTP AUTOMATIC.
-         (proxy-url
-          (let ((p (resolve-proxy proxy-cfg uri)))
-            (when (eq p :system)
-              (error 'unsupported-operation
-                     :operation :system-proxy
-                     :message
-                     "OS automatic proxy residual (:SYSTEM / PAC/WPAD) not wired on async-backend; set http(s)_proxy or an explicit :proxy"))
-            p))
+         ;; Usocket path (dexador-usocket): URL or NIL (direct).
+         ;; SYSTEM-AUTOMATIC-P / PAC/WPAD is WinHTTP-only — ignored here.
+         (proxy-url (resolve-proxy proxy-cfg uri))
          (pool (effective-connection-pool client)))
     (multiple-value-bind (host port scheme) (%uri-host-port uri)
       (multiple-value-bind (event-backend event-loop) (%ensure-event-context)
@@ -170,11 +164,7 @@
                 (:socks4
                  (error 'unsupported-operation
                         :operation :socks4-proxy
-                        :message "SOCKS4 not implemented; use socks5:// or socks5h://"))
-                (:system
-                 (error 'unsupported-operation
-                        :operation :system-proxy
-                        :message "OS automatic proxy not yet wired")))))
+                        :message "SOCKS4 not implemented; use socks5:// or socks5h://")))))
           (labels
               ((build-headers-and-body ()
                  (setf headers (%merge-headers (http-client-headers client)
