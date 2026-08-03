@@ -152,6 +152,13 @@ jobs:
             GROVEL="$(find /tmp/nat/libuv-src -name 'grovel.cffi.lisp' | head -1)"
             cp "$GROVEL" "$GITHUB_WORKSPACE/_sib/event-backend-libuv/grovel-cache/grovel.cffi.lisp"
           fi
+          # Stage DLLs into sibling native/ so overlay search paths find them.
+          mkdir -p "$GITHUB_WORKSPACE/_sib/cl-stack-ssl/native" \
+                   "$GITHUB_WORKSPACE/_sib/cl-stack-brotli/native" \
+                   "$GITHUB_WORKSPACE/_sib/event-backend-libuv/lib/windows-amd64"
+          cp -a "$SSL_NAT"/. "$GITHUB_WORKSPACE/_sib/cl-stack-ssl/native/"
+          cp -a "$BR_NAT"/. "$GITHUB_WORKSPACE/_sib/cl-stack-brotli/native/"
+          cp -a "$UV_NAT"/. "$GITHUB_WORKSPACE/_sib/event-backend-libuv/lib/windows-amd64/"
           ls -la "$SSL_NAT" "$BR_NAT" "$UV_NAT"
 
       - name: Install Roswell (Unix)
