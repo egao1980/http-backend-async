@@ -13,6 +13,7 @@ concurrency:
 env:
   SBCL_VERSION: 2.4.11
   ROSWELL_VERSION: "26.02.116"
+  CL_REPOSITORY_REF: "v0.9.0"
   HTTP_ASYNC_LIVE: "1"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -24,25 +25,15 @@ jobs:
         include:
           - os: ubuntu-latest
             event_backend: libuv
-            apt: libuv1-dev
-            brew: libuv
           - os: ubuntu-latest
             event_backend: libev
-            apt: libev-dev
-            brew: libev
           - os: macos-latest
             event_backend: libuv
-            apt: ""
-            brew: libuv
           - os: macos-latest
             event_backend: libev
-            apt: ""
-            brew: libev
           # Windows primary = libuv (libev is Unix-only).
           - os: windows-latest
             event_backend: libuv
-            apt: ""
-            brew: ""
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -52,116 +43,9 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: egao1980/http-protocol
-          path: _sib/http-protocol
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/event-protocol
-          path: _sib/event-protocol
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/event-backend-libuv
-          path: _sib/event-backend-libuv
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/event-backend-libev
-          path: _sib/event-backend-libev
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/http-encoding-chipz
-          path: _sib/http-encoding-chipz
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/http-encoding-brotli
-          path: _sib/http-encoding-brotli
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/cl-stack-brotli
-          path: _sib/cl-stack-brotli
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/cl-stack-ssl
-          path: _sib/cl-stack-ssl
-
-      - name: Layout siblings (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          mkdir -p /tmp/ws
-          cp -a "$GITHUB_WORKSPACE" /tmp/ws/http-backend-async
-          for d in http-protocol event-protocol event-backend-libuv event-backend-libev \
-                   http-encoding-chipz http-encoding-brotli cl-stack-brotli cl-stack-ssl; do
-            cp -a "$GITHUB_WORKSPACE/_sib/$d" "/tmp/ws/$d"
-          done
-          cp -a /tmp/ws/event-protocol /tmp/ws/event-backend-libuv/event-protocol
-          cp -a /tmp/ws/event-protocol /tmp/ws/event-backend-libev/event-protocol
-
-      - name: Install native deps (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev libbrotli-dev ${{ matrix.apt }}
-
-      - name: Install native deps (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install ${{ matrix.brew }} openssl@3 brotli
-          echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
-
-      - name: Install oras (Windows)
-        if: runner.os == 'Windows'
-        uses: oras-project/setup-oras@v1
-        with:
-          version: 1.2.3
-
-      # Pull published windows overlays for OpenSSL/brotli/libuv (+ grovel-cache).
-      - name: Pull OpenSSL + brotli + libuv natives (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          mkdir -p /tmp/oci
-          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:3.4.1" --platform windows/amd64 -o /tmp/oci/ssl
-          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-brotli:1.2.0" --platform windows/amd64 -o /tmp/oci/brotli
-          oras pull "ghcr.io/egao1980/cl-systems/event-backend-libuv:0.1.0" --platform windows/amd64 -o /tmp/oci/libuv
-          mkdir -p /tmp/nat/ssl /tmp/nat/brotli /tmp/nat/libuv /tmp/nat/libuv-src
-          tar -xzf /tmp/oci/ssl/native-library.tar.gz -C /tmp/nat/ssl
-          tar -xzf /tmp/oci/brotli/native-library.tar.gz -C /tmp/nat/brotli
-          tar -xzf /tmp/oci/libuv/native-library.tar.gz -C /tmp/nat/libuv
-          tar -xzf /tmp/oci/libuv/event-backend-libuv-0.1.0.tar.gz -C /tmp/nat/libuv-src
-          tar -xzf /tmp/oci/libuv/cffi-grovel-output.tar.gz -C /tmp/nat/libuv-src
-          SSL_NAT="$(find /tmp/nat/ssl -type d -name native | head -1)"
-          BR_NAT="$(find /tmp/nat/brotli -type d -name native | head -1)"
-          UV_NAT="$(find /tmp/nat/libuv -type d -name native | head -1)"
-          : "${SSL_NAT:?OpenSSL native directory not found}"
-          : "${BR_NAT:?Brotli native directory not found}"
-          : "${UV_NAT:?Libuv native directory not found}"
-          echo "OPENSSL_NATIVE=$SSL_NAT" >> "$GITHUB_ENV"
-          echo "BROTLI_NATIVE=$BR_NAT" >> "$GITHUB_ENV"
-          echo "EVENT_PROTOCOL_NATIVE=$UV_NAT" >> "$GITHUB_ENV"
-          echo "$SSL_NAT" >> "$GITHUB_PATH"
-          echo "$BR_NAT" >> "$GITHUB_PATH"
-          echo "$UV_NAT" >> "$GITHUB_PATH"
-          mkdir -p "$GITHUB_WORKSPACE/_sib/event-backend-libuv/grovel-cache"
-          GROVEL="$(find /tmp/nat/libuv-src -name 'grovel.cffi.lisp' | head -1)"
-          : "${GROVEL:?Windows grovel.cffi.lisp not found in libuv bundle}"
-          cp "$GROVEL" "$GITHUB_WORKSPACE/_sib/event-backend-libuv/grovel-cache/grovel.cffi.lisp"
-          ls -la "$GROVEL"
-          mkdir -p "$GITHUB_WORKSPACE/_sib/cl-stack-ssl/native" \
-                   "$GITHUB_WORKSPACE/_sib/cl-stack-brotli/native" \
-                   "$GITHUB_WORKSPACE/_sib/event-backend-libuv/lib/windows-amd64"
-          cp -a "$SSL_NAT"/. "$GITHUB_WORKSPACE/_sib/cl-stack-ssl/native/"
-          cp -a "$BR_NAT"/. "$GITHUB_WORKSPACE/_sib/cl-stack-brotli/native/"
-          cp -a "$UV_NAT"/. "$GITHUB_WORKSPACE/_sib/event-backend-libuv/lib/windows-amd64/"
-          ls -la "$SSL_NAT" "$BR_NAT" "$UV_NAT"
+          repository: egao1980/cl-repository
+          ref: ${{ env.CL_REPOSITORY_REF }}
+          path: .cl-repository
 
       - name: Install Roswell (Unix)
         if: runner.os != 'Windows'
@@ -187,32 +71,16 @@ jobs:
           ros install "sbcl-bin/$SBCL_VERSION"
           ros use "sbcl-bin/$SBCL_VERSION"
 
-      - name: Install Roswell + test (Unix)
-        if: runner.os != 'Windows'
-        working-directory: /tmp/ws/http-backend-async
+      - name: Bootstrap cl-repository-client (QL deps for client only)
+        shell: bash
+        run: |
+          ros -e '(ql:quickload (quote ("yason" "ironclad" "babel" "dexador" "quri" "chipz" "flexi-streams" "cl-ppcre" "cl-base64" "trivial-features" "salza2" "archive")) :silent t)' -q
+
+      - name: cl-repo install deps + test
         shell: bash
         env:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
           HTTP_ASYNC_LIVE: "1"
         run: |
-          ros install qlot
-          qlot install
-          qlot exec ros -S . -e '(asdf:test-system "http-backend-async")'
-
-      - name: Test (Windows / libuv)
-        if: runner.os == 'Windows'
-        shell: bash
-        env:
-          HTTP_ASYNC_EVENT_BACKEND: libuv
-          HTTP_ASYNC_LIVE: "1"
-        run: |
-          export PATH="${OPENSSL_NATIVE}:${BROTLI_NATIVE}:${EVENT_PROTOCOL_NATIVE}:${PATH}"
-          cp -a _sib/event-protocol _sib/event-backend-libuv/event-protocol
-          ros install rove cffi cffi-grovel quri fast-http babel alexandria blackbird \
-            cl-cookie chipz salza2 trivial-gray-streams bordeaux-threads usocket cl+ssl
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/_sib/http-protocol//:$(pwd)/_sib/event-protocol//:$(pwd)/_sib/event-backend-libuv//:$(pwd)/_sib/http-encoding-chipz//:$(pwd)/_sib/http-encoding-brotli//:$(pwd)/_sib/cl-stack-brotli//:$(pwd)/_sib/cl-stack-ssl//:"
-          ros -S . \
-              -e '(setf *debugger-hook* (lambda (c h) (declare (ignore h)) (format *error-output* "~&UNHANDLED: ~A~%" c) (uiop:quit 1)))' \
-              -e '(asdf:load-system :cffi)' \
-              -e "(dolist (d (list (uiop:getenv \"OPENSSL_NATIVE\") (uiop:getenv \"BROTLI_NATIVE\") (uiop:getenv \"EVENT_PROTOCOL_NATIVE\"))) (when (and d (plusp (length d))) (push (uiop:ensure-directory-pathname d) cffi:*foreign-library-directories*)))" \
-              -e '(asdf:test-system "http-backend-async")' -q
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
+          ros -l scripts/ci-test.lisp -q
