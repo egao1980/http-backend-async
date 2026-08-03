@@ -9,7 +9,9 @@
         (uiop:quit 1)))
 
 (asdf:load-system "cl-repository-client")
-#+sbcl (setf sb-ext:*on-package-variance* '(:warn))
+;; QL bootstrap (client→dexador→babel) then OCI babel: DEFPACKAGE variance is a
+;; WARNING; ASDF defaults *compile-file-failure-behaviour* to :error and aborts.
+(setf asdf:*compile-file-failure-behaviour* :warn)
 
 (defun ci-install (oci-name &key version (asdf-name oci-name))
   "Install OCI package OCI-NAME (e.g. cl-plus-ssl), then asdf-load ASDF-NAME (e.g. cl+ssl)."
@@ -27,7 +29,9 @@
   (format t "~&; ci: cl-repo load ~a~@[:~a~]~%" name version)
   (if version
       (cl-repo:load-system name :version version)
-      (cl-repo:load-system name)))
+      (cl-repo:load-system name))
+  (unless (asdf:component-loaded-p name)
+    (error "ci-load: ~a did not load" name)))
 
 (defun ci-ensure-ql (&rest names)
   "QL only for systems not yet published to egao1980/cl-systems."
