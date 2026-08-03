@@ -31,6 +31,11 @@
   (format t "~&; ci: test with event backend ~a~%" backend)
   (call-with-ci-muffles
    (lambda ()
+     (dolist (n '("rove" "fast-http" "babel" "usocket" "bordeaux-threads"
+                  "blackbird" "trivial-gray-streams" "cl-cookie"))
+       (unless (asdf:find-system n nil)
+         (format t "~&; ci: ql fallback ~a~%" n)
+         (ql:quickload n :silent t)))
      (asdf:load-system "cl+ssl")
      (asdf:load-system "cl-stack-ssl")
      (asdf:load-system event-sys)
