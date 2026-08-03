@@ -22,8 +22,8 @@
       (babel:octets-to-string out :encoding :utf-8 :errorp nil))))
 
 (defun %default-handler (method path headers body)
-  "httpbin-shaped paths used by requests CE tests (/gzip /deflate)."
-  (declare (ignore method headers))
+  "httpbin-shaped paths used by requests CE / cookie tests."
+  (declare (ignore method))
   (cond
     ((string= path "/ok")
      (values 200 '(("content-type" . "text/plain"))
@@ -54,6 +54,21 @@
     ((string= path "/echo")
      (values 200 '(("content-type" . "application/octet-stream"))
              (or body #())))
+    ;; requests Session cookie persistence (set → echo Cookie header)
+    ((string= path "/cookies/set")
+     (values 200
+             '(("content-type" . "text/plain")
+               ("set-cookie" . "session=abc; Path=/"))
+             (babel:string-to-octets "set")))
+    ((string= path "/cookies")
+     (let ((cookie (cdr (assoc "cookie" headers :test #'string-equal))))
+       (values 200 '(("content-type" . "text/plain"))
+               (babel:string-to-octets (or cookie "")))))
+    ((string= path "/redirect/1")
+     (values 302
+             '(("location" . "/ok")
+               ("content-type" . "text/plain"))
+             (babel:string-to-octets "go")))
     (t
      (values 404 '(("content-type" . "text/plain"))
              (babel:string-to-octets "nope")))))

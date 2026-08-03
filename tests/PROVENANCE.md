@@ -11,6 +11,7 @@ Live + fixture Content-Encoding cases track [psf/requests](https://github.com/ps
 | `test-accept-encoding-identity` / `live-accept-encoding-identity` | Session `Accept-Encoding: identity` |
 | `test-content-encoding-case-insensitive` | urllib3 case-insensitive `Content-Encoding` |
 | soft-load `br` | requests FAQ: decode br when a brotli decoder is available |
+| `test-session-cookie-jar` | requests `Session` cookie jar — Set-Cookie then Cookie on next GET |
 
 - requests: Apache-2.0 — ideas only; no copied source
 - Original Rove tests in this repo: MIT

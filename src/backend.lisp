@@ -95,6 +95,8 @@
                                       :event-loop event-loop))
                (sock nil)
                (fd nil)
+               (cookie-jar (resolve-cookie-jar client request
+                                               :url (http-request-url request)))
                (headers (%merge-headers (http-client-headers client)
                                         (http-request-headers request)))
                (ae (%accept-encoding-header
@@ -115,6 +117,8 @@
                              host
                              (format nil "~A:~A" host port))
                          headers)))
+          (setf headers (inject-cookie-header headers cookie-jar
+                                              (quri:render-uri uri)))
           (multiple-value-bind (body ce-header)
               (%prepare-content (http-request-content request)
                                 (http-request-content-encoding request))
@@ -175,21 +179,25 @@
                      (handler-case (funcall cb res)
                        (error (e) (warn "callback failed: ~A" e)))))
                  (finish-response ()
-                   (multiple-value-bind (body* headers*)
-                       (apply-response-content-encoding
-                        (coerce body '(simple-array (unsigned-byte 8) (*)))
-                        hdrs
-                        :decompress (http-request-decompress request))
-                     (succeed
-                      (make-instance 'http-response
-                                     :status (fast-http:http-status http)
-                                     :headers headers*
-                                     :body body*
-                                     :url (quri:render-uri uri)
-                                     :http-version
-                                     (format nil "HTTP/~A"
-                                             (fast-http:http-version http))
-                                     :request request))))
+                   (let* ((final-url (quri:render-uri uri))
+                          (set-cookies (merge-response-cookies
+                                        cookie-jar final-url hdrs)))
+                     (multiple-value-bind (body* headers*)
+                         (apply-response-content-encoding
+                          (coerce body '(simple-array (unsigned-byte 8) (*)))
+                          hdrs
+                          :decompress (http-request-decompress request))
+                       (succeed
+                        (make-instance 'http-response
+                                       :status (fast-http:http-status http)
+                                       :headers headers*
+                                       :body body*
+                                       :url final-url
+                                       :cookies set-cookies
+                                       :http-version
+                                       (format nil "HTTP/~A"
+                                               (fast-http:http-version http))
+                                       :request request)))))
                  (https-exchange ()
                    "TLS handshake + HTTP on loop thread (run-to-completion)."
                    (when-let ((io (async-request-io-handle handle)))

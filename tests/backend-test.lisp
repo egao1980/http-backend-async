@@ -135,3 +135,28 @@
         (event-protocol:run eb el :stop-when-idle t)
         (ok (async-request-canceled-p handle))
         (ok (null canceled))))))
+
+(deftest test-session-cookie-jar
+  "requests Session: Set-Cookie persisted and sent on next request."
+  (with-http-fixture ()
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (http:with-client (client)
+        (let ((res1 (%await-promise
+                     (get-async (fixture-url "/cookies/set") :client client)
+                     eb el)))
+          (ok (= 200 (response-status res1)))
+          (ok (= 1 (length (response-cookies res1))))
+          (ok (plusp (length (cl-cookie:cookie-jar-cookies
+                              (http-client-cookie-jar client))))))
+        ;; Fresh event loop for second hop (fixture still up).
+        (let* ((eb2 (%make-event-backend))
+               (el2 (make-event-loop eb2)))
+          (with-event-backend (eb2)
+            (with-event-loop-var (el2)
+              (let* ((res2 (%await-promise
+                            (get-async (fixture-url "/cookies") :client client)
+                            eb2 el2))
+                     (text (%body-text res2)))
+                (ok (= 200 (response-status res2)))
+                (ok (search "session=abc" text))))))))))
