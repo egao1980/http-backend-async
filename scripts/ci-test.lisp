@@ -25,7 +25,7 @@
 (cl-repository-client/asdf-integration:load-system-init-files)
 
 (defun ci-assert-http-protocol-api ()
-  "Fail fast if OCI/sibling http-protocol lacks prepare-request-body (#73)."
+  "Fail fast if OCI http-protocol lacks prepare-request-body (#73)."
   (asdf:load-system "http-protocol")
   (format t "~&; ci: http-protocol from ~a~%"
           (asdf:system-source-directory (asdf:find-system "http-protocol")))
