@@ -1,0 +1,99 @@
+name: Publish OCI Package
+
+# Pure-Lisp source package → ghcr.io/egao1980/cl-systems/http-backend-async:<version>
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (default: from tag or 0.1.0)"
+        required: false
+        default: ""
+      registry:
+        description: "OCI registry"
+        required: false
+        default: "ghcr.io"
+
+env:
+  PACKAGE_VERSION_DEFAULT: "0.1.0"
+  PACKAGER_TAG: "0.8.0"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - id: ver
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          if [ -z "$V" ] && [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          [ -z "$V" ] && V="${PACKAGE_VERSION_DEFAULT}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage Lisp-only source
+        run: |
+          STAGING="${RUNNER_TEMP}/http-backend-async-src"
+          mkdir -p "$STAGING"
+          cp -a http-backend-async.asd src LICENSE README.md "$STAGING/"
+          echo "STAGING=$STAGING" >> "$GITHUB_ENV"
+
+      - name: Install SBCL + Quicklisp
+        run: |
+          sudo apt-get update && sudo apt-get install -y sbcl
+          curl -fsSL -o /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp
+          sbcl --noinform --non-interactive \
+            --load /tmp/quicklisp.lisp \
+            --eval '(quicklisp-quickstart:install :path #p"~/quicklisp/")'
+          sbcl --noinform --non-interactive \
+            --load ~/quicklisp/setup.lisp \
+            --eval '(ql-util:without-prompting (ql:add-to-init-file))'
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+        with:
+          version: 1.2.3
+
+      - name: Pull cl-repository-packager
+        run: |
+          CL_REPO_IMAGE="ghcr.io/egao1980/cl-repository/cl-repository-packager"
+          rm -rf /tmp/cl-repo-pull
+          mkdir -p /tmp/cl-repo-pull ~/.local/share/cl-systems
+          oras pull "${CL_REPO_IMAGE}:${PACKAGER_TAG}" -o /tmp/cl-repo-pull/
+          for f in /tmp/cl-repo-pull/*.tar.gz; do
+            tar -xzf "$f" -C ~/.local/share/cl-systems/
+          done
+
+      - name: Publish source-only package
+        env:
+          PKG_VERSION: ${{ needs.resolve-version.outputs.version }}
+          OCI_REGISTRY: ${{ inputs.registry || 'ghcr.io' }}
+          OCI_NAMESPACE: egao1980/cl-systems
+          GITHUB_ACTOR: ${{ github.actor }}
+          PKG_SOURCE_DIR: ${{ env.STAGING }}
+          SKIP_CATALOG: "true"
+        run: |
+          sbcl --noinform --non-interactive --load scripts/publish-source.lisp
+
+      - name: Verify
+        env:
+          PKG_VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          REF="ghcr.io/egao1980/cl-systems/http-backend-async:${PKG_VERSION}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          oras manifest fetch "$REF"
+          echo "OK $REF"
