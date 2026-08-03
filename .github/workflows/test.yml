@@ -13,7 +13,7 @@ concurrency:
 env:
   SBCL_VERSION: 2.4.11
   ROSWELL_VERSION: "26.02.116"
-  CL_REPOSITORY_REF: "cursor/windows-provides-symlink-58c5"
+  CL_REPOSITORY_REF: "v0.9.0"
   HTTP_ASYNC_LIVE: "1"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
