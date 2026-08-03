@@ -23,8 +23,9 @@
 
 (defparameter *ci-ql-sources*
   '(("babel" :ql)
-    ("trivial-features" :ql))
-  "Already loaded via client QL bootstrap — do not reinstall from OCI.")
+    ("trivial-features" :ql)
+    ("cl-unicode" :ql))
+  "QL pins: babel already bootstrapped; cl-unicode OCI v0.1.6 lacks idna-mapping.")
 
 (cl-repo:add-registry "https://ghcr.io" :namespace "egao1980/cl-systems" :priority :prepend)
 
