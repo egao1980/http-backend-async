@@ -12,7 +12,11 @@ concurrency:
 
 env:
   SBCL_VERSION: 2.4.11
+  ROSWELL_VERSION: "26.02.116"
+  CL_REPOSITORY_REF: "main"
+  CL_STACK_SSL_VERSION: "3.4.1"
   HTTP_ASYNC_LIVE: "1"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   test:
@@ -22,101 +26,103 @@ jobs:
         include:
           - os: ubuntu-latest
             event_backend: libuv
-            apt: libuv1-dev
-            brew: libuv
           - os: ubuntu-latest
             event_backend: libev
-            apt: libev-dev
-            brew: libev
           - os: macos-latest
             event_backend: libuv
-            apt: ""
-            brew: libuv
           - os: macos-latest
             event_backend: libev
-            apt: ""
-            brew: libev
+          - os: windows-latest
+            event_backend: libuv
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/checkout@v4
         with:
-          repository: egao1980/http-protocol
-          path: _sib/http-protocol
+          repository: egao1980/cl-repository
+          ref: ${{ env.CL_REPOSITORY_REF }}
+          path: .cl-repository
 
-      - uses: actions/checkout@v4
+      - uses: oras-project/setup-oras@v1
         with:
-          repository: egao1980/event-protocol
-          path: _sib/event-protocol
+          version: 1.2.3
 
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/event-backend-libuv
-          path: _sib/event-backend-libuv
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/event-backend-libev
-          path: _sib/event-backend-libev
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/http-encoding-chipz
-          path: _sib/http-encoding-chipz
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/http-encoding-brotli
-          path: _sib/http-encoding-brotli
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/cl-stack-brotli
-          path: _sib/cl-stack-brotli
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/cl-stack-ssl
-          path: _sib/cl-stack-ssl
-
-      - name: Layout siblings
+      - name: Install Roswell (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p /tmp/ws
-          cp -a "$GITHUB_WORKSPACE" /tmp/ws/http-backend-async
-          for d in http-protocol event-protocol event-backend-libuv event-backend-libev \
-                   http-encoding-chipz http-encoding-brotli cl-stack-brotli cl-stack-ssl; do
-            cp -a "$GITHUB_WORKSPACE/_sib/$d" "/tmp/ws/$d"
-          done
-          cp -a /tmp/ws/event-protocol /tmp/ws/event-backend-libuv/event-protocol
-          cp -a /tmp/ws/event-protocol /tmp/ws/event-backend-libev/event-protocol
+          curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
 
-      - name: Install native deps (Linux)
-        if: runner.os == 'Linux'
+      - name: Install Roswell (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev libbrotli-dev ${{ matrix.apt }}
+          curl -sL "https://github.com/roswell/roswell/releases/download/v${ROSWELL_VERSION}/roswell_${ROSWELL_VERSION}_amd64.zip" \
+            -o /tmp/roswell.zip
+          rm -rf /c/roswell && mkdir -p /c/roswell
+          unzip -qo /tmp/roswell.zip -d /c/roswell
+          echo "/c/roswell/roswell" >> "$GITHUB_PATH"
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
 
-      - name: Install native deps (macOS)
-        if: runner.os == 'macOS'
+      - name: Install SBCL
+        shell: bash
         run: |
-          brew install ${{ matrix.brew }} openssl@3 brotli
-          echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          ros install "sbcl-bin/$SBCL_VERSION"
+          ros use "sbcl-bin/$SBCL_VERSION"
 
-      - name: Install Roswell + test
-        working-directory: /tmp/ws/http-backend-async
+      - name: Bootstrap cl-repository-client (QL deps for client only)
+        shell: bash
+        run: |
+          ros -e '(ql:quickload (quote ("yason" "ironclad" "babel" "dexador" "quri" "chipz" "flexi-streams" "cl-ppcre" "cl-base64" "trivial-features" "salza2" "archive")) :silent t)' -q
+
+      - name: cl-repo install deps
+        shell: bash
+        env:
+          HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
+        run: |
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
+          ros -l scripts/ci-install.lisp -q
+
+      - name: Stage OpenSSL overlay for test process
+        shell: bash
+        run: |
+          case "${RUNNER_OS}" in
+            Linux)   plat=linux/amd64 ;;
+            macOS)
+              case "${RUNNER_ARCH}" in
+                ARM64) plat=darwin/arm64 ;;
+                X64)   plat=darwin/amd64 ;;
+                *) echo "unsupported arch ${RUNNER_ARCH}" >&2; exit 1 ;;
+              esac ;;
+            Windows) plat=windows/amd64 ;;
+            *) echo "unsupported OS ${RUNNER_OS}" >&2; exit 1 ;;
+          esac
+          echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          mkdir -p /tmp/ssl-pull /tmp/ssl-native
+          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:${CL_STACK_SSL_VERSION}" \
+            --platform "${plat}" -o /tmp/ssl-pull
+          tar -xzf /tmp/ssl-pull/native-library.tar.gz -C /tmp/ssl-native
+          NAT="$(find /tmp/ssl-native -type d -name native | head -1)"
+          : "${NAT:?native/ not found in cl-stack-ssl overlay}"
+          echo "OPENSSL_NATIVE=${NAT}" >> "$GITHUB_ENV"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            echo "${NAT}" >> "$GITHUB_PATH"
+          else
+            echo "LD_LIBRARY_PATH=${NAT}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            echo "DYLD_LIBRARY_PATH=${NAT}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+          ls -la "${NAT}"
+
+      - name: Test with overlay OpenSSL
         shell: bash
         env:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
           HTTP_ASYNC_LIVE: "1"
         run: |
-          curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
-          export PATH="$HOME/.roswell/bin:$PATH"
-          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
-          ros install "sbcl-bin/$SBCL_VERSION"
-          ros use "sbcl-bin/$SBCL_VERSION"
-          ros install qlot
-          qlot install
-          qlot exec ros -S . -e '(asdf:test-system "http-backend-async")'
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
+          ros -l scripts/ci-test.lisp -q

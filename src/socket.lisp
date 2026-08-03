@@ -65,17 +65,29 @@
   (usocket:socket-stream usock))
 
 (defun %would-block-p (condition)
+  "True for EAGAIN/EWOULDBLOCK/EINPROGRESS and Windows WSAEWOULDBLOCK.
+   SBCL on Windows often reports WSAEWOULDBLOCK (10035) as EINTR with
+   message 'A non-blocking socket operation could not be completed immediately.'"
   (let ((msg (princ-to-string condition)))
     (or (search "WOULD-BLOCK" msg :test #'char-equal)
         (search "EAGAIN" msg :test #'char-equal)
         (search "EWOULDBLOCK" msg :test #'char-equal)
+        (search "WSAEWOULDBLOCK" msg :test #'char-equal)
         (search "Resource temporarily unavailable" msg :test #'char-equal)
         (search "operation in progress" msg :test #'char-equal)
-        (search "EINPROGRESS" msg :test #'char-equal))))
+        (search "EINPROGRESS" msg :test #'char-equal)
+        (search "could not be completed immediately" msg :test #'char-equal)
+        ;; WSAEWOULDBLOCK via SBCL interrupted-error / EINTR wording
+        (and (search "EINTR" msg :test #'char-equal)
+             (or (search "non-blocking" msg :test #'char-equal)
+                 (search "immediately" msg :test #'char-equal))))))
 
 (defun %in-progress-condition-p (condition)
-  (let ((op (%soft-class :sb-bsd-sockets "OPERATION-IN-PROGRESS")))
+  (let ((op (%soft-class :sb-bsd-sockets "OPERATION-IN-PROGRESS"))
+        (eintr (%soft-class :sb-bsd-sockets "INTERRUPTED-ERROR")))
     (or (and op (typep condition op))
+        ;; Windows NB connect: WSAEWOULDBLOCK often typed as INTERRUPTED-ERROR
+        (and eintr (typep condition eintr))
         (%would-block-p condition))))
 
 ;;; --- nonblocking connect (SBCL) -------------------------------------------
