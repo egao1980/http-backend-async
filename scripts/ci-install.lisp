@@ -135,19 +135,7 @@
      (ci-fetch "cffi")
      (ci-fetch "event-protocol")
      (ci-fetch event-sys)
-     (handler-case (ci-fetch "ws-protocol" :version "0.2.0")
-       (error (e)
-         (format t "~&; ci: ws-protocol OCI unavailable (~A) — git fallback~%" e)
-         (let* ((root (cl-repository-client/installer:systems-root))
-                (dest (merge-pathnames "ws-protocol/0.2.0/" root)))
-           (unless (probe-file (merge-pathnames "ws-protocol.asd" dest))
-             (ensure-directories-exist dest)
-             (uiop:run-program
-              (list "git" "clone" "--depth" "1"
-                    "https://github.com/egao1980/ws-protocol.git"
-                    (uiop:native-namestring dest))
-              :output t :error-output t))
-           (cl-repository-client/asdf-integration:configure-asdf-source-registry))))
+     (ci-fetch "ws-protocol" :version "0.2.0")
      (let ((ssl-ver (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)))
        (ci-patch-stack-ssl ssl-ver)
        (when (uiop:getenv "GITHUB_ENV")
