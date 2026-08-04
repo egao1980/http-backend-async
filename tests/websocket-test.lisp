@@ -20,6 +20,14 @@
                      'ws-transport-not-available))
         (ok t))))
 
+(deftest async-ws-connect-async-is-specialized
+  "connect-async must not fall through to ws-protocol's BT default."
+  (ok (not (null (find-method #'ws-protocol:connect-async nil
+                              (list (find-class 'async-backend)
+                                    (find-class t)
+                                    (find-class t))
+                              nil)))))
+
 (deftest extended-connect-header-helper
   (let ((hdrs (make-extended-connect-ws-headers
                "wss://example.com/chat"
