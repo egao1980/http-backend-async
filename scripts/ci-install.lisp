@@ -135,7 +135,9 @@
      (ci-fetch "cffi")
      (ci-fetch "event-protocol")
      (ci-fetch event-sys)
-     (ci-fetch "ws-protocol" :version "0.2.0")
+     (handler-case (ci-fetch "ws-protocol" :version "0.2.1")
+       (error () (ci-fetch "ws-protocol" :version "0.2.0")))
+
      (let ((ssl-ver (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)))
        (ci-patch-stack-ssl ssl-ver)
        (when (uiop:getenv "GITHUB_ENV")
@@ -147,7 +149,7 @@
      ;; http2/client only — umbrella http2 pulls server/poll (cffi-grovel / poll.h).
      (dolist (n '("rove" "fast-http" "babel" "usocket" "bordeaux-threads"
                   "blackbird" "trivial-gray-streams" "cl-cookie" "cl-unicode"
-                  "cl-base64" "http2/client"))
+                  "cl-base64" "http2/client" "fast-websocket"))
        (unless (or (ci-on-disk-p n) (asdf:find-system n nil))
          (format t "~&; ci: ql fallback ~a~%" n)
          (ql:quickload n :silent t))))))
