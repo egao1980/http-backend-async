@@ -27,4 +27,9 @@
            #:response-keeps-alive-p
            #:build-connect-request-octets
            #:connect-response-ok-p
-           #:proxy-authorization-value))
+           #:proxy-authorization-value
+           #:ensure-http2
+           #:async-h2-pump-stream
+           #:async-h2-session
+           #:make-async-h2-session
+           #:tls-selected-alpn))

@@ -21,10 +21,27 @@
   handle    ; SSL*
   host
   verify
+  (alpn nil) ; negotiated ALPN protocol string or NIL
   (handshake-done-p nil :type boolean))
 
-(defun make-tls-session (fd host &key (verify t))
-  "Create SSL* + socket BIO on nonblocking FD. Does not run handshake."
+(defun %set-alpn-protos (handle protocols)
+  "Offer ALPN PROTOCOLS on SSL* HANDLE (cl+ssl wire format)."
+  (when protocols
+    (cffi:with-foreign-string ((string len)
+                               (cl+ssl::make-alpn-proto-string protocols))
+      (cl+ssl::ssl-set-alpn-protos handle string (1- len)))))
+
+(defun tls-selected-alpn (session)
+  "ALPN protocol selected after handshake, or NIL."
+  (or (tls-session-alpn session)
+      (when (and session (tls-session-stream session))
+        (ignore-errors
+          (cl+ssl:get-selected-alpn-protocol (tls-session-stream session))))))
+
+(defun make-tls-session (fd host &key (verify t) (alpn-protocols '("h2" "http/1.1")))
+  "Create SSL* + socket BIO on nonblocking FD. Does not run handshake.
+
+   ALPN-PROTOCOLS — list of protocol names offered (RFC 7301), default prefer h2."
   (ensure-tls)
   (cl+ssl:ensure-initialized)
   (let* ((verify* (%verify-arg verify))
@@ -37,6 +54,7 @@
           (when host
             (cffi:with-foreign-string (chostname host)
               (cl+ssl::ssl-set-tlsext-host-name handle chostname)))
+          (%set-alpn-protos handle alpn-protocols)
           (cl+ssl::install-handle-and-bio stream handle fd t)
           (cl+ssl::ssl-set-connect-state handle)
           (%make-tls-session :stream stream
@@ -93,7 +111,10 @@
            (error 'http-tls-error
                   :message (format nil "TLS verify failed for ~A: ~A"
                                    (tls-session-host session) e))))
-       (setf (tls-session-handshake-done-p session) t)
+       (setf (tls-session-handshake-done-p session) t
+             (tls-session-alpn session)
+             (ignore-errors
+               (cl+ssl:get-selected-alpn-protocol (tls-session-stream session))))
        :done)
       ((:want-read :want-write) status)
       (:eof

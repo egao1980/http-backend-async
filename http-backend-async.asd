@@ -1,5 +1,5 @@
 (defsystem "http-backend-async"
-  :version "0.1.3"
+  :version "0.2.0"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
@@ -23,6 +23,7 @@
                (:file "socks")
                (:file "async-body-stream")
                (:file "http1")
+               (:file "http2")
                (:file "redirect")
                (:file "tls")
                (:file "backend")
@@ -39,6 +40,7 @@
                (:file "proxy-test")
                (:file "socks-test")
                (:file "backend-test")
+               (:file "http2-test")
                (:file "live-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
