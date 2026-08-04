@@ -17,10 +17,13 @@
 (defvar *h2-classes-ready* nil)
 
 (defun ensure-http2 ()
-  "Load http2 (soft) and define async stream classes. Returns T when available."
+  "Load http2/client (soft) and define async stream classes. Returns T when available.
+
+   Load http2/client — not the umbrella http2 system — so Windows CI does not
+   pull http2/server/poll (cffi-grovel needs poll.h)."
   (or *http2-loaded*
       (setf *http2-loaded*
-            (and (ignore-errors (asdf:load-system "http2") t) t)))
+            (and (ignore-errors (asdf:load-system "http2/client") t) t)))
   (when (and *http2-loaded* (not *h2-classes-ready*))
     (%ensure-h2-classes)
     (setf *h2-classes-ready* t))
