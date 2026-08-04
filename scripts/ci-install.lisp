@@ -124,7 +124,7 @@
      (ci-install "cl-plus-ssl" :version "latest") ; real :latest tag
      ;; All GHCR pulls before any ql:quickload / ASDF load.
      ;; Omit :version → cl-repo picks newest published tag.
-     (ci-fetch "http-protocol" :version "0.2.0")
+     (ci-fetch "http-protocol" :version "0.3.0")
      (ci-fetch "http-encoding-chipz")
      (ci-fetch "http-encoding-brotli")
      (ci-fetch "cl-stack-brotli")
@@ -135,6 +135,19 @@
      (ci-fetch "cffi")
      (ci-fetch "event-protocol")
      (ci-fetch event-sys)
+     (handler-case (ci-fetch "ws-protocol" :version "0.2.0")
+       (error (e)
+         (format t "~&; ci: ws-protocol OCI unavailable (~A) — git fallback~%" e)
+         (let* ((root (cl-repository-client/installer:systems-root))
+                (dest (merge-pathnames "ws-protocol/0.2.0/" root)))
+           (unless (probe-file (merge-pathnames "ws-protocol.asd" dest))
+             (ensure-directories-exist dest)
+             (uiop:run-program
+              (list "git" "clone" "--depth" "1"
+                    "https://github.com/egao1980/ws-protocol.git"
+                    (uiop:native-namestring dest))
+              :output t :error-output t))
+           (cl-repository-client/asdf-integration:configure-asdf-source-registry))))
      (let ((ssl-ver (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)))
        (ci-patch-stack-ssl ssl-ver)
        (when (uiop:getenv "GITHUB_ENV")
@@ -145,7 +158,7 @@
      ;; QL only after OCI HTTPS is done (image will be discarded before tests).
      (dolist (n '("rove" "fast-http" "babel" "usocket" "bordeaux-threads"
                   "blackbird" "trivial-gray-streams" "cl-cookie" "cl-unicode"
-                  "cl-base64"))
+                  "cl-base64" "http2"))
        (unless (or (ci-on-disk-p n) (asdf:find-system n nil))
          (format t "~&; ci: ql fallback ~a~%" n)
          (ql:quickload n :silent t))))))

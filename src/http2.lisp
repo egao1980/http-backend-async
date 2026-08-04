@@ -27,13 +27,16 @@
   *http2-loaded*)
 
 (defun %ensure-h2-classes ()
-  "CLIENT-STREAM + header/body collectors — no utf8/gzip mixins (CE is ours)."
+  "CLIENT-STREAM + header/body collectors — no utf8/gzip mixins (CE is ours).
+   Also define ASYNC-H2-CLIENT-CONNECTION to track RFC 8441 SETTINGS."
   (let ((client-stream (find-symbol "CLIENT-STREAM" :http2/client))
         (header-m (find-symbol "HEADER-COLLECTING-MIXIN" :http2/core))
         (body-m (find-symbol "BODY-COLLECTING-MIXIN" :http2/core))
         (peer-ends (find-symbol "PEER-ENDS-HTTP-STREAM" :http2/core))
-        (client-done (find-symbol "CLIENT-DONE" :http2/client)))
-    (unless (and client-stream header-m body-m peer-ends client-done)
+        (client-done (find-symbol "CLIENT-DONE" :http2/client))
+        (vanilla (find-symbol "VANILLA-CLIENT-CONNECTION" :http2/client))
+        (set-peer (find-symbol "SET-PEER-SETTING" :http2/core)))
+    (unless (and client-stream header-m body-m peer-ends client-done vanilla)
       (error 'http-version-not-available
              :requested :http/2
              :message "http2 missing CLIENT-STREAM / mixins"))
@@ -41,7 +44,21 @@
       (eval `(defclass async-h2-client-stream
                  (,client-stream ,header-m ,body-m) ())))
     (eval `(defmethod ,peer-ends ((stream async-h2-client-stream))
-             (signal ',client-done :result stream)))))
+             (signal ',client-done :result stream)))
+    (unless (find-class 'async-h2-client-connection nil)
+      (eval `(defclass async-h2-client-connection (,vanilla)
+               ((enable-connect-protocol-p
+                 :initform nil
+                 :accessor h2-enable-connect-protocol-p))
+               (:documentation
+                "Client connection that records SETTINGS_ENABLE_CONNECT_PROTOCOL
+                 (RFC 8441) for future Extended CONNECT WebSocket."))))
+    (when set-peer
+      (eval `(defmethod ,set-peer ((connection async-h2-client-connection)
+                                   (name (eql :enable-connect-protocol))
+                                   value)
+               (setf (h2-enable-connect-protocol-p connection)
+                     (plusp value)))))))
 
 (defclass async-h2-pump-stream
     (trivial-gray-streams:fundamental-binary-input-stream
@@ -147,6 +164,12 @@
   (parse-fn nil)
   (parse-need 9 :type (integer 0 *)))
 
+(defun h2-session-enable-connect-protocol-p (session)
+  "True if peer advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (RFC 8441)."
+  (let ((conn (async-h2-session-connection session)))
+    (and (typep conn 'async-h2-client-connection)
+         (h2-enable-connect-protocol-p conn))))
+
 (defun %h2-parse-frame-header-fn ()
   "Function object for http2 PARSE-FRAME-HEADER (not the symbol)."
   (symbol-function (find-symbol "PARSE-FRAME-HEADER" :http2/core)))
@@ -154,14 +177,14 @@
 (defun make-async-h2-session (pump)
   "Create http2 client connection + incremental parse state over PUMP.
 
-   VANILLA-CLIENT-CONNECTION writes the client preface + SETTINGS (RFC 9113 §3.4)
-   into PUMP immediately."
+   ASYNC-H2-CLIENT-CONNECTION writes the client preface + SETTINGS (RFC 9113 §3.4)
+   into PUMP immediately and tracks ENABLE_CONNECT_PROTOCOL for RFC 8441."
   (unless (ensure-http2)
     (error 'http-version-not-available
            :requested :http/2
            :negotiated nil
            :message "http2 system not loadable"))
-  (let ((conn (make-instance (find-symbol "VANILLA-CLIENT-CONNECTION" :http2/client)
+  (let ((conn (make-instance 'async-h2-client-connection
                              :network-stream pump
                              :stream-class 'async-h2-client-stream)))
     (%make-async-h2-session :connection conn

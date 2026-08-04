@@ -8,7 +8,7 @@
 (defvar *event-backend-maker* nil
   "Thunk → EVENT-BACKEND. Tests/CI bind this to libuv or libev maker.")
 
-(defclass async-backend (http-backend)
+(defclass async-backend (http-backend ws-backend)
   ()
   (:default-initargs :name "async"))
 

@@ -25,7 +25,7 @@
                         out)))))))
 
 (let* ((name "http-backend-async")
-       (version (env "PKG_VERSION" "0.2.0"))
+       (version (env "PKG_VERSION" "0.2.1"))
        (source-dir (uiop:ensure-directory-pathname
                     (env "PKG_SOURCE_DIR" (namestring (uiop:getcwd)))))
        (_ (sync-asdf-version! source-dir version))
@@ -44,9 +44,13 @@
                :license "MIT"
                :description "Async http-protocol backend on event-protocol (register-io)"
                :author "egao1980"
-               :depends-on '("http-protocol" "event-protocol" "http-encoding-chipz" "quri" "fast-http" "babel" "alexandria" "cffi" "usocket" "cl+ssl")
+               :depends-on '("http-protocol" "event-protocol" "ws-protocol"
+                             "http-encoding-chipz" "quri" "fast-http" "babel"
+                             "alexandria" "bordeaux-threads" "trivial-gray-streams"
+                             "cffi" "usocket" "cl+ssl")
                :provides '("http-backend-async")))
        (result (cl-repository-packager/build-matrix:build-package spec)))
+  (declare (ignore _))
   (format t "~%Publishing ~a:~a (source-only) to ~a/~a~%"
           name version registry-url namespace)
   (cl-repository-packager/publisher:publish-package
