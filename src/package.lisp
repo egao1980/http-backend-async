@@ -11,7 +11,8 @@
                 #:defer
                 #:sleep*
                 #:cancel
-                #:register-io)
+                #:register-io
+                #:update-io)
   (:import-from #:alexandria #:when-let)
   (:export #:async-backend
            #:make-async-backend
