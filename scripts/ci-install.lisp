@@ -144,9 +144,10 @@
                               :if-exists :append :if-does-not-exist :create)
            (format out "CL_STACK_SSL_VERSION=~a~%" ssl-ver))))
      ;; QL only after OCI HTTPS is done (image will be discarded before tests).
+     ;; http2/client only — umbrella http2 pulls server/poll (cffi-grovel / poll.h).
      (dolist (n '("rove" "fast-http" "babel" "usocket" "bordeaux-threads"
                   "blackbird" "trivial-gray-streams" "cl-cookie" "cl-unicode"
-                  "cl-base64" "http2"))
+                  "cl-base64" "http2/client"))
        (unless (or (ci-on-disk-p n) (asdf:find-system n nil))
          (format t "~&; ci: ql fallback ~a~%" n)
          (ql:quickload n :silent t))))))
