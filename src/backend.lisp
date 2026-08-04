@@ -8,9 +8,14 @@
 (defvar *event-backend-maker* nil
   "Thunk → EVENT-BACKEND. Tests/CI bind this to libuv or libev maker.")
 
-(defclass async-backend (http-backend)
+(defclass async-backend (http-backend ws-backend)
   ()
   (:default-initargs :name "async"))
+
+(defmethod backend-http-versions ((backend async-backend))
+  "RFC 9112 + RFC 9113 (ALPN h2). Cleartext h2c = not yet."
+  (declare (ignore backend))
+  '(:http/1.1 :http/2))
 
 (defun make-async-backend ()
   "Load chipz encoding (+ soft br/zstd/TLS) and return ASYNC-BACKEND."
@@ -165,7 +170,15 @@
                ;; response also allows reuse (fixture often sends Connection: close).
                (keep-alive-p (not (null pool)))
                (reuse-ok-p nil)
-               (from-pool-p nil))
+               (from-pool-p nil)
+               (version-pref (effective-http-version client request))
+               (negotiated-version :http/1.1)
+               (h2-pump nil)
+               (h2-session nil)
+               (h2-out nil)
+               (h2-out-pos 0)
+               ;; Completed H2 stream waiting for outbound ACK/WINDOW_UPDATE flush.
+               (h2-done-stream nil))
           (when proxy-url
             (multiple-value-bind (pscheme phost pport puser ppass)
                 (parse-proxy-uri proxy-url)
@@ -485,9 +498,7 @@
                                 :url final-url
                                 :cookies set-cookies
                                 :history history-for-final
-                                :http-version
-                                (format nil "HTTP/~A"
-                                        (fast-http:http-version http))
+                                :http-version negotiated-version
                                 :request request))
                (follow-redirect (status headers* body* set-cookies final-url)
                  (let ((location (gethash "location" headers*)))
@@ -583,19 +594,63 @@
                            :decompress (http-request-decompress request))
                         (follow-redirect status headers* body* set-cookies
                                          final-url))))))
+               (begin-h2 ()
+                 "Start HTTP/2 session after ALPN=h2 (or prior-knowledge later)."
+                 (unless (ensure-http2)
+                   (return-from begin-h2
+                     (fail (make-condition 'http-version-not-available
+                                           :requested version-pref
+                                           :negotiated nil
+                                           :message "http2 system not loadable"))))
+                 (setf h2-pump (make-instance 'async-h2-pump-stream)
+                       h2-session (make-async-h2-session h2-pump)
+                       negotiated-version :http/2)
+                 (ensure-http-version-available version-pref negotiated-version
+                                                :backend-name "async")
+                 ;; Stream uploads: materialize for H2 DATA frames (wave-1).
+                 (when stream-body-p
+                   (let ((chunks nil))
+                     (loop for n = (read-sequence body-read-buf body-stream-src)
+                           while (plusp n)
+                           do (push (subseq body-read-buf 0 n) chunks))
+                     (setf body-octets
+                           (if chunks
+                               (apply #'concatenate
+                                      '(simple-array (unsigned-byte 8) (*))
+                                      (nreverse chunks))
+                               #())
+                           stream-body-p nil)))
+                 ;; RFC 9113 §3.4: preface+SETTINGS then HEADERS immediately
+                 ;; (same as http2 RETRIEVE-URL). No wait for peer SETTINGS.
+                 (h2-open-request h2-session method uri headers
+                                  :body body-octets)
+                 (setf h2-out (h2-pump-take-out h2-pump)
+                       h2-out-pos 0
+                       phase :h2-write)
+                 (arm-io :write)
+                 (next-tick (lambda () (on-io :ok))))
                (begin-origin-io ()
                  "After TCP (and optional SOCKS), start TLS or HTTP write."
-                 (if https
-                     (progn
-                       (setf tls (make-tls-session fd host :verify verify)
-                             (async-request-tls-stream handle) tls
-                             phase :tls-hs)
-                       (arm-io :write)
-                       (next-tick (lambda () (on-io :ok))))
-                     (progn
-                       (setf phase :write)
-                       (arm-io :write)
-                       (next-tick (lambda () (on-io :ok))))))
+                 (cond
+                   ((and (not https) (eq version-pref :http/2))
+                    (fail (make-condition 'http-version-not-available
+                                          :requested :http/2
+                                          :negotiated nil
+                                          :message "cleartext h2c not implemented")))
+                   (https
+                    (setf tls (make-tls-session
+                               fd host
+                               :verify verify
+                               :alpn-protocols (alpn-protocols-for-version version-pref))
+                          (async-request-tls-stream handle) tls
+                          phase :tls-hs)
+                    (arm-io :write)
+                    (next-tick (lambda () (on-io :ok))))
+                   (t
+                    (setf negotiated-version :http/1.1
+                          phase :write)
+                    (arm-io :write)
+                    (next-tick (lambda () (on-io :ok))))))
                (%socks-append (octets n)
                  (loop for i below n
                        do (vector-push-extend (aref octets i) socks-in)))
@@ -787,15 +842,101 @@
                  (loop
                    (ecase (tls-handshake-step tls)
                      (:done
-                      (setf phase :write)
-                      (arm-io :write)
-                      (return (do-write)))
+                      (let* ((alpn (tls-selected-alpn tls))
+                             (got (or (http-version-from-alpn alpn) :http/1.1)))
+                        (setf negotiated-version got)
+                        (handler-case
+                            (ensure-http-version-available
+                             version-pref got :backend-name "async")
+                          (http-version-not-available (e)
+                            (return (fail e))))
+                        (if (eq got :http/2)
+                            (return (begin-h2))
+                            (progn
+                              (setf phase :write)
+                              (arm-io :write)
+                              (return (do-write))))))
                      (:want-read
                       (arm-io :read)
                       (return))
                      (:want-write
                       (arm-io :write)
                       (return)))))
+               (finish-h2-stream (h2-stream)
+                 "Deliver a completed HTTP/2 stream as an HTTP-RESPONSE hop."
+                 (multiple-value-bind (status headers* body*)
+                     (h2-stream-to-http-parts h2-stream)
+                   (let ((set-cookies
+                           (merge-response-cookies cookie-jar
+                                                   (quri:render-uri uri)
+                                                   headers*)))
+                     (multiple-value-bind (body* headers*)
+                         (apply-response-content-encoding
+                          (coerce body* '(simple-array (unsigned-byte 8) (*)))
+                          headers*
+                          :decompress (http-request-decompress request))
+                       (setf reuse-ok-p keep-alive-p
+                             h2-done-stream nil)
+                       (follow-redirect status headers* body*
+                                        set-cookies
+                                        (quri:render-uri uri))))))
+               (do-h2-write ()
+                 (loop
+                   (when (or (null h2-out) (>= h2-out-pos (length h2-out)))
+                     (setf h2-out nil h2-out-pos 0)
+                     (when (h2-pump-pending-out-p h2-pump)
+                       (setf h2-out (h2-pump-take-out h2-pump)
+                             h2-out-pos 0))
+                     (unless h2-out
+                       ;; Flush done: if response already complete, deliver it
+                       ;; (SETTINGS ACK often shares the read that finishes the stream).
+                       (when h2-done-stream
+                         (return (finish-h2-stream h2-done-stream)))
+                       (setf phase :h2-read)
+                       (arm-io :read)
+                       (return)))
+                   (multiple-value-bind (pos done want)
+                       (%write-octets h2-out h2-out-pos (length h2-out))
+                     (setf h2-out-pos pos)
+                     (cond
+                       (want (arm-tls-want want) (return))
+                       ((not done) (return))
+                       (t
+                        (setf h2-out nil h2-out-pos 0)
+                        (when (h2-pump-pending-out-p h2-pump)
+                          (setf h2-out (h2-pump-take-out h2-pump))))))))
+               (do-h2-read ()
+                 (loop
+                   (multiple-value-bind (n want)
+                       (if https
+                           (tls-read-octets tls recv-buf)
+                           (values (socket-recv-octets sock recv-buf) nil))
+                     (cond
+                       (want (arm-tls-want want) (return))
+                       ((null n) (arm-io :read) (return))
+                       ((zerop n)
+                        (return (fail (make-condition 'http-connection-error
+                                                      :message "HTTP/2 EOF"))))
+                       (t
+                        (h2-pump-feed-in h2-pump recv-buf n)
+                        (multiple-value-bind (done h2-stream)
+                            (handler-case (h2-process-pending h2-session)
+                              (error (e)
+                                (return (fail (make-condition
+                                               'http-connection-error
+                                               :message (princ-to-string e))))))
+                          (when done
+                            (setf h2-done-stream h2-stream))
+                          (when (h2-pump-pending-out-p h2-pump)
+                            (setf h2-out (h2-pump-take-out h2-pump)
+                                  h2-out-pos 0
+                                  phase :h2-write)
+                            (arm-io :write)
+                            (return (do-h2-write)))
+                          (when h2-done-stream
+                            (return (finish-h2-stream h2-done-stream)))
+                          (arm-io :read)
+                          (return)))))))
                (arm-tls-want (want)
                  "Map TLS WANT_* to a single register-io direction (never :read-write)."
                  (arm-io (ecase want
@@ -909,6 +1050,8 @@
                        (:socks (do-socks))
                        (:http-connect (do-http-connect))
                        (:tls-hs (do-tls-hs))
+                       (:h2-write (do-h2-write))
+                       (:h2-read (do-h2-read))
                        (:write (do-write))
                        (:read (do-read)))
                    (http-error (e) (fail e))
@@ -916,6 +1059,12 @@
                      (fail (make-condition
                             (if https 'http-tls-error 'http-connection-error)
                             :message (princ-to-string e)))))))
+            ;; RFC 9113 h2c prior-knowledge is P2 — fail before TCP.
+            (when (and (not https) (eq version-pref :http/2))
+              (error 'http-version-not-available
+                     :requested :http/2
+                     :negotiated nil
+                     :message "cleartext h2c not implemented"))
             (build-headers-and-body)
             (reset-parser)
             (with-event-backend (event-backend)

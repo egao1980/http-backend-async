@@ -104,8 +104,20 @@ jobs:
           esac
           echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
           mkdir -p /tmp/ssl-pull /tmp/ssl-native
-          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:${CL_STACK_SSL_VERSION}" \
-            --platform "${plat}" -o /tmp/ssl-pull
+          : "${CL_STACK_SSL_VERSION:?CL_STACK_SSL_VERSION empty — ci-install must set GITHUB_ENV}"
+          REF="ghcr.io/egao1980/cl-systems/cl-stack-ssl:${CL_STACK_SSL_VERSION}"
+          # GHCR occasionally returns "denied" under concurrent matrix pulls — retry.
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            rm -rf /tmp/ssl-pull/* /tmp/ssl-native/*
+            if oras pull "${REF}" --platform "${plat}" -o /tmp/ssl-pull; then
+              ok=1
+              break
+            fi
+            echo "oras pull attempt ${attempt} failed; sleep $((attempt * 4))s" >&2
+            sleep $((attempt * 4))
+          done
+          [ "$ok" = 1 ] || { echo "oras pull failed for ${REF} platform=${plat}" >&2; exit 1; }
           tar -xzf /tmp/ssl-pull/native-library.tar.gz -C /tmp/ssl-native
           NAT="$(find /tmp/ssl-native -type d -name native | head -1)"
           : "${NAT:?native/ not found in cl-stack-ssl overlay}"
