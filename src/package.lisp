@@ -5,9 +5,22 @@
                 #:backend-ws-transports
                 #:backend-supports-ws-transport-p
                 #:connect
+                #:send-text
+                #:send-binary
+                #:ping
+                #:close-connection
+                #:on-event
                 #:make-http2-websocket-connect-headers
+                #:resolve-ws-transport
+                #:inject-auth-headers
                 #:ws-transport-not-available
-                #:make-ws-client)
+                #:make-ws-client
+                #:ws-client-headers
+                #:ws-client-protocols
+                #:ws-client-transport
+                #:ws-client-auth
+                #:ws-client-proxy
+                #:ws-client-verify)
   (:import-from #:event-protocol
                 #:*event-backend*
                 #:*event-loop*
