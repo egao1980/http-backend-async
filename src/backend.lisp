@@ -373,9 +373,8 @@
                               (when (async-body-full-p body-feed)
                                 (setf read-paused-p t)
                                 (when-let ((io (async-request-io-handle handle)))
-                                  (ignore-errors (cancel event-backend io))
-                                  (setf (async-request-io-handle handle) nil
-                                        io-dir nil)))))
+                                  (ignore-errors (update-io event-backend io :none))
+                                  (setf io-dir :none)))))
                    (multiple-value-bind (app-stream headers**)
                        (apply-response-content-encoding
                         body-feed headers*
@@ -419,27 +418,23 @@
                  ;; socket remains writable under :read-write interest.
                  (sleep* event-backend event-loop 0 :callback fn))
                (arm-io (direction)
-                 "Register FD interest. Re-arm via next-tick after cancel (same FD)."
+                 "Register or update FD interest in place (no cancel+re-init)."
                  (unless fd
                    (error 'http-connection-error :message "arm-io before connect"))
-                 (when (and (async-request-io-handle handle) (eq io-dir direction))
+                 (when (or (async-request-canceled-p handle)
+                           (eq phase :reconnect))
                    (return-from arm-io nil))
-                 (let ((old (async-request-io-handle handle)))
-                   (setf (async-request-io-handle handle) nil
-                         io-dir nil)
-                   (flet ((register ()
-                            (when (and fd
-                                       (not (async-request-canceled-p handle))
-                                       (not (eq phase :reconnect)))
-                              (setf io-dir direction
-                                    (async-request-io-handle handle)
-                                    (register-io event-backend event-loop fd
-                                                 direction #'on-io)))))
-                     (if old
-                         (progn
-                           (ignore-errors (cancel event-backend old))
-                           (next-tick #'register))
-                         (register)))))
+                 (let ((cur (async-request-io-handle handle)))
+                   (cond
+                     ((and cur (eq io-dir direction)) nil)
+                     (cur
+                      (update-io event-backend cur direction)
+                      (setf io-dir direction))
+                     (t
+                      (setf io-dir direction
+                            (async-request-io-handle handle)
+                            (register-io event-backend event-loop fd
+                                         direction #'on-io))))))
                (do-connect ()
                  (let ((conn (and pool (pool-acquire pool pool-key*))))
                    (cond
