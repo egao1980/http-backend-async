@@ -177,11 +177,12 @@
   "Function object for http2 PARSE-FRAME-HEADER (not the symbol)."
   (symbol-function (find-symbol "PARSE-FRAME-HEADER" :http2/core)))
 
-(defun make-async-h2-session (pump)
+(defun make-async-h2-session (pump &key (stream-class 'async-h2-client-stream))
   "Create http2 client connection + incremental parse state over PUMP.
 
    ASYNC-H2-CLIENT-CONNECTION writes the client preface + SETTINGS (RFC 9113 §3.4)
-   into PUMP immediately and tracks ENABLE_CONNECT_PROTOCOL for RFC 8441."
+   into PUMP immediately and tracks ENABLE_CONNECT_PROTOCOL for RFC 8441.
+   STREAM-CLASS defaults to ASYNC-H2-CLIENT-STREAM; WS uses ASYNC-H2-WS-STREAM."
   (unless (ensure-http2)
     (error 'http-version-not-available
            :requested :http/2
@@ -189,7 +190,7 @@
            :message "http2 system not loadable"))
   (let ((conn (make-instance 'async-h2-client-connection
                              :network-stream pump
-                             :stream-class 'async-h2-client-stream)))
+                             :stream-class stream-class)))
     (%make-async-h2-session :connection conn
                             :pump pump
                             :parse-fn (%h2-parse-frame-header-fn)

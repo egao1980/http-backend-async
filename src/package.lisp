@@ -5,6 +5,7 @@
                 #:backend-ws-transports
                 #:backend-supports-ws-transport-p
                 #:connect
+                #:connect-async
                 #:send-text
                 #:send-binary
                 #:ping
@@ -30,6 +31,7 @@
                 #:run
                 #:stop
                 #:defer
+                #:wake
                 #:sleep*
                 #:cancel
                 #:register-io
