@@ -47,3 +47,14 @@ HTTP_ASYNC_EVENT_BACKEND=libev qlot exec ros -e '(asdf:test-system "http-backend
 ```
 
 Tracks [egao1980/cl-stack#31](https://github.com/egao1980/cl-stack/issues/31).
+
+## Publish
+
+Source-only OCI publish is centralized in [`cl-stack-systems`](https://github.com/egao1980/cl-stack-systems)
+(`imports/http-backend-async/qlfile` pin + shared `publish.yml`). Packaging metadata lives in the `.asd`
+(`auto-package-spec`):
+
+```bash
+gh workflow run publish.yml -R egao1980/cl-stack-systems -f import=http-backend-async
+```
+
