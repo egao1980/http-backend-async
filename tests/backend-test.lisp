@@ -225,6 +225,41 @@
         (ok (equalp (loop for i below 64 collect (mod i 256))
                     (coerce octets 'list)))))))
 
+(deftest test-async-body-queue-bounded
+  "cl-stack#71: cooperative producer keeps peak buffered octets O(limit), not O(body)."
+  (let* ((limit 1024)
+         (chunk 256)
+         (body-size (* 40 1024))
+         (peak 0)
+         (s (http-backend-async::make-async-body-input-stream :limit limit))
+         (producer
+          (bt:make-thread
+           (lambda ()
+             (loop with pos = 0
+                   while (< pos body-size)
+                   do (loop while (http-backend-async::async-body-full-p s)
+                            do (sleep 0.0005))
+                      (let* ((n (min chunk (- body-size pos)))
+                             (piece (make-array n :element-type '(unsigned-byte 8)
+                                                  :initial-element 7)))
+                        (http-backend-async::async-body-feed s piece)
+                        (bt:with-lock-held ((http-backend-async::async-body-lock s))
+                          (setf peak (max peak (http-backend-async::async-body-buffered s))))
+                        (incf pos n)))
+             (http-backend-async::async-body-eof s))
+           :name "async-body-producer")))
+    (let ((buf (make-array 128 :element-type '(unsigned-byte 8)))
+          (got 0))
+      (loop for n = (read-sequence buf s)
+            while (plusp n)
+            do (incf got n)
+               (sleep 0.0002))
+      (bt:join-thread producer)
+      (ok (= body-size got))
+      ;; One in-flight chunk may land after FULL-P was false → limit+chunk.
+      (ok (<= peak (+ limit chunk)))
+      (ok (< peak body-size)))))
+
 (deftest test-want-stream-gzip
   "cl-stack#71: streamed response + CE decode via Gray wrap."
   (with-http-fixture ()
