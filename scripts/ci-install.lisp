@@ -21,6 +21,8 @@
   #-sbcl
   (funcall fn))
 
+(call-with-ci-muffles (lambda () (asdf:load-system "cl-repository-client")))
+
 (defun ci-record-installed-version (system env-var)
   (let ((ver (cl-repo:installed-system-version system))
         (env (uiop:getenv "GITHUB_ENV")))
@@ -28,8 +30,6 @@
       (with-open-file (out env :direction :output :if-exists :append :if-does-not-exist :create)
         (format out "~a=~a~%" env-var ver))
       (format t "~&; ci: ~a=~a~%" env-var ver))))
-
-(call-with-ci-muffles (lambda () (asdf:load-system "cl-repository-client")))
 
 (cl-repo:add-registry "https://ghcr.io" :namespace "egao1980/cl-systems" :priority :prepend)
 
