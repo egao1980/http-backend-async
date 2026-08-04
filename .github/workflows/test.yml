@@ -13,7 +13,8 @@ concurrency:
 env:
   SBCL_VERSION: 2.4.11
   ROSWELL_VERSION: "26.02.116"
-  CL_REPOSITORY_REF: "main"
+  CL_REPOSITORY_CLIENT_IMAGE: "ghcr.io/egao1980/cl-repository/cl-repository-client"
+  CL_REPOSITORY_CLIENT_VERSION: "0.11.0"
   # CL_STACK_SSL_VERSION unset → ci-install.lisp resolves newest tag → GITHUB_ENV
   HTTP_ASYNC_LIVE: "1"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -40,12 +41,6 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v5
-
-      - uses: actions/checkout@v5
-        with:
-          repository: egao1980/cl-repository
-          ref: ${{ env.CL_REPOSITORY_REF }}
-          path: .cl-repository
 
       - uses: oras-project/setup-oras@v2
         with:
@@ -75,6 +70,21 @@ jobs:
           ros install "sbcl-bin/$SBCL_VERSION"
           ros use "sbcl-bin/$SBCL_VERSION"
 
+      - name: Pull cl-repository-client (OCI)
+        shell: bash
+        run: |
+          echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          rm -rf /tmp/cl-repo-pull .cl-repository
+          mkdir -p /tmp/cl-repo-pull .cl-repository
+          oras pull "${CL_REPOSITORY_CLIENT_IMAGE}:${CL_REPOSITORY_CLIENT_VERSION}" -o /tmp/cl-repo-pull
+          for f in /tmp/cl-repo-pull/*.tar.gz; do
+            tar -xzf "$f" -C .cl-repository
+          done
+          CLIENT_DIR="$(find .cl-repository -maxdepth 1 -type d -name 'cl-oci-*' | head -1)"
+          : "${CLIENT_DIR:?cl-oci-* not found after oras pull}"
+          echo "CL_REPOSITORY_CLIENT_DIR=${CLIENT_DIR}" >> "$GITHUB_ENV"
+          ls -la "${CLIENT_DIR}"
+
       - name: Bootstrap cl-repository-client (QL deps for client only)
         shell: bash
         run: |
@@ -85,7 +95,7 @@ jobs:
         env:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
         run: |
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/${CL_REPOSITORY_CLIENT_DIR}//:"
           ros -l scripts/ci-install.lisp -q
 
       - name: Stage OpenSSL overlay for test process
@@ -136,5 +146,5 @@ jobs:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
           HTTP_ASYNC_LIVE: "1"
         run: |
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/${CL_REPOSITORY_CLIENT_DIR}//:"
           ros -l scripts/ci-test.lisp -q
