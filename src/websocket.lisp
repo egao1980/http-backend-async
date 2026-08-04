@@ -24,6 +24,16 @@
   (make-http2-websocket-connect-headers
    url headers :scheme scheme :protocols protocols))
 
+;;; Slots/accessors exist at compile time; http2 mixins are mixed in at load.
+(defclass async-h2-ws-payload-mixin ()
+  ((payload :initform (make-array 0 :element-type '(unsigned-byte 8)
+                                  :adjustable t :fill-pointer 0)
+            :accessor h2-ws-payload)
+   (payload-lock :initform (bt:make-lock "h2-ws-payload")
+                 :reader h2-ws-payload-lock)
+   (got-headers-p :initform nil :accessor h2-ws-got-headers-p)
+   (peer-ended-p :initform nil :accessor h2-ws-peer-ended-p)))
+
 (defun %ensure-h2-ws-stream-class ()
   "CLIENT-STREAM that queues DATA for RFC 6455 parsing."
   (ensure-http2)
@@ -37,14 +47,9 @@
              :requested :http/2
              :message "http2 missing CLIENT-STREAM / APPLY-DATA-FRAME"))
     (unless (find-class 'async-h2-ws-stream nil)
-      (eval `(defclass async-h2-ws-stream (,client-stream ,header-m)
-               ((payload :initform (make-array 0 :element-type '(unsigned-byte 8)
-                                               :adjustable t :fill-pointer 0)
-                         :accessor h2-ws-payload)
-                (payload-lock :initform (bt:make-lock "h2-ws-payload")
-                              :reader h2-ws-payload-lock)
-                (got-headers-p :initform nil :accessor h2-ws-got-headers-p)
-                (peer-ended-p :initform nil :accessor h2-ws-peer-ended-p)))))
+      (eval `(defclass async-h2-ws-stream
+                 (,client-stream ,header-m async-h2-ws-payload-mixin)
+               ())))
     (eval `(defmethod ,apply-data ((stream async-h2-ws-stream) data start end)
              (bt:with-lock-held ((h2-ws-payload-lock stream))
                (loop for i from start below end

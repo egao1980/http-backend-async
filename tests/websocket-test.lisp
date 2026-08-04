@@ -43,12 +43,20 @@
         (funcall set-peer conn :enable-connect-protocol 0)
         (ok (not (h2-session-enable-connect-protocol-p session))))))
 
+(defun %async-ws-h2-live-p ()
+  "True when live gate set. Uses feature-or-env when ws-protocol ≥0.2.1."
+  (let ((fn (find-symbol "FEATURE-OR-ENV-ENABLED-P" :ws-protocol)))
+    (if (and fn (fboundp fn))
+        (funcall fn :http-async-ws-h2-live "HTTP_ASYNC_WS_H2_LIVE")
+        (let ((v (uiop:getenv "HTTP_ASYNC_WS_H2_LIVE")))
+          (and v (not (member (string-downcase v)
+                              '("" "0" "false" "no" "off")
+                              :test #'string=)))))))
+
 (deftest extended-connect-live-optional
   "Live RFC 8441 WS — gate with HTTP_ASYNC_WS_H2_LIVE=1 or :http-async-ws-h2-live."
   (cond
-    ((not (and (fboundp 'ws-protocol:feature-or-env-enabled-p)
-               (ws-protocol:feature-or-env-enabled-p
-                :http-async-ws-h2-live "HTTP_ASYNC_WS_H2_LIVE")))
+    ((not (%async-ws-h2-live-p))
      (skip "set HTTP_ASYNC_WS_H2_LIVE=1 for Extended CONNECT live"))
     ((not (and (ensure-http2) (http-backend-async::ensure-fast-websocket)))
      (skip "http2/fast-websocket unavailable"))
