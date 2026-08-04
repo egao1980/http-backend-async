@@ -39,15 +39,15 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: egao1980/cl-repository
           ref: ${{ env.CL_REPOSITORY_REF }}
           path: .cl-repository
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
         with:
           version: 1.2.3
 
