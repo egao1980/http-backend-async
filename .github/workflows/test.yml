@@ -42,36 +42,16 @@ jobs:
 
       - uses: egao1980/cl-repository/.github/actions/setup-client@main
 
-      - name: Install Roswell (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
-          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
-
-      - name: Install Roswell (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          curl -sL "https://github.com/roswell/roswell/releases/download/v${ROSWELL_VERSION}/roswell_${ROSWELL_VERSION}_amd64.zip" \
-            -o /tmp/roswell.zip
-          rm -rf /c/roswell && mkdir -p /c/roswell
-          unzip -qo /tmp/roswell.zip -d /c/roswell
-          echo "/c/roswell/roswell" >> "$GITHUB_PATH"
-          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
-
-      - name: Install SBCL
-        shell: bash
-        run: |
-          ros install "sbcl-bin/$SBCL_VERSION"
-          ros use "sbcl-bin/$SBCL_VERSION"
+      - uses: egao1980/cl-repository/.github/actions/setup-roswell@main
+        with:
+          sbcl-version: ${{ env.SBCL_VERSION }}
+          roswell-version: ${{ env.ROSWELL_VERSION }}
 
       - name: cl-repo install deps
         shell: bash
         env:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
         run: |
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/${CL_REPOSITORY_CLIENT_DIR}//:"
           ros -l scripts/ci-install.lisp -q
 
       - name: Stage OpenSSL overlay for test process
@@ -122,5 +102,4 @@ jobs:
           HTTP_ASYNC_EVENT_BACKEND: ${{ matrix.event_backend }}
           HTTP_ASYNC_LIVE: "1"
         run: |
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/${CL_REPOSITORY_CLIENT_DIR}//:"
           ros -l scripts/ci-test.lisp -q
