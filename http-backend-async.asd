@@ -16,6 +16,13 @@
                "cffi"
                "usocket"
                "cl+ssl")
+  :properties
+  (:cl-repo
+   (:ci (:with ("cl-stack-ssl" "http2/client" "fast-websocket"
+                "http-encoding-brotli" "cl-stack-brotli")
+         :sources (("babel" :ql) ("trivial-features" :ql) ("cl-unicode" :ql))
+         :load-before-test ("cl+ssl" "cl-stack-ssl")
+         :record-versions (("cl-stack-ssl" . "CL_STACK_SSL_VERSION")))))
   :serial t
   :pathname "src"
   :components ((:file "package")

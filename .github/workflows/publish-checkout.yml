@@ -1,60 +1,25 @@
-# Emergency publish from this repo while cl-systems package ACL still grants
-# write to the original publisher repo (not cl-stack-systems).
-name: Publish checkout to cl-systems
+name: Publish checkout
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "OCI tag (default: .asd :version)"
+        description: "OCI tag (empty → .asd :version)"
         required: false
         default: ""
-
-env:
-  PACKAGER_TAG: "0.12.0"
+        type: string
+      packager_version:
+        description: "Packager image version"
+        required: false
+        default: "0.16.0"
+        type: string
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    uses: egao1980/cl-repository/.github/workflows/publish-source.yml@main
+    with:
+      version: ${{ inputs.version }}
+      packager-version: ${{ inputs.packager_version }}
     permissions:
       contents: read
       packages: write
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: oras-project/setup-oras@v2
-        with:
-          version: 1.2.3
-
-      - name: Install SBCL + git
-        run: sudo apt-get update && sudo apt-get install -y sbcl git
-
-      - name: Install Quicklisp
-        run: |
-          curl -fsSL -o /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp
-          sbcl --noinform --non-interactive \
-            --load /tmp/quicklisp.lisp \
-            --eval '(quicklisp-quickstart:install :path #p"~/quicklisp/")'
-          sbcl --noinform --non-interactive \
-            --load ~/quicklisp/setup.lisp \
-            --eval '(ql-util:without-prompting (ql:add-to-init-file))'
-
-      - name: Pull packager
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
-          rm -rf /tmp/cl-repo-pull
-          mkdir -p /tmp/cl-repo-pull ~/.local/share/cl-systems
-          oras pull "ghcr.io/egao1980/cl-repository/cl-repository-packager:${PACKAGER_TAG}" -o /tmp/cl-repo-pull/
-          for f in /tmp/cl-repo-pull/*.tar.gz; do
-            tar -xzf "$f" -C ~/.local/share/cl-systems/
-          done
-
-      - name: Publish
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
-          PKG_SYSTEM: http-backend-async
-          PKG_VERSION: ${{ inputs.version }}
-        run: sbcl --noinform --non-interactive --load scripts/publish-checkout.lisp
