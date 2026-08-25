@@ -1,0 +1,15 @@
+;;;; Load the matrix event backend after overlays, before asdf:test-system.
+
+(let* ((backend (string-downcase (or (uiop:getenv "HTTP_ASYNC_EVENT_BACKEND") "libuv")))
+       (event-sys (cond ((string= backend "libuv") "event-backend-libuv")
+                        ((string= backend "libev") "event-backend-libev")
+                        (t (error "Unknown HTTP_ASYNC_EVENT_BACKEND: ~a" backend)))))
+  (format t "~&; ci: pre-test event backend ~a~%" backend)
+  (asdf:load-system "cl+ssl")
+  (asdf:load-system "cl-stack-ssl")
+  (asdf:load-system event-sys)
+  (asdf:load-system "http-protocol")
+  (unless (and (find-package :http-protocol)
+               (fboundp (find-symbol "PREPARE-REQUEST-BODY" :http-protocol))
+               (fboundp (find-symbol "RESPONSE-DATA" :http-protocol)))
+    (error "http-protocol missing 0.2+ API — need OCI http-protocol ≥ 0.2.0")))
