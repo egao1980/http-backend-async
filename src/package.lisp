@@ -32,6 +32,7 @@
                 #:stop
                 #:defer
                 #:wake
+                #:submit
                 #:sleep*
                 #:cancel
                 #:register-io
