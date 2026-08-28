@@ -20,22 +20,21 @@
                  (stop event-backend event-loop))
                (on-response (res)
                  (if (and want-stream-p (streamp (response-body res)))
-                     (bt:make-thread
-                      (lambda ()
-                        (handler-case
-                            (let ((octets (slurp-octets (body-stream res))))
-                              (finish
-                               (make-instance 'http-response
-                                              :status (response-status res)
-                                              :headers (response-headers res)
-                                              :body octets
-                                              :url (response-url res)
-                                              :http-version (response-http-version res)
-                                              :cookies (response-cookies res)
-                                              :history (response-history res)
-                                              :request (response-request res))))
-                          (error (e) (fail e))))
-                      :name "http-async-sync-slurp")
+                     (submit event-backend event-loop
+                             (lambda () (slurp-octets (body-stream res)))
+                             :callback
+                             (lambda (octets)
+                               (finish
+                                (make-instance 'http-response
+                                               :status (response-status res)
+                                               :headers (response-headers res)
+                                               :body octets
+                                               :url (response-url res)
+                                               :http-version (response-http-version res)
+                                               :cookies (response-cookies res)
+                                               :history (response-history res)
+                                               :request (response-request res))))
+                             :error-callback #'fail)
                      (finish res))))
         (with-event-backend (event-backend)
           (with-event-loop-var (event-loop)
