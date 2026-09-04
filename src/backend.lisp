@@ -183,6 +183,7 @@
                (h2-body-buf (make-array 0 :element-type '(unsigned-byte 8)
                                           :adjustable t :fill-pointer 0))
                (h2-callback-finished-p nil)
+               (h2-req-end-p nil)
                (streamed-response nil))
           (when proxy-url
             (multiple-value-bind (pscheme phost pport puser ppass)
@@ -698,6 +699,86 @@
                                              set-cookies
                                              (quri:render-uri uri)
                                              :trailers tr))))))))
+               (%body-pipe-p (x)
+                 (let ((s (find-symbol (string '#:http-body-pipe-p) :http-protocol)))
+                   (and s (fboundp s) (funcall s x))))
+               (%pipe-listen (x)
+                 (let ((s (find-symbol (string '#:http-body-pipe-listen) :http-protocol)))
+                   (and s (fboundp s) (funcall s x))))
+               (%pipe-eof (x)
+                 (let ((s (find-symbol (string '#:http-body-pipe-eof-p) :http-protocol)))
+                   (and s (fboundp s) (funcall s x))))
+               (%pipe-read (x seq start end)
+                 (let ((s (find-symbol (string '#:http-body-pipe-read-available)
+                                       :http-protocol)))
+                   (if (and s (fboundp s))
+                       (funcall s x seq start end)
+                       start)))
+               (%pipe-set-on-data (x fn)
+                 (let ((acc (find-symbol (string '#:body-pipe-on-data) :http-protocol)))
+                   (when acc
+                     (funcall (fdefinition `(setf ,acc)) fn x))))
+               (queue-h2-out ()
+                 (when (and h2-pump (h2-pump-pending-out-p h2-pump))
+                   (setf h2-out (h2-pump-take-out h2-pump)
+                         h2-out-pos 0
+                         phase :h2-write)
+                   t))
+               (try-h2-request-body ()
+                 "Send one DATA chunk from the request stream/pipe. T if bytes queued."
+                 (when (or (not stream-body-p) h2-req-end-p (null h2-req-stream))
+                   (return-from try-h2-request-body nil))
+                 (cond
+                   ((%body-pipe-p body-stream-src)
+                    (unless (%pipe-listen body-stream-src)
+                      (return-from try-h2-request-body nil))
+                    (let* ((end (%pipe-read body-stream-src body-read-buf
+                                            0 (length body-read-buf)))
+                           (n (- end 0)))
+                      (cond
+                        ((plusp n)
+                         (h2-write-data h2-session h2-req-stream
+                                        (subseq body-read-buf 0 n)
+                                        :end-stream nil)
+                         t)
+                        ((%pipe-eof body-stream-src)
+                         (h2-write-data h2-session h2-req-stream #()
+                                        :end-stream t)
+                         (setf h2-req-end-p t
+                               stream-body-p nil)
+                         t)
+                        (t nil))))
+                   (t
+                    (let ((n (read-sequence body-read-buf body-stream-src)))
+                      (cond
+                        ((plusp n)
+                         (h2-write-data h2-session h2-req-stream
+                                        (subseq body-read-buf 0 n)
+                                        :end-stream nil)
+                         t)
+                        (t
+                         (h2-write-data h2-session h2-req-stream #()
+                                        :end-stream t)
+                         (setf h2-req-end-p t
+                               stream-body-p nil)
+                         t))))))
+               (install-pipe-wake ()
+                 (when (%body-pipe-p body-stream-src)
+                   (%pipe-set-on-data
+                    body-stream-src
+                    (lambda ()
+                      (flet ((kick ()
+                               (unless (async-request-canceled-p handle)
+                                 (try-h2-request-body)
+                                 (when (queue-h2-out)
+                                   (arm-io :write)))))
+                        (let ((wc (find-symbol "WAKE-CALL" :event-protocol)))
+                          (if (and wc (fboundp wc))
+                              (funcall wc event-backend event-loop #'kick)
+                              (progn
+                                (defer event-backend event-loop #'kick)
+                                (ignore-errors
+                                  (wake event-backend event-loop))))))))))
                (begin-h2 ()
                  "Start HTTP/2 session after ALPN=h2 (or prior-knowledge later)."
                  (unless (ensure-http2)
@@ -712,31 +793,23 @@
                                    :stream-class 'async-h2-streaming-client-stream)
                        negotiated-version :http/2
                        h2-callback-finished-p nil
+                       h2-req-end-p nil
                        (fill-pointer h2-body-buf) 0)
                  (ensure-http-version-available version-pref negotiated-version
                                                 :backend-name "async")
-                 ;; Stream uploads: materialize for H2 DATA frames (wave-1).
-                 (when stream-body-p
-                   (let ((chunks nil))
-                     (loop for n = (read-sequence body-read-buf body-stream-src)
-                           while (plusp n)
-                           do (push (subseq body-read-buf 0 n) chunks))
-                     (setf body-octets
-                           (if chunks
-                               (apply #'concatenate
-                                      '(simple-array (unsigned-byte 8) (*))
-                                      (nreverse chunks))
-                               #())
-                           stream-body-p nil)))
-                 ;; RFC 9113 §3.4: preface+SETTINGS then HEADERS immediately
-                 ;; (same as http2 RETRIEVE-URL). No wait for peer SETTINGS.
+                 ;; RFC 9113 §3.4: preface+SETTINGS then HEADERS immediately.
+                 ;; Stream uploads: HEADERS without END_STREAM, DATA as we read.
                  (setf h2-req-stream
                        (h2-open-request h2-session method uri headers
-                                        :body body-octets))
+                                        :end-stream (not stream-body-p)
+                                        :body (if stream-body-p nil body-octets)))
                  (when (typep h2-req-stream 'async-h2-stream-hooks)
                    (setf (h2-stream-on-headers h2-req-stream) #'on-h2-headers
                          (h2-stream-on-data h2-req-stream) #'on-h2-data
                          (h2-stream-on-end h2-req-stream) #'on-h2-end))
+                 (install-pipe-wake)
+                 (when stream-body-p
+                   (try-h2-request-body))
                  (setf h2-out (h2-pump-take-out h2-pump)
                        h2-out-pos 0
                        phase :h2-write)
@@ -1001,6 +1074,11 @@
                        (setf h2-out (h2-pump-take-out h2-pump)
                              h2-out-pos 0))
                      (unless h2-out
+                       (when (try-h2-request-body)
+                         (when (h2-pump-pending-out-p h2-pump)
+                           (setf h2-out (h2-pump-take-out h2-pump)
+                                 h2-out-pos 0)
+                           (return)))
                        ;; Flush done: if response already complete, deliver it
                        ;; (SETTINGS ACK often shares the read that finishes the stream).
                        (when (and h2-done-stream (not h2-callback-finished-p))
@@ -1046,6 +1124,13 @@
                                   phase :h2-write)
                             (arm-io :write)
                             (return (do-h2-write)))
+                          (when (try-h2-request-body)
+                            (when (h2-pump-pending-out-p h2-pump)
+                              (setf h2-out (h2-pump-take-out h2-pump)
+                                    h2-out-pos 0
+                                    phase :h2-write)
+                              (arm-io :write)
+                              (return (do-h2-write))))
                           (when (and h2-done-stream (not h2-callback-finished-p))
                             (return (finish-h2-stream h2-done-stream)))
                           (arm-io :read)

@@ -44,6 +44,21 @@
     (http-backend-async::h2-buf-append buf #(1 2 3 4) 1 4)
     (ok (equalp #(2 3 4) buf))))
 
+(deftest h2-open-request-streaming-body
+  "HEADERS without END_STREAM, then DATA chunks."
+  (if (not (ensure-http2))
+      (skip "http2/client not loadable")
+      (let* ((pump (make-instance 'async-h2-pump-stream))
+             (session (make-async-h2-session pump))
+             (uri (quri:uri "https://example.test/upload"))
+             (stream (h2-open-request session :post uri
+                                      '(("content-type" . "application/octet-stream"))
+                                      :end-stream nil)))
+        (ok stream)
+        (h2-write-data session stream #(1 2 3) :end-stream nil)
+        (h2-write-data session stream #(4) :end-stream t)
+        (ok (plusp (length (http-backend-async::h2-pump-take-out pump)))))))
+
 (deftest http2-live-want-stream
   "Live H2 :want-stream — gate with HTTP_ASYNC_H2_LIVE=1."
   (if (not (uiop:getenv "HTTP_ASYNC_H2_LIVE"))
