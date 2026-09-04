@@ -29,6 +29,75 @@
     (setf *h2-classes-ready* t))
   *http2-loaded*)
 
+(defclass async-h2-stream-hooks ()
+  ((on-headers :initform nil :accessor h2-stream-on-headers)
+   (on-data :initform nil :accessor h2-stream-on-data)
+   (on-end :initform nil :accessor h2-stream-on-end)
+   (headers-seen-p :initform nil :accessor h2-stream-headers-seen-p)
+   (header-snapshot :initform nil :accessor h2-stream-header-snapshot)
+   (trailers :initform nil :accessor h2-stream-trailers)
+   (pending-window :initform 0 :accessor h2-stream-pending-window)
+   (hold-window-p :initform nil :accessor h2-stream-hold-window-p))
+  (:documentation
+   "Callbacks + trailer snapshot for H2 :want-stream (DATA as they arrive)."))
+
+(defun %h2-write-window-update (stream nbytes)
+  "Credit NBYTES on STREAM and its connection (RFC 9113 flow control)."
+  (when (plusp nbytes)
+    (let ((pkg (find-package :http2/core)))
+      (when pkg
+        (let ((write (find-symbol "WRITE-WINDOW-UPDATE-FRAME" pkg))
+              (conn-fn (find-symbol "GET-CONNECTION" pkg)))
+          (when (and write conn-fn)
+            (let ((conn (ignore-errors (funcall conn-fn stream))))
+              (when conn
+                (funcall write conn nbytes)
+                (funcall write stream nbytes)))))))))
+
+(defun %h2-streaming-apply-data (stream data start end)
+  (let ((n (- end start)))
+    (when-let ((fn (h2-stream-on-data stream)))
+      (funcall fn data start end))
+    (cond
+      ((h2-stream-hold-window-p stream)
+       (incf (h2-stream-pending-window stream) n))
+      (t
+       (%h2-write-window-update stream n)))))
+
+(defun h2-stream-release-window (stream)
+  "Send WINDOW_UPDATE credits deferred while the body queue was full."
+  (let ((n (h2-stream-pending-window stream)))
+    (setf (h2-stream-hold-window-p stream) nil
+          (h2-stream-pending-window stream) 0)
+    (when (plusp n)
+      (%h2-write-window-update stream n)))
+  n)
+
+(defun %h2-streaming-end-headers (stream)
+  (let ((get-headers (or (find-symbol "GET-HEADERS" :http2/core)
+                         (find-symbol "GET-HEADERS" :http2/client))))
+    (cond
+      ((h2-stream-headers-seen-p stream)
+       (when get-headers
+         (setf (h2-stream-trailers stream)
+               (ldiff (funcall get-headers stream)
+                      (h2-stream-header-snapshot stream)))))
+      (t
+       (setf (h2-stream-headers-seen-p stream) t)
+       (when get-headers
+         (setf (h2-stream-header-snapshot stream) (funcall get-headers stream)))
+       (when-let ((fn (h2-stream-on-headers stream)))
+         (funcall fn stream))))))
+
+(defun %h2-streaming-peer-ends (stream)
+  (unless (h2-stream-headers-seen-p stream)
+    (%h2-streaming-end-headers stream))
+  (when-let ((fn (h2-stream-on-end stream)))
+    (funcall fn stream))
+  (let ((client-done (find-symbol "CLIENT-DONE" :http2/client)))
+    (when client-done
+      (signal client-done :result stream))))
+
 (defun %ensure-h2-classes ()
   "CLIENT-STREAM + header/body collectors — no utf8/gzip mixins (CE is ours).
    Also define ASYNC-H2-CLIENT-CONNECTION to track RFC 8441 SETTINGS."
@@ -36,6 +105,8 @@
         (header-m (find-symbol "HEADER-COLLECTING-MIXIN" :http2/core))
         (body-m (find-symbol "BODY-COLLECTING-MIXIN" :http2/core))
         (peer-ends (find-symbol "PEER-ENDS-HTTP-STREAM" :http2/core))
+        (apply-data (find-symbol "APPLY-DATA-FRAME" :http2/core))
+        (process-end (find-symbol "PROCESS-END-HEADERS" :http2/core))
         (client-done (find-symbol "CLIENT-DONE" :http2/client))
         (vanilla (find-symbol "VANILLA-CLIENT-CONNECTION" :http2/client))
         (set-peer (find-symbol "SET-PEER-SETTING" :http2/core)))
@@ -48,6 +119,20 @@
                  (,client-stream ,header-m ,body-m) ())))
     (eval `(defmethod ,peer-ends ((stream async-h2-client-stream))
              (signal ',client-done :result stream)))
+    (unless (find-class 'async-h2-streaming-client-stream nil)
+      (eval `(defclass async-h2-streaming-client-stream
+                 (,client-stream ,header-m async-h2-stream-hooks)
+               ())))
+    (when apply-data
+      (eval `(defmethod ,apply-data ((stream async-h2-streaming-client-stream)
+                                     data start end)
+               (%h2-streaming-apply-data stream data start end))))
+    (when process-end
+      (eval `(defmethod ,process-end :after (connection (stream async-h2-streaming-client-stream))
+               (declare (ignore connection))
+               (%h2-streaming-end-headers stream))))
+    (eval `(defmethod ,peer-ends ((stream async-h2-streaming-client-stream))
+             (%h2-streaming-peer-ends stream)))
     (unless (find-class 'async-h2-client-connection nil)
       (eval `(defclass async-h2-client-connection (,vanilla)
                ((enable-connect-protocol-p
@@ -275,3 +360,27 @@
             (if (typep body '(vector (unsigned-byte 8)))
                 body
                 (babel:string-to-octets (princ-to-string body) :encoding :utf-8)))))
+
+(defun h2-streaming-status-headers (h2-stream)
+  "→ (values status headers-ht) from the first HEADERS block (not trailers)."
+  (let* ((get-status (find-symbol "GET-STATUS" :http2/client))
+         (pairs (or (h2-stream-header-snapshot h2-stream)
+                    (let ((get-headers (or (find-symbol "GET-HEADERS" :http2/core)
+                                           (find-symbol "GET-HEADERS" :http2/client))))
+                      (when get-headers (funcall get-headers h2-stream))))))
+    (values (parse-integer (funcall get-status h2-stream))
+            (%h2-headers-table (%h2-headers-alist pairs)))))
+
+(defun h2-streaming-trailers-table (h2-stream)
+  "EQUAL hash-table of trailer fields, or NIL when none."
+  (let ((pairs (h2-stream-trailers h2-stream)))
+    (when pairs
+      (%h2-headers-table (%h2-headers-alist pairs)))))
+
+(defun h2-buf-append (buf data start end)
+  "Append DATA[START:END] onto adjustable octet BUF. Returns BUF."
+  (let* ((n (- end start))
+         (old (fill-pointer buf)))
+    (adjust-array buf (+ old n) :fill-pointer (+ old n))
+    (replace buf data :start1 old :start2 start :end2 end)
+    buf))

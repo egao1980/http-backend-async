@@ -19,6 +19,47 @@
   (ok (equal '(:http/1.1 :http/2)
              (backend-http-versions (make-async-backend)))))
 
+(deftest http2-streaming-hooks-feed-data
+  (let* ((s (make-instance 'async-h2-stream-hooks))
+         (got nil))
+    (setf (http-backend-async:h2-stream-on-data s)
+          (lambda (data start end)
+            (setf got (subseq data start end))))
+    (http-backend-async::%h2-streaming-apply-data s #(10 20 30 40) 1 3)
+    (ok (equalp #(20 30) got))
+    (ok (zerop (http-backend-async:h2-stream-pending-window s)))))
+
+(deftest http2-streaming-hooks-hold-window
+  (let ((s (make-instance 'async-h2-stream-hooks)))
+    (setf (http-backend-async:h2-stream-hold-window-p s) t)
+    (http-backend-async::%h2-streaming-apply-data s #(1 2 3) 0 3)
+    (ok (= 3 (http-backend-async:h2-stream-pending-window s)))
+    (http-backend-async:h2-stream-release-window s)
+    (ok (zerop (http-backend-async:h2-stream-pending-window s)))
+    (ok (not (http-backend-async:h2-stream-hold-window-p s)))))
+
+(deftest http2-buf-append
+  (let ((buf (make-array 0 :element-type '(unsigned-byte 8)
+                         :adjustable t :fill-pointer 0)))
+    (http-backend-async::h2-buf-append buf #(1 2 3 4) 1 4)
+    (ok (equalp #(2 3 4) buf))))
+
+(deftest http2-live-want-stream
+  "Live H2 :want-stream — gate with HTTP_ASYNC_H2_LIVE=1."
+  (if (not (uiop:getenv "HTTP_ASYNC_H2_LIVE"))
+      (skip "HTTP_ASYNC_H2_LIVE unset")
+      (with-async-test (eb el backend)
+        (declare (ignore backend))
+        (multiple-value-bind (res octets)
+            (%await-stream-promise
+             (http:stream-async :get "https://www.cloudflare.com/"
+                                :http-version :http/2
+                                :timeout 20.0)
+             eb el :timeout 25.0)
+          (ok (member (response-http-version res) '(:http/1.1 :http/2) :test #'eq))
+          (ok (streamp (response-body res)))
+          (ok (plusp (length octets)))))))
+
 #+ (or)
 (deftest http2-live-nghttp2
   "Live: requires network. Enable with HTTP_ASYNC_H2_LIVE."

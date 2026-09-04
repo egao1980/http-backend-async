@@ -178,7 +178,12 @@
                (h2-out nil)
                (h2-out-pos 0)
                ;; Completed H2 stream waiting for outbound ACK/WINDOW_UPDATE flush.
-               (h2-done-stream nil))
+               (h2-done-stream nil)
+               (h2-req-stream nil)
+               (h2-body-buf (make-array 0 :element-type '(unsigned-byte 8)
+                                          :adjustable t :fill-pointer 0))
+               (h2-callback-finished-p nil)
+               (streamed-response nil))
           (when proxy-url
             (multiple-value-bind (pscheme phost pport puser ppass)
                 (parse-proxy-uri proxy-url)
@@ -490,35 +495,46 @@
                    (handler-case (funcall cb res)
                      (error (e) (warn "callback failed: ~A" e)))))
                (make-hop-response (status headers* body* set-cookies final-url
-                                    &key (history-for-final nil))
-                 (make-instance 'http-response
-                                :status status
-                                :headers headers*
-                                :body body*
-                                :url final-url
-                                :cookies set-cookies
-                                :history history-for-final
-                                :http-version negotiated-version
-                                :request request))
-               (follow-redirect (status headers* body* set-cookies final-url)
+                                    &key (history-for-final nil) trailers)
+                 (let ((res (make-instance 'http-response
+                                           :status status
+                                           :headers headers*
+                                           :body body*
+                                           :url final-url
+                                           :cookies set-cookies
+                                           :history history-for-final
+                                           :http-version negotiated-version
+                                           :request request)))
+                   (when trailers
+                     (let ((writer (find-symbol (string '#:response-trailers)
+                                                :http-protocol)))
+                       (when (and writer (fboundp writer))
+                         (funcall (fdefinition `(setf ,writer)) trailers res))))
+                   res))
+               (follow-redirect (status headers* body* set-cookies final-url
+                                  &key trailers)
                  (let ((location (gethash "location" headers*)))
                    (cond
                      ((or (null location) (not (redirect-status-p status)))
                       (setf reuse-ok-p
                             (and keep-alive-p
-                                 (response-keeps-alive-p
-                                  headers* (fast-http:http-version http))))
+                                 (or (eq negotiated-version :http/2)
+                                     (response-keeps-alive-p
+                                      headers* (fast-http:http-version http)))))
                       (succeed (make-hop-response
                                 status headers* body* set-cookies final-url
-                                :history-for-final (nreverse history))))
+                                :history-for-final (nreverse history)
+                                :trailers trailers)))
                      ((zerop max-redirects)
                       (setf reuse-ok-p
                             (and keep-alive-p
-                                 (response-keeps-alive-p
-                                  headers* (fast-http:http-version http))))
+                                 (or (eq negotiated-version :http/2)
+                                     (response-keeps-alive-p
+                                      headers* (fast-http:http-version http)))))
                       (succeed (make-hop-response
                                 status headers* body* set-cookies final-url
-                                :history-for-final (nreverse history))))
+                                :history-for-final (nreverse history)
+                                :trailers trailers)))
                      ((>= redirect-hops max-redirects)
                       (fail (make-condition
                              'http-redirect-error
@@ -531,8 +547,10 @@
                       (incf redirect-hops)
                       (setf reuse-ok-p
                             (and keep-alive-p
-                                 (response-keeps-alive-p
-                                  headers* (fast-http:http-version http))))
+                                 (or (eq negotiated-version :http/2)
+                                     (and http
+                                          (response-keeps-alive-p
+                                           headers* (fast-http:http-version http))))))
                       (handler-case
                           (let ((next (resolve-redirect-uri uri location)))
                             (when (and chunked-p
@@ -594,6 +612,92 @@
                            :decompress (http-request-decompress request))
                         (follow-redirect status headers* body* set-cookies
                                          final-url))))))
+               (unpause-h2 ()
+                 "Resume H2 reads after the body queue drains; flush WINDOW_UPDATE."
+                 (setf read-paused-p nil)
+                 (when h2-req-stream
+                   (h2-stream-release-window h2-req-stream))
+                 (when (and h2-pump (h2-pump-pending-out-p h2-pump))
+                   (setf h2-out (h2-pump-take-out h2-pump)
+                         h2-out-pos 0
+                         phase :h2-write)
+                   (arm-io :write)
+                   (return-from unpause-h2))
+                 (unless (async-request-canceled-p handle)
+                   (arm-io :read)))
+               (begin-h2-stream-body (status headers* set-cookies)
+                 "Deliver headers + Gray body; DATA frames feed the queue."
+                 (setf reuse-ok-p keep-alive-p
+                       body-feed (make-async-body-input-stream
+                                  :on-space #'unpause-h2)
+                       streaming-final-p t)
+                 (multiple-value-bind (app-stream headers**)
+                     (apply-response-content-encoding
+                      body-feed headers*
+                      :decompress (http-request-decompress request))
+                   (setf streamed-response
+                         (make-hop-response
+                          status headers** app-stream set-cookies
+                          (quri:render-uri uri)
+                          :history-for-final (nreverse (copy-list history))))
+                   (deliver-stream streamed-response)))
+               (on-h2-headers (h2-stream)
+                 (multiple-value-bind (status headers*)
+                     (h2-streaming-status-headers h2-stream)
+                   (let ((set-cookies
+                           (merge-response-cookies cookie-jar
+                                                   (quri:render-uri uri)
+                                                   headers*)))
+                     (when (and want-stream-p
+                                (not streaming-final-p)
+                                (not (will-follow-redirect-p status headers*)))
+                       (begin-h2-stream-body status headers* set-cookies)))))
+               (on-h2-data (data start end)
+                 (cond
+                   (streaming-final-p
+                    (async-body-feed body-feed data :start start :end end)
+                    (when (and body-feed (async-body-full-p body-feed))
+                      (setf read-paused-p t)
+                      (when h2-req-stream
+                        (setf (h2-stream-hold-window-p h2-req-stream) t))
+                      (when-let ((io (async-request-io-handle handle)))
+                        (ignore-errors (update-io event-backend io :none))
+                        (setf io-dir :none))))
+                   (t
+                    (h2-buf-append h2-body-buf data start end))))
+               (on-h2-end (h2-stream)
+                 (setf h2-callback-finished-p t)
+                 (let ((tr (h2-streaming-trailers-table h2-stream)))
+                   (cond
+                     (streaming-final-p
+                      (when streamed-response
+                        (let ((writer (find-symbol (string '#:response-trailers)
+                                                   :http-protocol)))
+                          (when (and writer (fboundp writer))
+                            (funcall (fdefinition `(setf ,writer))
+                                     tr streamed-response))))
+                      (when body-feed
+                        (async-body-eof body-feed))
+                      (complete-request))
+                     (t
+                      (multiple-value-bind (status headers*)
+                          (h2-streaming-status-headers h2-stream)
+                        (let ((set-cookies
+                                (merge-response-cookies cookie-jar
+                                                        (quri:render-uri uri)
+                                                        headers*))
+                              (body* (copy-seq h2-body-buf)))
+                          (multiple-value-bind (body* headers*)
+                              (apply-response-content-encoding
+                               (coerce body* '(simple-array (unsigned-byte 8) (*)))
+                               headers*
+                               :decompress (http-request-decompress request))
+                            (setf reuse-ok-p keep-alive-p
+                                  h2-done-stream nil)
+                            (follow-redirect status headers* body*
+                                             set-cookies
+                                             (quri:render-uri uri)
+                                             :trailers tr))))))))
                (begin-h2 ()
                  "Start HTTP/2 session after ALPN=h2 (or prior-knowledge later)."
                  (unless (ensure-http2)
@@ -603,8 +707,12 @@
                                            :negotiated nil
                                            :message "http2 system not loadable"))))
                  (setf h2-pump (make-instance 'async-h2-pump-stream)
-                       h2-session (make-async-h2-session h2-pump)
-                       negotiated-version :http/2)
+                       h2-session (make-async-h2-session
+                                   h2-pump
+                                   :stream-class 'async-h2-streaming-client-stream)
+                       negotiated-version :http/2
+                       h2-callback-finished-p nil
+                       (fill-pointer h2-body-buf) 0)
                  (ensure-http-version-available version-pref negotiated-version
                                                 :backend-name "async")
                  ;; Stream uploads: materialize for H2 DATA frames (wave-1).
@@ -622,8 +730,13 @@
                            stream-body-p nil)))
                  ;; RFC 9113 §3.4: preface+SETTINGS then HEADERS immediately
                  ;; (same as http2 RETRIEVE-URL). No wait for peer SETTINGS.
-                 (h2-open-request h2-session method uri headers
-                                  :body body-octets)
+                 (setf h2-req-stream
+                       (h2-open-request h2-session method uri headers
+                                        :body body-octets))
+                 (when (typep h2-req-stream 'async-h2-stream-hooks)
+                   (setf (h2-stream-on-headers h2-req-stream) #'on-h2-headers
+                         (h2-stream-on-data h2-req-stream) #'on-h2-data
+                         (h2-stream-on-end h2-req-stream) #'on-h2-end))
                  (setf h2-out (h2-pump-take-out h2-pump)
                        h2-out-pos 0
                        phase :h2-write)
@@ -890,7 +1003,7 @@
                      (unless h2-out
                        ;; Flush done: if response already complete, deliver it
                        ;; (SETTINGS ACK often shares the read that finishes the stream).
-                       (when h2-done-stream
+                       (when (and h2-done-stream (not h2-callback-finished-p))
                          (return (finish-h2-stream h2-done-stream)))
                        (setf phase :h2-read)
                        (arm-io :read)
@@ -933,7 +1046,7 @@
                                   phase :h2-write)
                             (arm-io :write)
                             (return (do-h2-write)))
-                          (when h2-done-stream
+                          (when (and h2-done-stream (not h2-callback-finished-p))
                             (return (finish-h2-stream h2-done-stream)))
                           (arm-io :read)
                           (return)))))))
