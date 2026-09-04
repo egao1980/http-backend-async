@@ -70,8 +70,8 @@
     (setf (h2-stream-hold-window-p stream) nil
           (h2-stream-pending-window stream) 0)
     (when (plusp n)
-      (%h2-write-window-update stream n)))
-  n)
+      (%h2-write-window-update stream n))
+    n))
 
 (defun %h2-streaming-end-headers (stream)
   (let ((get-headers (or (find-symbol "GET-HEADERS" :http2/core)
