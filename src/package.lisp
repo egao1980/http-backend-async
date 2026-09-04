@@ -58,5 +58,14 @@
            #:make-async-h2-session
            #:h2-session-enable-connect-protocol-p
            #:h2-enable-connect-protocol-p
+           #:async-h2-stream-hooks
+           #:h2-stream-on-headers
+           #:h2-stream-on-data
+           #:h2-stream-on-end
+           #:h2-stream-release-window
+           #:h2-stream-hold-window-p
+           #:h2-stream-pending-window
+           #:h2-streaming-status-headers
+           #:h2-streaming-trailers-table
            #:make-extended-connect-ws-headers
            #:tls-selected-alpn))
