@@ -109,19 +109,22 @@
         (process-end (find-symbol "PROCESS-END-HEADERS" :http2/core))
         (client-done (find-symbol "CLIENT-DONE" :http2/client))
         (vanilla (find-symbol "VANILLA-CLIENT-CONNECTION" :http2/client))
-        (set-peer (find-symbol "SET-PEER-SETTING" :http2/core)))
+        (set-peer (find-symbol "SET-PEER-SETTING" :http2/core))
+        (multi (find-symbol "MULTI-PART-DATA-STREAM" :http2/core)))
     (unless (and client-stream header-m body-m peer-ends client-done vanilla)
       (error 'http-version-not-available
              :requested :http/2
              :message "http2 missing CLIENT-STREAM / mixins"))
     (unless (find-class 'async-h2-client-stream nil)
       (eval `(defclass async-h2-client-stream
-                 (,client-stream ,header-m ,body-m) ())))
+                 (,client-stream ,header-m ,body-m ,@(when multi `(,multi)))
+               ())))
     (eval `(defmethod ,peer-ends ((stream async-h2-client-stream))
              (signal ',client-done :result stream)))
     (unless (find-class 'async-h2-streaming-client-stream nil)
       (eval `(defclass async-h2-streaming-client-stream
-                 (,client-stream ,header-m async-h2-stream-hooks)
+                 (,client-stream ,header-m async-h2-stream-hooks
+                  ,@(when multi `(,multi)))
                ())))
     (when apply-data
       (eval `(defmethod ,apply-data ((stream async-h2-streaming-client-stream)
@@ -285,11 +288,33 @@
   "Deprecated alias — returns the http2 connection object only."
   (async-h2-session-connection (make-async-h2-session pump)))
 
+(defun h2-write-data (session stream octets &key (end-stream nil))
+  "Write DATA frames on STREAM (split at 16KiB). END-STREAM T → last frame."
+  (declare (ignore session))
+  (let* ((write (find-symbol "WRITE-DATA-FRAME" :http2/core))
+         (payload (coerce (or octets #()) '(simple-array (unsigned-byte 8) (*))))
+         (len (length payload))
+         (max 16384))
+    (unless write
+      (error 'http-version-not-available
+             :requested :http/2
+             :message "http2 missing WRITE-DATA-FRAME"))
+    (cond
+      ((zerop len)
+       (funcall write stream payload :end-stream end-stream))
+      (t
+       (loop for i from 0 below len by max
+             for last = (>= (+ i max) len)
+             do (funcall write stream (subseq payload i (min (+ i max) len))
+                         :end-stream (and end-stream last)))))
+    stream))
+
 (defun h2-open-request (session method uri headers &key (end-stream t) body)
   "Send HEADERS (+ optional BODY) using protocol MAKE-HTTP2-REQUEST-HEADERS.
 
    RFC 9113 §3.4 — may be called immediately after the client preface (no need
-   to wait for peer SETTINGS)."
+   to wait for peer SETTINGS). END-STREAM NIL keeps the stream open for later
+   H2-WRITE-DATA (streaming / duplex uploads)."
   (let* ((connection (async-h2-session-connection session))
          (fields (%http2-headers-for-lib
                   (make-http2-request-headers method uri headers)))
@@ -299,8 +324,7 @@
                           :end-stream (and end-stream no-body)
                           :end-headers t)))
     (when (not no-body)
-      (funcall (find-symbol "WRITE-BINARY-PAYLOAD" :http2/core)
-               connection stream body :end-stream t))
+      (h2-write-data session stream body :end-stream end-stream))
     stream))
 
 (defun h2-process-pending (session)

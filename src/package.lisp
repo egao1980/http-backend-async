@@ -67,5 +67,7 @@
            #:h2-stream-pending-window
            #:h2-streaming-status-headers
            #:h2-streaming-trailers-table
+           #:h2-open-request
+           #:h2-write-data
            #:make-extended-connect-ws-headers
            #:tls-selected-alpn))
