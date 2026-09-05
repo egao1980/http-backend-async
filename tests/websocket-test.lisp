@@ -36,6 +36,19 @@
     (ok (equal "websocket" (cdr (assoc :protocol hdrs))))
     (ok (equal "/chat" (cdr (assoc :path hdrs))))))
 
+(deftest http2-headers-for-lib-encodes-protocol
+  "zellerin HPACK cannot store-string a keyword :protocol (RFC 8441)."
+  (let ((lib (http-backend-async::%http2-headers-for-lib
+              (make-extended-connect-ws-headers "wss://example.com/chat"))))
+    (ok (equal ":protocol"
+               (first (find ":protocol" lib :key #'first :test #'equal))))
+    (ok (equal "websocket"
+               (second (find ":protocol" lib :key #'first :test #'equal))))
+    (ok (eq :method (first (find :method lib :key #'first))))
+    (when (ensure-http2)
+      (let ((compile (find-symbol "COMPILE-HEADERS" :http2/core)))
+        (ok (vectorp (funcall compile lib nil)))))))
+
 (deftest h2-enable-connect-protocol-setting
   "Peer SETTINGS_ENABLE_CONNECT_PROTOCOL is recorded on the async H2 connection."
   (if (not (ensure-http2))

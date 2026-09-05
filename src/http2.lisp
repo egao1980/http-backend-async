@@ -245,9 +245,21 @@
     (dolist (pair alist ht)
       (setf (gethash (car pair) ht) (cdr pair)))))
 
+(defun %http2-pseudo-name (name)
+  "Keyword pseudo-headers zellerin HPACK can index vs encode as :name string.
+
+   :method/:scheme/:path/:authority/:status are in the static table.
+   RFC 8441 :protocol is not — HPACK store-string needs a string, not a keyword."
+  (cond
+    ((not (keywordp name)) name)
+    ((member name '(:method :scheme :path :authority :status) :test #'eq) name)
+    (t (format nil ":~(~A~)" name))))
+
 (defun %http2-headers-for-lib (header-fields)
   "Convert MAKE-HTTP2-REQUEST-HEADERS alist → http2 library ((name value)…)."
-  (mapcar (lambda (pair) (list (car pair) (cdr pair))) header-fields))
+  (mapcar (lambda (pair)
+            (list (%http2-pseudo-name (car pair)) (cdr pair)))
+          header-fields))
 
 (defstruct (async-h2-session (:constructor %make-async-h2-session))
   connection
