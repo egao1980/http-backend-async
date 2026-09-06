@@ -18,7 +18,7 @@
                "cl+ssl")
   :properties
   (:cl-repo
-   (:ci (:with ("cl-stack-ssl" "http2/client" "fast-websocket"
+   (:ci (:with ("cl-stack-ssl" "http2" "fast-websocket"
                 "http-encoding-brotli" "cl-stack-brotli")
          :load-before-test ("cl+ssl" "cl-stack-ssl")
          :record-versions (("cl-stack-ssl" . "CL_STACK_SSL_VERSION")))))

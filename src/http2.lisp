@@ -19,8 +19,8 @@
 (defun ensure-http2 ()
   "Load http2/client (soft) and define async stream classes. Returns T when available.
 
-   Load http2/client — not the umbrella http2 system — so Windows CI does not
-   pull http2/server/poll (cffi-grovel needs poll.h)."
+   Load ASDF http2/client (secondary), not the umbrella http2 system.
+   CI :with is the registry package http2."
   (or *http2-loaded*
       (setf *http2-loaded*
             (and (ignore-errors (asdf:load-system "http2/client") t) t)))
