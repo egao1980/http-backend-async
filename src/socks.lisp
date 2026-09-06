@@ -29,49 +29,58 @@
       (replace out p :start1 (+ 3 ul))
       out)))
 
+(defun %ipv4-dotted-host-p (host)
+  "True when HOST is a dotted IPv4 literal (not IPv6)."
+  (and (stringp host)
+       (not (find #\: host))
+       (let ((parts (uiop:split-string host :separator ".")))
+         (and (= 4 (length parts))
+              (every (lambda (p)
+                       (and (plusp (length p))
+                            (<= (length p) 3)
+                            (every #'digit-char-p p)
+                            (<= 0 (parse-integer p) 255)))
+                     parts)))))
+
+(defun %socks5-connect-ipv4 (host hi lo)
+  (let* ((parts (mapcar #'parse-integer
+                        (uiop:split-string host :separator ".")))
+         (out (make-array 10 :element-type '(unsigned-byte 8))))
+    (setf (aref out 0) #x05
+          (aref out 1) #x01          ; CONNECT
+          (aref out 2) #x00
+          (aref out 3) #x01)         ; IPv4
+    (loop for i from 0 below 4
+          do (setf (aref out (+ 4 i)) (nth i parts)))
+    (setf (aref out 8) hi (aref out 9) lo)
+    out))
+
+(defun %socks5-connect-domain (host hi lo)
+  (let* ((name (babel:string-to-octets host :encoding :utf-8))
+         (n (length name)))
+    (when (> n 255)
+      (%socks-fail "SOCKS5 hostname too long"))
+    (let ((out (make-array (+ 7 n) :element-type '(unsigned-byte 8))))
+      (setf (aref out 0) #x05
+            (aref out 1) #x01
+            (aref out 2) #x00
+            (aref out 3) #x03        ; DOMAINNAME
+            (aref out 4) n)
+      (replace out name :start1 5)
+      (setf (aref out (+ 5 n)) hi
+            (aref out (+ 6 n)) lo)
+      out)))
+
 (defun socks5-connect-request (host port &key remote-dns)
-  "Build SOCKS5 CONNECT request. HOST is domain (ATYP 3) or IPv4 string."
-  (declare (ignore remote-dns))
+  "Build SOCKS5 CONNECT. :REMOTE-DNS T (socks5h) always sends ATYP 3
+   so the proxy resolves HOST. Otherwise IPv4 literals use ATYP 1."
   (let* ((port (if (integerp port) port (parse-integer (princ-to-string port))))
          (hi (ldb (byte 8 8) port))
          (lo (ldb (byte 8 0) port))
          (host (strip-ipv6-brackets host)))
-    (cond
-      ;; IPv4 dotted
-      ((and (not (find #\: host))
-            (= 4 (length (uiop:split-string host :separator ".")))
-            (ignore-errors
-              (every (lambda (p)
-                       (let ((n (parse-integer p :junk-allowed t)))
-                         (and n (<= 0 n 255))))
-                     (uiop:split-string host :separator "."))))
-       (let* ((parts (mapcar #'parse-integer
-                             (uiop:split-string host :separator ".")))
-              (out (make-array 10 :element-type '(unsigned-byte 8))))
-         (setf (aref out 0) #x05
-               (aref out 1) #x01          ; CONNECT
-               (aref out 2) #x00
-               (aref out 3) #x01)         ; IPv4
-         (loop for i from 0 below 4
-               do (setf (aref out (+ 4 i)) (nth i parts)))
-         (setf (aref out 8) hi (aref out 9) lo)
-         out))
-      ;; Domain name (socks5h / general)
-      (t
-       (let* ((name (babel:string-to-octets host :encoding :utf-8))
-              (n (length name)))
-         (when (> n 255)
-           (%socks-fail "SOCKS5 hostname too long"))
-         (let ((out (make-array (+ 7 n) :element-type '(unsigned-byte 8))))
-           (setf (aref out 0) #x05
-                 (aref out 1) #x01
-                 (aref out 2) #x00
-                 (aref out 3) #x03        ; DOMAINNAME
-                 (aref out 4) n)
-           (replace out name :start1 5)
-           (setf (aref out (+ 5 n)) hi
-                 (aref out (+ 6 n)) lo)
-           out))))))
+    (if (and (not remote-dns) (%ipv4-dotted-host-p host))
+        (%socks5-connect-ipv4 host hi lo)
+        (%socks5-connect-domain host hi lo))))
 
 (defun socks5-reply-ok-p (buf &key (start 0))
   "True if BUF[START…] is a successful CONNECT reply (VERN CMD=0)."
