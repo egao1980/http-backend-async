@@ -44,6 +44,89 @@
     (ok (response-keeps-alive-p ht 1.1))
     (ok (not (response-keeps-alive-p ht 1.0)))))
 
+(defclass h1-pool-stub (async-pooled-connection) ())
+
+(defmethod connection-alive-p ((c h1-pool-stub))
+  (http-backend-async::async-conn-alive-p c))
+
+(defclass h2-pool-stub (async-pooled-h2-connection) ())
+
+(defmethod connection-alive-p ((c h2-pool-stub))
+  (http-backend-async::async-h2-conn-alive-p c))
+
+(defun %make-h2-stub (event-loop)
+  (make-instance 'h2-pool-stub
+                 :socket nil
+                 :https t
+                 :session (list :session)
+                 :pump (list :pump)
+                 :event-loop event-loop))
+
+(deftest h2-pool-entry-not-handed-to-h1
+  "An h2 entry lives under the |h2 key. The HTTP/1.1 acquire never receives it,
+   and a stray h2 object on the plain key is discarded rather than adopted."
+  (let* ((pool (make-lru-connection-pool :max-size 4))
+         (base (pool-key "https" "example.com" 443))
+         (h2-key (h2-pool-key base))
+         (loop-a (cons :loop :a))
+         (loop-b (cons :loop :b))
+         (h2 (%make-h2-stub loop-a))
+         (h1 (make-instance 'h1-pool-stub :socket nil :https t)))
+    (ok (string= (concatenate 'string base "|h2") h2-key))
+    (pool-release pool h2-key h2)
+    ;; Plain key does not see the h2 entry.
+    (ok (null (pool-acquire pool base)))
+    (multiple-value-bind (conn kind)
+        (http-backend-async::acquire-pooled-connection
+         pool base loop-a :https t :version-pref :http/1.1)
+      (ok (null conn))
+      (ok (null kind))
+      (ok (not (typep conn 'async-pooled-h2-connection))))
+    ;; Still pooled for a matching loop on the h2 key.
+    (multiple-value-bind (conn kind)
+        (http-backend-async::acquire-pooled-connection
+         pool base loop-a :https t :version-pref :http/2)
+      (ok (eq conn h2))
+      (ok (eq kind :h2))
+      (ok (typep conn 'async-pooled-h2-connection))
+      (ok (not (typep conn 'async-pooled-connection))))
+    ;; Different event-loop: discard that entry and do not hand it back.
+    (pool-release pool h2-key h2)
+    (multiple-value-bind (conn kind)
+        (http-backend-async::acquire-pooled-connection
+         pool base loop-b :https t :version-pref :auto)
+      (ok (null conn))
+      (ok (null kind)))
+    (ok (not (http-backend-async::async-h2-conn-alive-p h2)))
+    (ok (null (pool-acquire pool h2-key)))
+    ;; Stray h2 object on the plain key is not adopted as HTTP/1.1.
+    (let ((stray (%make-h2-stub loop-a)))
+      (pool-release pool base stray)
+      (multiple-value-bind (conn kind)
+          (http-backend-async::acquire-pooled-connection
+           pool base loop-a :https nil :version-pref :http/1.1)
+        (ok (null conn))
+        (ok (null kind))
+        (ok (not (typep conn 'async-pooled-h2-connection))))
+      (ok (not (http-backend-async::async-h2-conn-alive-p stray)))
+      (ok (null (pool-acquire pool base))))
+    ;; HTTP/1.1 pooling still returns the h1 entry. Forced :http/2 does not.
+    (pool-release pool base h1)
+    (multiple-value-bind (conn kind)
+        (http-backend-async::acquire-pooled-connection
+         pool base loop-a :https t :version-pref :http/2)
+      (ok (null conn))
+      (ok (null kind)))
+    (ok (eq h1 (pool-acquire pool base)))
+    (pool-release pool base h1)
+    (multiple-value-bind (conn kind)
+        (http-backend-async::acquire-pooled-connection
+         pool base loop-a :https nil :version-pref :http/1.1)
+      (ok (eq conn h1))
+      (ok (eq kind :http/1.1))
+      (ok (typep conn 'async-pooled-connection)))
+    (pool-clear pool)))
+
 (deftest fixture-pool-reuses-tcp
   "Two GETs with keep-alive fixture → one TCP accept, two HTTP requests."
   (let ((http-protocol:*default-connection-pool* nil))

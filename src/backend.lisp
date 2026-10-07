@@ -51,6 +51,92 @@
   (setf (async-conn-socket c) nil)
   nil)
 
+(defclass async-pooled-h2-connection ()
+  ((socket :initarg :socket :accessor async-h2-conn-socket)
+   (tls :initarg :tls :accessor async-h2-conn-tls :initform nil)
+   (https :initarg :https :accessor async-h2-conn-https-p :initform nil)
+   (session :initarg :session :accessor async-h2-conn-session)
+   (pump :initarg :pump :accessor async-h2-conn-pump)
+   (event-loop :initarg :event-loop :accessor async-h2-conn-event-loop)
+   (alive :initform t :accessor async-h2-conn-alive-p))
+  (:documentation
+   "Pooled HTTP/2 session bound to EVENT-LOOP (libuv handles are loop-affine).
+    Reuse opens a new stream on SESSION. The HTTP/1.1 writer and a second
+    connection preface are never applied to this socket."))
+
+(defun make-async-pooled-h2-connection (socket &key tls https session pump event-loop)
+  (make-instance 'async-pooled-h2-connection
+                 :socket socket
+                 :tls tls
+                 :https https
+                 :session session
+                 :pump pump
+                 :event-loop event-loop))
+
+(defmethod connection-alive-p ((c async-pooled-h2-connection))
+  "Alive when the TLS socket, session, and loop binding are still held."
+  (and (async-h2-conn-alive-p c)
+       (async-h2-conn-session c)
+       (async-h2-conn-pump c)
+       (async-h2-conn-event-loop c)
+       (async-h2-conn-https-p c)
+       (async-h2-conn-socket c)
+       (ignore-errors (usocket:socket (async-h2-conn-socket c)))))
+
+(defmethod pool-discard ((pool lru-connection-pool) (c async-pooled-h2-connection))
+  (declare (ignore pool))
+  (setf (async-h2-conn-alive-p c) nil
+        (async-h2-conn-session c) nil
+        (async-h2-conn-pump c) nil)
+  (tls-close (async-h2-conn-tls c))
+  (setf (async-h2-conn-tls c) nil)
+  (close-socket (async-h2-conn-socket c))
+  (setf (async-h2-conn-socket c) nil)
+  nil)
+
+(defun h2-pool-key (key)
+  "Pool key for an HTTP/2 session. The |h2 suffix keeps it off the HTTP/1.1 key."
+  (concatenate 'string key "|h2"))
+
+(defun request-may-use-h2-pool-p (https version-pref)
+  "HTTPS requests that may negotiate h2. Cleartext h2c is not pooled.
+   Forced :http/1.1 must not be handed an h2 session."
+  (and https (not (eq version-pref :http/1.1))))
+
+(defun acquire-pooled-connection (pool key event-loop &key https version-pref)
+  "Return (values CONNECTION KIND). KIND is :h2, :http/1.1, or NIL.
+
+   NIL means the caller dials. An h2 entry is taken only from the |h2 key,
+   and only when its event-loop is EQ to EVENT-LOOP. A mismatched entry is
+   discarded and this returns NIL (dial fresh; do not fall through onto that
+   socket). The plain key is the HTTP/1.1 path: TYPECASE accepts only
+   ASYNC-POOLED-CONNECTION. An h2 object on that key is discarded.
+   Forced :http/2 does not take an HTTP/1.1 entry."
+  (when (and pool (request-may-use-h2-pool-p https version-pref))
+    (let ((h2 (pool-acquire pool (h2-pool-key key))))
+      (cond
+        ((null h2) nil)
+        ((and (typep h2 'async-pooled-h2-connection)
+              (async-h2-conn-https-p h2)
+              (eq (async-h2-conn-event-loop h2) event-loop))
+         (return-from acquire-pooled-connection (values h2 :h2)))
+        (t
+         (pool-discard pool h2)
+         (return-from acquire-pooled-connection (values nil nil))))))
+  (when (or (null pool) (eq version-pref :http/2))
+    (return-from acquire-pooled-connection (values nil nil)))
+  (let ((conn (and pool (pool-acquire pool key))))
+    (typecase conn
+      (null (values nil nil))
+      (async-pooled-h2-connection
+       (pool-discard pool conn)
+       (values nil nil))
+      (async-pooled-connection
+       (values conn :http/1.1))
+      (t
+       (pool-discard pool conn)
+       (values nil nil)))))
+
 (defclass async-request-handle ()
   ((canceled-p :initform nil :accessor async-request-canceled-p)
    (io-handle :initform nil :accessor async-request-io-handle)
@@ -184,7 +270,11 @@
                                           :adjustable t :fill-pointer 0))
                (h2-callback-finished-p nil)
                (h2-req-end-p nil)
-               (streamed-response nil))
+               (streamed-response nil)
+               ;; Origin key captured when the h2 session is created. Redirects
+               ;; rewrite POOL-KEY* before release; the session must go back
+               ;; under the origin it is actually connected to.
+               (h2-pool-key* nil))
           (when proxy-url
             (multiple-value-bind (pscheme phost pport puser ppass)
                 (parse-proxy-uri proxy-url)
@@ -335,10 +425,17 @@
                  (setf (async-request-socket handle) nil
                        sock nil
                        fd nil
+                       h2-session nil
+                       h2-pump nil
+                       h2-out nil
+                       h2-out-pos 0
+                       h2-req-stream nil
+                       h2-done-stream nil
+                       h2-pool-key* nil
                        from-pool-p nil
                        reuse-ok-p nil))
                (detach-connection ()
-                 "Hand socket/TLS to a pool entry without closing."
+                 "Hand socket/TLS to an HTTP/1.1 pool entry without closing."
                  (stop-io-and-timer)
                  (let ((conn (make-async-pooled-connection
                               sock :tls tls :https https)))
@@ -349,24 +446,77 @@
                          (async-request-tls-stream handle) nil
                          from-pool-p nil)
                    conn))
+               (detach-h2-connection ()
+                 "Hand socket, TLS, and the live HTTP/2 session to a pool entry."
+                 (stop-io-and-timer)
+                 (let ((conn (make-async-pooled-h2-connection
+                              sock
+                              :tls tls
+                              :https https
+                              :session h2-session
+                              :pump h2-pump
+                              :event-loop event-loop)))
+                   (setf sock nil
+                         tls nil
+                         fd nil
+                         h2-session nil
+                         h2-pump nil
+                         h2-out nil
+                         h2-out-pos 0
+                         h2-req-stream nil
+                         (async-request-socket handle) nil
+                         (async-request-tls-stream handle) nil
+                         from-pool-p nil)
+                   conn))
                (release-or-close (&key (force-close nil))
-                 "Return connection to POOL when keep-alive+reuse; else close.
+                 "Return the connection to POOL when it can be reused; else close.
 
-                  An ALPN=h2 connection is never pooled: ADOPT-POOLED replays
-                  the HTTP/1.1 writer, so the peer would answer the text request
-                  with GOAWAY (seen as INVALID-VERSION on a pooled socket).
-                  Reusing the h2 session needs its own pool entry type."
-                 (cond
-                   ((or force-close
-                        (null pool)
-                        (null sock)
-                        (not keep-alive-p)
-                        (not reuse-ok-p)
-                        (eq negotiated-version :http/2))
-                    (close-connection))
-                   (t
-                    (let ((conn (detach-connection)))
-                      (pool-release pool pool-key* conn)))))
+                  HTTP/1.1: keep-alive and the response allows reuse. The entry
+                  is an ASYNC-POOLED-CONNECTION under the origin key.
+
+                  HTTP/2 (HTTPS only): when the stream finished cleanly and the
+                  session is still usable — no connection error, no GOAWAY —
+                  detach it as an ASYNC-POOLED-H2-CONNECTION under the |h2 key.
+                  The next request on this event-loop opens a new stream on that
+                  session. The HTTP/1.1 writer is never used on an h2 socket.
+                  A dead session is closed, same as a force-close."
+                 (let ((pool-h2
+                         (and (not force-close)
+                              pool
+                              sock
+                              https
+                              keep-alive-p
+                              reuse-ok-p
+                              (eq negotiated-version :http/2)
+                              h2-session
+                              ;; IDLE-P, not REUSABLE-P: this runs from the
+                              ;; frame callback inside H2-PROCESS-PENDING.
+                              ;; A nested parse would clobber the cursor.
+                              ;; Buffered GOAWAY is drained on the next adopt.
+                              (handler-case
+                                  (progn
+                                    (when (and h2-req-stream
+                                               (typep h2-req-stream
+                                                      'async-h2-stream-hooks))
+                                      (h2-stream-release-window h2-req-stream))
+                                    (h2-session-idle-p h2-session))
+                                (error () nil)))))
+                   (cond
+                     (pool-h2
+                      (let* ((key (or h2-pool-key* (h2-pool-key pool-key*)))
+                             (conn (detach-h2-connection)))
+                        (setf h2-pool-key* nil)
+                        (pool-release pool key conn)))
+                     ((or force-close
+                          (null pool)
+                          (null sock)
+                          (not keep-alive-p)
+                          (not reuse-ok-p)
+                          (eq negotiated-version :http/2))
+                      (close-connection))
+                     (t
+                      (let ((conn (detach-connection)))
+                        (pool-release pool pool-key* conn))))))
                (complete-request (&key (force-close nil))
                  "Stop IO/timer; pool or close after full response / stream EOF."
                  (unless (async-request-canceled-p handle)
@@ -426,7 +576,7 @@
                          read-paused-p nil
                          reuse-ok-p nil)))
                (adopt-pooled (conn)
-                 "Reuse CONN for the next HTTP request (skip TCP/TLS/proxy)."
+                 "Reuse CONN for the next HTTP/1.1 request (skip TCP/TLS/proxy)."
                  (setf sock (async-conn-socket conn)
                        tls (async-conn-tls conn)
                        https (async-conn-https-p conn)
@@ -438,6 +588,37 @@
                        io-dir nil)
                  (arm-io :write)
                  (next-tick (lambda () (on-io :ok))))
+               (adopt-pooled-h2 (conn)
+                 "Reuse an HTTP/2 session: install its socket and open a new stream.
+                  Does not send a connection preface or run the HTTP/1.1 writer."
+                 (let ((usock (async-h2-conn-socket conn))
+                       (tls* (async-h2-conn-tls conn))
+                       (session (async-h2-conn-session conn))
+                       (pump (async-h2-conn-pump conn)))
+                   ;; Drop the wrapper before any call that can fail, so a
+                   ;; later discard cannot close the socket this request owns.
+                   (setf (async-h2-conn-alive-p conn) nil
+                         (async-h2-conn-socket conn) nil
+                         (async-h2-conn-tls conn) nil
+                         (async-h2-conn-session conn) nil
+                         (async-h2-conn-pump conn) nil
+                         sock usock
+                         tls tls*
+                         https (async-h2-conn-https-p conn)
+                         h2-session session
+                         h2-pump pump
+                         h2-pool-key* (h2-pool-key pool-key*)
+                         (async-request-socket handle) usock
+                         (async-request-tls-stream handle) tls*
+                         fd (socket-fd usock)
+                         from-pool-p t
+                         io-dir nil))
+                 (handler-case
+                     (begin-h2 :fresh nil)
+                   (http-error (e) (fail e))
+                   (error (e)
+                     (fail (make-condition 'http-connection-error
+                                           :message (princ-to-string e))))))
                (next-tick (fn)
                  ;; Prefer sleep* 0 over defer/idle: libev idle is starved while a
                  ;; socket remains writable under :read-write interest.
@@ -464,10 +645,14 @@
                             (register-io event-backend event-loop fd
                                          direction #'on-io))))))
                (do-connect ()
-                 (let ((conn (and pool (pool-acquire pool pool-key*))))
-                   (cond
-                     (conn
-                      (adopt-pooled conn))
+                 (multiple-value-bind (conn kind)
+                     (acquire-pooled-connection
+                      pool pool-key* event-loop
+                      :https https
+                      :version-pref version-pref)
+                   (case kind
+                     (:h2 (adopt-pooled-h2 conn))
+                     (:http/1.1 (adopt-pooled conn))
                      (t
                       (handler-case
                           (multiple-value-bind (usock status)
@@ -802,30 +987,59 @@
                                 (defer event-backend event-loop #'kick)
                                 (ignore-errors
                                   (wake event-backend event-loop))))))))))
-               (begin-h2 ()
-                 "Start HTTP/2 session after ALPN=h2 (or prior-knowledge later)."
+               (begin-h2 (&key (fresh t))
+                 "Start or continue HTTP/2 on this socket.
+
+                  FRESH T (new TLS connection): create the session. Its
+                  constructor writes the client preface and SETTINGS.
+                  FRESH NIL (pooled session): open another stream on the
+                  existing session and pump. Do not send a second preface.
+                  If that session cannot take a stream, or the open fails,
+                  close it and dial once. The dead session is not pooled."
                  (unless (ensure-http2)
                    (return-from begin-h2
                      (fail (make-condition 'http-version-not-available
                                            :requested version-pref
                                            :negotiated nil
                                            :message "http2 system not loadable"))))
-                 (setf h2-pump (make-instance 'async-h2-pump-stream)
-                       h2-session (make-async-h2-session
-                                   h2-pump
-                                   :stream-class 'async-h2-streaming-client-stream)
-                       negotiated-version :http/2
+                 (when fresh
+                   (setf h2-pump (make-instance 'async-h2-pump-stream)
+                         h2-session (make-async-h2-session
+                                     h2-pump
+                                     :stream-class 'async-h2-streaming-client-stream)
+                         h2-pool-key* (h2-pool-key pool-key*)))
+                 (unless fresh
+                   (unless (h2-session-reusable-p h2-session)
+                     (close-connection)
+                     (return-from begin-h2 (do-connect))))
+                 (setf negotiated-version :http/2
                        h2-callback-finished-p nil
                        h2-req-end-p nil
+                       h2-done-stream nil
+                       streamed-response nil
                        (fill-pointer h2-body-buf) 0)
                  (ensure-http-version-available version-pref negotiated-version
                                                 :backend-name "async")
-                 ;; RFC 9113 §3.4: preface+SETTINGS then HEADERS immediately.
+                 ;; RFC 9113 §3.4: on a new connection, preface+SETTINGS then
+                 ;; HEADERS immediately. A pooled session already sent the
+                 ;; preface; only HEADERS (and body) go out.
                  ;; Stream uploads: HEADERS without END_STREAM, DATA as we read.
-                 (setf h2-req-stream
-                       (h2-open-request h2-session method uri headers
-                                        :end-stream (not stream-body-p)
-                                        :body (if stream-body-p nil body-octets)))
+                 (handler-case
+                     (setf h2-req-stream
+                           (h2-open-request h2-session method uri headers
+                                            :end-stream (not stream-body-p)
+                                            :body (if stream-body-p nil body-octets)))
+                   (error (e)
+                     (if fresh
+                         (fail (make-condition 'http-connection-error
+                                               :message (princ-to-string e)))
+                         ;; Second open failed (connection error / GOAWAY the
+                         ;; library raised while building the stream). Close
+                         ;; and dial; do not return this session to the pool.
+                         (progn
+                           (close-connection)
+                           (do-connect)))
+                     (return-from begin-h2 nil)))
                  (when (typep h2-req-stream 'async-h2-stream-hooks)
                    (setf (h2-stream-on-headers h2-req-stream) #'on-h2-headers
                          (h2-stream-on-data h2-req-stream) #'on-h2-data

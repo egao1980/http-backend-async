@@ -148,16 +148,29 @@
       (eval `(defclass async-h2-client-connection (,vanilla)
                ((enable-connect-protocol-p
                  :initform nil
-                 :accessor h2-enable-connect-protocol-p))
+                 :accessor h2-enable-connect-protocol-p)
+                ;; zellerin/http2 raises GO-AWAY from the frame reader and does
+                ;; not leave a queryable flag. DO-GOAWAY records it here so the
+                ;; pool can refuse the session.
+                (goaway-p
+                 :initform nil
+                 :accessor h2-connection-goaway-p))
                (:documentation
                 "Client connection that records SETTINGS_ENABLE_CONNECT_PROTOCOL
-                 (RFC 8441) for future Extended CONNECT WebSocket."))))
+                 (RFC 8441) for future Extended CONNECT WebSocket, and whether
+                 the peer has sent GOAWAY."))))
     (when set-peer
       (eval `(defmethod ,set-peer ((connection async-h2-client-connection)
                                    (name (eql :enable-connect-protocol))
                                    value)
                (setf (h2-enable-connect-protocol-p connection)
-                     (plusp value)))))))
+                     (plusp value)))))
+    (let ((do-goaway (find-symbol "DO-GOAWAY" :http2/core)))
+      (when do-goaway
+        (eval `(defmethod ,do-goaway ((connection async-h2-client-connection)
+                                       error-code last-stream-id debug-data)
+                 (setf (h2-connection-goaway-p connection) t)
+                 (call-next-method)))))))
 
 (defclass async-h2-pump-stream
     (trivial-gray-streams:fundamental-binary-input-stream
@@ -308,6 +321,21 @@
   "Deprecated alias — returns the http2 connection object only."
   (async-h2-session-connection (make-async-h2-session pump)))
 
+(defun h2-connection-saw-goaway-p (connection)
+  "T if CONNECTION recorded a peer GOAWAY during frame parse."
+  (and connection
+       (slot-exists-p connection 'goaway-p)
+       (slot-value connection 'goaway-p)))
+
+(defun %h2-connection-streams (connection)
+  "Streams still known to CONNECTION. Unknown layout → a non-empty placeholder
+   so the caller refuses to pool."
+  (let ((fn (or (find-symbol "GET-STREAMS" :http2/core)
+                (find-symbol "GET-STREAMS" :http2/client))))
+    (if (and fn (fboundp fn))
+        (funcall fn connection)
+        '(:unknown))))
+
 (defun h2-write-data (session stream octets &key (end-stream nil))
   "Write DATA frames on STREAM (split at 16KiB). END-STREAM T → last frame."
   (declare (ignore session))
@@ -389,6 +417,35 @@
                     (async-h2-session-parse-need session) (or size 0))
               (when done (return)))))))
     (values done result)))
+
+(defun h2-session-idle-p (session)
+  "T when SESSION has no outstanding streams and has not seen GOAWAY.
+
+   Does not read the pump. Safe to call from inside H2-PROCESS-PENDING
+   (a nested parse would clobber the outer frame cursor). Sequential
+   reuse only: a stream still in GET-STREAMS means the next open would
+   be concurrent multiplexing, which this pool does not do."
+  (let ((conn (and session (async-h2-session-connection session))))
+    (and conn
+         (not (h2-connection-saw-goaway-p conn))
+         (null (%h2-connection-streams conn)))))
+
+(defun h2-session-reusable-p (session)
+  "Drain frames already buffered on SESSION, then H2-SESSION-IDLE-P.
+
+   Not safe to call from inside H2-PROCESS-PENDING. The http2 library
+   does not expose a GOAWAY flag: the frame parser raises GO-AWAY after
+   DO-GOAWAY, and that error makes this return NIL. Bytes that arrive
+   only later (still in the kernel buffer) fail the next read; that
+   request is not pooled."
+  (let ((conn (and session (async-h2-session-connection session))))
+    (when (and conn (not (h2-connection-saw-goaway-p conn)))
+      (handler-case
+          (progn
+            (h2-process-pending session)
+            (h2-session-idle-p session))
+        (error ()
+          nil)))))
 
 (defun h2-stream-to-http-parts (h2-stream)
   "Return (values status headers-ht body-octets) from a finished h2 stream."

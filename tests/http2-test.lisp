@@ -44,6 +44,65 @@
     (http-backend-async::h2-buf-append buf #(1 2 3 4) 1 4)
     (ok (equalp #(2 3 4) buf))))
 
+(defun %count-preface (octets)
+  (let ((needle (babel:string-to-octets "PRI * HTTP/2.0"))
+        (count 0)
+        (start 0))
+    (loop for pos = (search needle octets :start2 start)
+          while pos
+          do (incf count)
+             (setf start (+ pos (length needle))))
+    count))
+
+(deftest h2-second-stream-omits-connection-preface
+  "A second H2-OPEN-REQUEST on the same session is a new stream, not a new
+   connection. The client preface is written only when the session is created."
+  (if (not (ensure-http2))
+      (skip "http2/client not loadable")
+      (let* ((pump (make-instance 'async-h2-pump-stream))
+             (session (make-async-h2-session
+                       pump
+                       :stream-class 'async-h2-streaming-client-stream))
+             (uri (quri:uri "https://example.test/a")))
+        (ok (http-backend-async::h2-session-idle-p session))
+        (h2-open-request session :get uri nil)
+        (let ((first (http-backend-async::h2-pump-take-out pump)))
+          (ok (= 1 (%count-preface first))))
+        ;; Stream 1 is still open: do not treat the session as reusable.
+        (ok (not (http-backend-async::h2-session-idle-p session)))
+        (ok (not (http-backend-async::h2-session-reusable-p session)))
+        ;; Peer SETTINGS (empty) + HEADERS :status 200, END_STREAM, on stream 1.
+        ;; Static-table index 8 is :status 200 (HPACK indexed, 0x88).
+        (http-backend-async::h2-pump-feed-in
+         pump
+         #(0 0 0 4 0 0 0 0 0
+           0 0 1 1 5 0 0 0 1
+           #x88))
+        (http-backend-async::h2-process-pending session)
+        (ok (http-backend-async::h2-session-idle-p session))
+        (h2-open-request session :get (quri:uri "https://example.test/b") nil)
+        (let ((second (http-backend-async::h2-pump-take-out pump)))
+          (ok (plusp (length second)))
+          (ok (zerop (%count-preface second)))))))
+
+(deftest h2-goaway-session-is-not-reusable
+  "GOAWAY is not a queryable flag on the http2 connection. DO-GOAWAY records
+   it, and a parse error while draining also refuses reuse."
+  (if (not (ensure-http2))
+      (skip "http2/client not loadable")
+      (let* ((pump (make-instance 'async-h2-pump-stream))
+             (session (make-async-h2-session pump)))
+        ;; length=8 type=GOAWAY (0x07), the prefix seen as INVALID-VERSION
+        ;; when an h1 writer was pointed at an h2 socket.
+        (http-backend-async::h2-pump-feed-in
+         pump
+         #(0 0 8 7 0 0 0 0 0
+           0 0 0 0
+           0 0 0 0))
+        (ok (not (http-backend-async::h2-session-reusable-p session)))
+        (ok (http-backend-async::h2-connection-saw-goaway-p
+             (async-h2-session-connection session))))))
+
 (deftest h2-open-request-streaming-body
   "HEADERS without END_STREAM, then DATA chunks."
   (if (not (ensure-http2))
