@@ -10,3 +10,5 @@
 .DS_Store
 system-index.txt
 qlfile.lock
+cl-repo.lock
+.cl-repository/
