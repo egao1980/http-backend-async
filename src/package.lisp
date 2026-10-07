@@ -48,6 +48,9 @@
            #:make-lru-connection-pool
            #:async-pooled-connection
            #:make-async-pooled-connection
+           #:async-pooled-h2-connection
+           #:make-async-pooled-h2-connection
+           #:h2-pool-key
            #:response-keeps-alive-p
            #:build-connect-request-octets
            #:connect-response-ok-p
