@@ -350,13 +350,19 @@
                          from-pool-p nil)
                    conn))
                (release-or-close (&key (force-close nil))
-                 "Return connection to POOL when keep-alive+reuse; else close."
+                 "Return connection to POOL when keep-alive+reuse; else close.
+
+                  An ALPN=h2 connection is never pooled: ADOPT-POOLED replays
+                  the HTTP/1.1 writer, so the peer would answer the text request
+                  with GOAWAY (seen as INVALID-VERSION on a pooled socket).
+                  Reusing the h2 session needs its own pool entry type."
                  (cond
                    ((or force-close
                         (null pool)
                         (null sock)
                         (not keep-alive-p)
-                        (not reuse-ok-p))
+                        (not reuse-ok-p)
+                        (eq negotiated-version :http/2))
                     (close-connection))
                    (t
                     (let ((conn (detach-connection)))
@@ -437,12 +443,15 @@
                  ;; socket remains writable under :read-write interest.
                  (sleep* event-backend event-loop 0 :callback fn))
                (arm-io (direction)
-                 "Register or update FD interest in place (no cancel+re-init)."
-                 (unless fd
-                   (error 'http-connection-error :message "arm-io before connect"))
+                 "Register or update FD interest in place (no cancel+re-init).
+                  A no-op once the request completed: the streaming body's
+                  ON-SPACE (UNPAUSE-H2) and the tail of DO-H2-READ still run
+                  after COMPLETE-REQUEST dropped the socket."
                  (when (or (async-request-canceled-p handle)
                            (eq phase :reconnect))
                    (return-from arm-io nil))
+                 (unless fd
+                   (error 'http-connection-error :message "arm-io before connect"))
                  (let ((cur (async-request-io-handle handle)))
                    (cond
                      ((and cur (eq io-dir direction)) nil)
@@ -476,9 +485,12 @@
                           (fail (make-condition 'http-connection-error
                                                 :message (princ-to-string e)))))))))
                (fail (condition)
-                 (when body-feed
-                   (async-body-fail body-feed condition))
+                 ;; After COMPLETE-REQUEST a late error (e.g. a stray ARM-IO
+                 ;; from the reader thread) must not poison a body that was
+                 ;; already delivered whole.
                  (unless (async-request-canceled-p handle)
+                   (when body-feed
+                     (async-body-fail body-feed condition))
                    (complete-request :force-close t)
                    (unless headers-delivered-p
                      (handler-case (funcall eb-cb condition)
@@ -613,6 +625,17 @@
                            :decompress (http-request-decompress request))
                         (follow-redirect status headers* body* set-cookies
                                          final-url))))))
+               (unpause-h2-threadsafe ()
+                 "ON-SPACE runs on the body reader's thread; hop onto the loop
+                  thread when the backend can (WAKE-CALL), as INSTALL-PIPE-WAKE does."
+                 (unless (async-request-canceled-p handle)
+                   (let ((wc (find-symbol "WAKE-CALL" :event-protocol)))
+                     (if (and wc (fboundp wc))
+                         (funcall wc event-backend event-loop #'unpause-h2)
+                         (progn
+                           (defer event-backend event-loop #'unpause-h2)
+                           (ignore-errors
+                            (wake event-backend event-loop)))))))
                (unpause-h2 ()
                  "Resume H2 reads after the body queue drains; flush WINDOW_UPDATE."
                  (setf read-paused-p nil)
@@ -630,7 +653,7 @@
                  "Deliver headers + Gray body; DATA frames feed the queue."
                  (setf reuse-ok-p keep-alive-p
                        body-feed (make-async-body-input-stream
-                                  :on-space #'unpause-h2)
+                                  :on-space #'unpause-h2-threadsafe)
                        streaming-final-p t)
                  (multiple-value-bind (app-stream headers**)
                      (apply-response-content-encoding

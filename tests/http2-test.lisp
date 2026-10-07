@@ -75,6 +75,22 @@
           (ok (streamp (response-body res)))
           (ok (plusp (length octets)))))))
 
+(deftest http2-live-sequential-same-client
+  "Two h2 GETs on one client/pool: the second must not replay HTTP/1.1 on a
+   pooled ALPN=h2 socket (INVALID-VERSION on GOAWAY). HTTP_ASYNC_H2_LIVE=1."
+  (if (not (uiop:getenv "HTTP_ASYNC_H2_LIVE"))
+      (skip "HTTP_ASYNC_H2_LIVE unset")
+      (with-async-test (eb el backend)
+        (let ((client (make-http-client backend :http-version :http/2 :verify t)))
+          (dotimes (i 2)
+            (let ((res (%await-promise
+                        (http:get-async "https://www.cloudflare.com/"
+                                        :client client :timeout 20.0)
+                        eb el :timeout 25.0)))
+              (ok (eq :http/2 (response-http-version res))
+                  (format nil "request ~D over h2" (1+ i)))
+              (ok (<= 200 (response-status res) 399))))))))
+
 #+ (or)
 (deftest http2-live-nghttp2
   "Live: requires network. Enable with HTTP_ASYNC_H2_LIVE."

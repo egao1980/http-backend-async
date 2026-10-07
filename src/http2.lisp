@@ -112,8 +112,13 @@
         (set-peer (find-symbol "SET-PEER-SETTING" :http2/core))
         ;; http2 2.1.x still exports the symbol but dropped the class; mixing
         ;; in a forward-referenced class breaks the CPL at instantiation.
+        ;; FIND-CLASS also returns a FORWARD-REFERENCED-CLASS once something
+        ;; (e.g. a defsection docstring) has named it, so require a real one.
         (multi (let ((sym (find-symbol "MULTI-PART-DATA-STREAM" :http2/core)))
-                 (and sym (find-class sym nil) sym))))
+                 (and sym
+                      (let ((class (find-class sym nil)))
+                        (and class (typep class 'standard-class)))
+                      sym))))
     (unless (and client-stream header-m body-m peer-ends client-done vanilla)
       (error 'http-version-not-available
              :requested :http/2
