@@ -110,7 +110,10 @@
         (client-done (find-symbol "CLIENT-DONE" :http2/client))
         (vanilla (find-symbol "VANILLA-CLIENT-CONNECTION" :http2/client))
         (set-peer (find-symbol "SET-PEER-SETTING" :http2/core))
-        (multi (find-symbol "MULTI-PART-DATA-STREAM" :http2/core)))
+        ;; http2 2.1.x still exports the symbol but dropped the class; mixing
+        ;; in a forward-referenced class breaks the CPL at instantiation.
+        (multi (let ((sym (find-symbol "MULTI-PART-DATA-STREAM" :http2/core)))
+                 (and sym (find-class sym nil) sym))))
     (unless (and client-stream header-m body-m peer-ends client-done vanilla)
       (error 'http-version-not-available
              :requested :http/2
