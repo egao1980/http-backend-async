@@ -23,7 +23,9 @@
    CI :with is the registry package http2."
   (or *http2-loaded*
       (setf *http2-loaded*
-            (and (ignore-errors (asdf:load-system "http2/client") t) t)))
+            (and (or (find-package :http2/client)
+                     (ignore-errors (asdf:load-system "http2/client") t))
+                 t)))
   (when (and *http2-loaded* (not *h2-classes-ready*))
     (%ensure-h2-classes)
     (setf *h2-classes-ready* t))
@@ -434,17 +436,18 @@
   "Drain frames already buffered on SESSION, then H2-SESSION-IDLE-P.
 
    Not safe to call from inside H2-PROCESS-PENDING. The http2 library
-   does not expose a GOAWAY flag: the frame parser raises GO-AWAY after
-   DO-GOAWAY, and that error makes this return NIL. Bytes that arrive
-   only later (still in the kernel buffer) fail the next read; that
-   request is not pooled."
+   does not expose a GOAWAY flag. The frame parser raises GO-AWAY /
+   GO-AWAY-NO-ERROR after DO-GOAWAY. Those conditions are serious but
+   not ERROR subclasses, so this catches SERIOUS-CONDITION and returns
+   NIL. Bytes that arrive only later (still in the kernel buffer) fail
+   the next read; that request is not pooled."
   (let ((conn (and session (async-h2-session-connection session))))
     (when (and conn (not (h2-connection-saw-goaway-p conn)))
       (handler-case
           (progn
             (h2-process-pending session)
             (h2-session-idle-p session))
-        (error ()
+        (serious-condition ()
           nil)))))
 
 (defun h2-stream-to-http-parts (h2-stream)

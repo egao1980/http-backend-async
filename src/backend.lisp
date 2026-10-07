@@ -616,7 +616,7 @@
                  (handler-case
                      (begin-h2 :fresh nil)
                    (http-error (e) (fail e))
-                   (error (e)
+                   (serious-condition (e)
                      (fail (make-condition 'http-connection-error
                                            :message (princ-to-string e))))))
                (next-tick (fn)
@@ -1029,7 +1029,7 @@
                            (h2-open-request h2-session method uri headers
                                             :end-stream (not stream-body-p)
                                             :body (if stream-body-p nil body-octets)))
-                   (error (e)
+                   (serious-condition (e)
                      (if fresh
                          (fail (make-condition 'http-connection-error
                                                :message (princ-to-string e)))
@@ -1348,8 +1348,9 @@
                        (t
                         (h2-pump-feed-in h2-pump recv-buf n)
                         (multiple-value-bind (done h2-stream)
+                            ;; GO-AWAY is a serious-condition, not an ERROR.
                             (handler-case (h2-process-pending h2-session)
-                              (error (e)
+                              (serious-condition (e)
                                 (return (fail (make-condition
                                                'http-connection-error
                                                :message (princ-to-string e))))))
@@ -1490,7 +1491,7 @@
                        (:write (do-write))
                        (:read (do-read)))
                    (http-error (e) (fail e))
-                   (error (e)
+                   (serious-condition (e)
                      (fail (make-condition
                             (if https 'http-tls-error 'http-connection-error)
                             :message (princ-to-string e)))))))

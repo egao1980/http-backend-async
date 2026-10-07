@@ -62,7 +62,7 @@
       (let* ((pump (make-instance 'async-h2-pump-stream))
              (session (make-async-h2-session
                        pump
-                       :stream-class 'async-h2-streaming-client-stream))
+                       :stream-class 'http-backend-async::async-h2-streaming-client-stream))
              (uri (quri:uri "https://example.test/a")))
         (ok (http-backend-async::h2-session-idle-p session))
         (h2-open-request session :get uri nil)
@@ -101,7 +101,7 @@
            0 0 0 0))
         (ok (not (http-backend-async::h2-session-reusable-p session)))
         (ok (http-backend-async::h2-connection-saw-goaway-p
-             (async-h2-session-connection session))))))
+             (http-backend-async::async-h2-session-connection session))))))
 
 (deftest h2-open-request-streaming-body
   "HEADERS without END_STREAM, then DATA chunks."
