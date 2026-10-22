@@ -51,6 +51,12 @@
            #:async-pooled-h2-connection
            #:make-async-pooled-h2-connection
            #:h2-pool-key
+           #:h2-mux
+           #:*h2-max-streams-per-connection*
+           #:*h2-mux-count*
+           #:h2-mux-peer-max-streams
+           #:h2-mux-active-count
+           #:h2-mux-peak-streams
            #:response-keeps-alive-p
            #:build-connect-request-octets
            #:connect-response-ok-p
@@ -68,6 +74,7 @@
            #:h2-stream-release-window
            #:h2-stream-hold-window-p
            #:h2-stream-pending-window
+           #:h2-stream-ended-p
            #:h2-streaming-status-headers
            #:h2-streaming-trailers-table
            #:h2-open-request
