@@ -150,6 +150,46 @@
                   (format nil "request ~D over h2" (1+ i)))
               (ok (<= 200 (response-status res) 399))))))))
 
+(deftest http2-live-concurrent-requests-multiplex
+  "Concurrent h2 GETs on one client share a pooled connection, at most
+   *H2-MAX-STREAMS-PER-CONNECTION* streams each. HTTP_ASYNC_H2_LIVE=1."
+  (if (not (uiop:getenv "HTTP_ASYNC_H2_LIVE"))
+      (skip "HTTP_ASYNC_H2_LIVE unset")
+      (with-async-test (eb el backend)
+        (let* ((url "https://www.cloudflare.com/")
+               (*h2-max-streams-per-connection* 4)
+               (client (make-http-client backend :http-version :http/2 :verify t))
+               (pool (http-protocol::effective-connection-pool client))
+               (key (h2-pool-key (pool-key "https" "www.cloudflare.com" 443)))
+               (before *h2-mux-count*)
+               ;; http2 < 2.1.2 cannot report the peer's limit: one stream each.
+               (cap (if (find-symbol "GET-PEER-MAX-CONCURRENT-STREAMS" :http2/core) 4 1)))
+          (pool-clear pool)
+          ;; Warm-up: the peer's SETTINGS are known and the mux sits in the pool.
+          (%await-promise (http:get-async url :client client :timeout 20.0)
+                          eb el :timeout 25.0)
+          (ok (= 1 (- *h2-mux-count* before)) "warm-up dialed once")
+          (let ((responses (%await-promise
+                            (blackbird:all
+                             (loop repeat 6
+                                   collect (http:get-async url :client client
+                                                               :timeout 20.0)))
+                            eb el :timeout 40.0))
+                (muxes (loop for m = (pool-acquire pool key)
+                             while m collect m)))
+            (ok (= 6 (length responses)))
+            (ok (every (lambda (r) (and (eq :http/2 (response-http-version r))
+                                        (<= 200 (response-status r) 399)))
+                       responses))
+            (when (= cap 4)
+              (ok (<= (- *h2-mux-count* before) 3)
+                  "6 requests at 4 streams per connection: no connection per request")
+              (ok (member 4 (mapcar #'h2-mux-peak-streams muxes))
+                  "the pooled connection carried 4 streams at once"))
+            (ok (every (lambda (m) (<= (h2-mux-peak-streams m) cap)) muxes)
+                "never above the stream cap")
+            (dolist (m muxes) (pool-discard pool m)))))))
+
 #+ (or)
 (deftest http2-live-nghttp2
   "Live: requires network. Enable with HTTP_ASYNC_H2_LIVE."

@@ -39,7 +39,9 @@
    (header-snapshot :initform nil :accessor h2-stream-header-snapshot)
    (trailers :initform nil :accessor h2-stream-trailers)
    (pending-window :initform 0 :accessor h2-stream-pending-window)
-   (hold-window-p :initform nil :accessor h2-stream-hold-window-p))
+   (hold-window-p :initform nil :accessor h2-stream-hold-window-p)
+   (ended-p :initform nil :accessor h2-stream-ended-p
+            :documentation "Peer sent END_STREAM and ON-END ran."))
   (:documentation
    "Callbacks + trailer snapshot for H2 :want-stream (DATA as they arrive)."))
 
@@ -94,6 +96,7 @@
 (defun %h2-streaming-peer-ends (stream)
   (unless (h2-stream-headers-seen-p stream)
     (%h2-streaming-end-headers stream))
+  (setf (h2-stream-ended-p stream) t)
   (when-let ((fn (h2-stream-on-end stream)))
     (funcall fn stream))
   (let ((client-done (find-symbol "CLIENT-DONE" :http2/client)))

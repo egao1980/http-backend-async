@@ -114,8 +114,15 @@
    Forced :http/2 does not take an HTTP/1.1 entry."
   (when (and pool (request-may-use-h2-pool-p https version-pref))
     (let ((h2 (pool-acquire pool (h2-pool-key key))))
+      (when (typep h2 'h2-mux)
+        (setf (h2-mux-pooled-p h2) nil))
       (cond
         ((null h2) nil)
+        ((and (typep h2 'h2-mux)
+              (eq (async-h2-conn-event-loop h2) event-loop)
+              (not (h2-mux-has-capacity-p h2)))
+         ;; Full: it re-pools itself when a stream finishes. Dial a new connection.
+         (return-from acquire-pooled-connection (values nil nil)))
         ((and (typep h2 'async-pooled-h2-connection)
               (async-h2-conn-https-p h2)
               (eq (async-h2-conn-event-loop h2) event-loop))
@@ -143,12 +150,18 @@
    (timer-handle :initform nil :accessor async-request-timer-handle)
    (socket :initform nil :accessor async-request-socket)
    (tls-stream :initform nil :accessor async-request-tls-stream) ; tls-session
+   (cancel-hook :initform nil :accessor async-request-cancel-hook
+                :documentation "Thunk run on cancel: an HTTP/2 request resets its stream
+instead of closing the shared connection.")
    (event-backend :initarg :event-backend :reader async-request-event-backend)
    (event-loop :initarg :event-loop :reader async-request-event-loop)))
 
 (defmethod cancel-request ((backend async-backend) (handle async-request-handle))
   (unless (async-request-canceled-p handle)
     (setf (async-request-canceled-p handle) t)
+    (when-let ((hook (async-request-cancel-hook handle)))
+      (setf (async-request-cancel-hook handle) nil)
+      (ignore-errors (funcall hook)))
     (let ((eb (async-request-event-backend handle)))
       (when-let ((io (async-request-io-handle handle)))
         (ignore-errors (cancel eb io)))
@@ -259,22 +272,18 @@
                (from-pool-p nil)
                (version-pref (effective-http-version client request))
                (negotiated-version :http/1.1)
-               (h2-pump nil)
-               (h2-session nil)
-               (h2-out nil)
-               (h2-out-pos 0)
-               ;; Completed H2 stream waiting for outbound ACK/WINDOW_UPDATE flush.
-               (h2-done-stream nil)
+               ;; The H2-MUX carrying this request's stream. The mux owns the
+               ;; socket; this closure only sees its stream hooks.
+               (h2-mux nil)
+               ;; (CAR IO-CELL) set → the registered IO callback forwards to the
+               ;; mux that adopted this request's handle.
+               (io-cell nil)
                (h2-req-stream nil)
                (h2-body-buf (make-array 0 :element-type '(unsigned-byte 8)
                                           :adjustable t :fill-pointer 0))
                (h2-callback-finished-p nil)
                (h2-req-end-p nil)
-               (streamed-response nil)
-               ;; Origin key captured when the h2 session is created. Redirects
-               ;; rewrite POOL-KEY* before release; the session must go back
-               ;; under the origin it is actually connected to.
-               (h2-pool-key* nil))
+               (streamed-response nil))
           (when proxy-url
             (multiple-value-bind (pscheme phost pport puser ppass)
                 (parse-proxy-uri proxy-url)
@@ -415,7 +424,8 @@
                  (when-let ((tm (async-request-timer-handle handle)))
                    (ignore-errors (cancel event-backend tm))
                    (setf (async-request-timer-handle handle) nil))
-                 (setf io-dir nil))
+                 (setf io-dir nil
+                       io-cell nil))
                (close-connection ()
                  (stop-io-and-timer)
                  (tls-close tls)
@@ -425,13 +435,6 @@
                  (setf (async-request-socket handle) nil
                        sock nil
                        fd nil
-                       h2-session nil
-                       h2-pump nil
-                       h2-out nil
-                       h2-out-pos 0
-                       h2-req-stream nil
-                       h2-done-stream nil
-                       h2-pool-key* nil
                        from-pool-p nil
                        reuse-ok-p nil))
                (detach-connection ()
@@ -446,67 +449,31 @@
                          (async-request-tls-stream handle) nil
                          from-pool-p nil)
                    conn))
-               (detach-h2-connection ()
-                 "Hand socket, TLS, and the live HTTP/2 session to a pool entry."
-                 (stop-io-and-timer)
-                 (let ((conn (make-async-pooled-h2-connection
-                              sock
-                              :tls tls
-                              :https https
-                              :session h2-session
-                              :pump h2-pump
-                              :event-loop event-loop)))
-                   (setf sock nil
-                         tls nil
-                         fd nil
-                         h2-session nil
-                         h2-pump nil
-                         h2-out nil
-                         h2-out-pos 0
+               (release-h2-stream (force-close)
+                 "Give this request's stream back to its mux. The mux re-pools,
+                  drains or closes itself; other streams on it carry on."
+                 (let ((mux h2-mux)
+                       (stream h2-req-stream))
+                   (stop-io-and-timer)
+                   (setf h2-mux nil
                          h2-req-stream nil
-                         (async-request-socket handle) nil
-                         (async-request-tls-stream handle) nil
-                         from-pool-p nil)
-                   conn))
+                         (async-request-cancel-hook handle) nil)
+                   (let ((reset (or force-close (not h2-callback-finished-p))))
+                     (when (and (not reset) (typep stream 'async-h2-stream-hooks))
+                       (ignore-errors (h2-stream-release-window stream)))
+                     (h2-mux-stream-done mux stream :reset reset))))
                (release-or-close (&key (force-close nil))
                  "Return the connection to POOL when it can be reused; else close.
 
                   HTTP/1.1: keep-alive and the response allows reuse. The entry
                   is an ASYNC-POOLED-CONNECTION under the origin key.
 
-                  HTTP/2 (HTTPS only): when the stream finished cleanly and the
-                  session is still usable — no connection error, no GOAWAY —
-                  detach it as an ASYNC-POOLED-H2-CONNECTION under the |h2 key.
-                  The next request on this event-loop opens a new stream on that
-                  session. The HTTP/1.1 writer is never used on an h2 socket.
-                  A dead session is closed, same as a force-close."
-                 (let ((pool-h2
-                         (and (not force-close)
-                              pool
-                              sock
-                              https
-                              keep-alive-p
-                              reuse-ok-p
-                              (eq negotiated-version :http/2)
-                              h2-session
-                              ;; IDLE-P, not REUSABLE-P: this runs from the
-                              ;; frame callback inside H2-PROCESS-PENDING.
-                              ;; A nested parse would clobber the cursor.
-                              ;; Buffered GOAWAY is drained on the next adopt.
-                              (handler-case
-                                  (progn
-                                    (when (and h2-req-stream
-                                               (typep h2-req-stream
-                                                      'async-h2-stream-hooks))
-                                      (h2-stream-release-window h2-req-stream))
-                                    (h2-session-idle-p h2-session))
-                                (error () nil)))))
+                  HTTP/2: the socket belongs to H2-MUX, never to this request.
+                  Releasing ends the request's stream (RST_STREAM when it did not
+                  finish); the mux stays pooled while it has spare streams."
+                 (if h2-mux
+                   (release-h2-stream force-close)
                    (cond
-                     (pool-h2
-                      (let* ((key (or h2-pool-key* (h2-pool-key pool-key*)))
-                             (conn (detach-h2-connection)))
-                        (setf h2-pool-key* nil)
-                        (pool-release pool key conn)))
                      ((or force-close
                           (null pool)
                           (null sock)
@@ -589,36 +556,21 @@
                  (arm-io :write)
                  (next-tick (lambda () (on-io :ok))))
                (adopt-pooled-h2 (conn)
-                 "Reuse an HTTP/2 session: install its socket and open a new stream.
-                  Does not send a connection preface or run the HTTP/1.1 writer."
-                 (let ((usock (async-h2-conn-socket conn))
-                       (tls* (async-h2-conn-tls conn))
-                       (session (async-h2-conn-session conn))
-                       (pump (async-h2-conn-pump conn)))
-                   ;; Drop the wrapper before any call that can fail, so a
-                   ;; later discard cannot close the socket this request owns.
-                   (setf (async-h2-conn-alive-p conn) nil
-                         (async-h2-conn-socket conn) nil
-                         (async-h2-conn-tls conn) nil
-                         (async-h2-conn-session conn) nil
-                         (async-h2-conn-pump conn) nil
-                         sock usock
-                         tls tls*
-                         https (async-h2-conn-https-p conn)
-                         h2-session session
-                         h2-pump pump
-                         h2-pool-key* (h2-pool-key pool-key*)
-                         (async-request-socket handle) usock
-                         (async-request-tls-stream handle) tls*
-                         fd (socket-fd usock)
-                         from-pool-p t
-                         io-dir nil))
-                 (handler-case
-                     (begin-h2 :fresh nil)
-                   (http-error (e) (fail e))
-                   (serious-condition (e)
-                     (fail (make-condition 'http-connection-error
-                                           :message (princ-to-string e))))))
+                 "Open this request's stream on a pooled H2-MUX (no preface).
+                  A mux that cannot take it is dropped from the pool; dial."
+                 (cond
+                   ((not (typep conn 'h2-mux))
+                    (pool-discard pool conn)
+                    (do-connect))
+                   ((h2-mux-ready-for-stream-p conn)
+                    (setf https t
+                          from-pool-p t)
+                    (begin-h2 :mux conn))
+                   (t
+                    (unless (or (eq (h2-mux-state conn) :dead)
+                                (h2-mux-usable-p conn))
+                      (pool-discard pool conn))
+                    (do-connect))))
                (next-tick (fn)
                  ;; Prefer sleep* 0 over defer/idle: libev idle is starved while a
                  ;; socket remains writable under :read-write interest.
@@ -640,10 +592,15 @@
                       (update-io event-backend cur direction)
                       (setf io-dir direction))
                      (t
-                      (setf io-dir direction
-                            (async-request-io-handle handle)
-                            (register-io event-backend event-loop fd
-                                         direction #'on-io))))))
+                      (let ((cell (list nil)))
+                        (setf io-dir direction
+                              io-cell cell
+                              (async-request-io-handle handle)
+                              (register-io event-backend event-loop fd direction
+                                           (lambda (status)
+                                             (if (car cell)
+                                                 (funcall (car cell) status)
+                                                 (on-io status))))))))))
                (do-connect ()
                  (multiple-value-bind (conn kind)
                      (acquire-pooled-connection
@@ -810,30 +767,26 @@
                            :decompress (http-request-decompress request))
                         (follow-redirect status headers* body* set-cookies
                                          final-url))))))
+               (call-on-loop (fn)
+                 "Run FN on the loop thread (WAKE-CALL when the backend has it)."
+                 (let ((wc (find-symbol "WAKE-CALL" :event-protocol)))
+                   (if (and wc (fboundp wc))
+                       (funcall wc event-backend event-loop fn)
+                       (progn
+                         (defer event-backend event-loop fn)
+                         (ignore-errors
+                          (wake event-backend event-loop))))))
                (unpause-h2-threadsafe ()
-                 "ON-SPACE runs on the body reader's thread; hop onto the loop
-                  thread when the backend can (WAKE-CALL), as INSTALL-PIPE-WAKE does."
+                 "ON-SPACE runs on the body reader's thread; hop onto the loop."
                  (unless (async-request-canceled-p handle)
-                   (let ((wc (find-symbol "WAKE-CALL" :event-protocol)))
-                     (if (and wc (fboundp wc))
-                         (funcall wc event-backend event-loop #'unpause-h2)
-                         (progn
-                           (defer event-backend event-loop #'unpause-h2)
-                           (ignore-errors
-                            (wake event-backend event-loop)))))))
+                   (call-on-loop #'unpause-h2)))
                (unpause-h2 ()
-                 "Resume H2 reads after the body queue drains; flush WINDOW_UPDATE."
+                 "The body queue drained: send the held WINDOW_UPDATE credit."
                  (setf read-paused-p nil)
                  (when h2-req-stream
                    (h2-stream-release-window h2-req-stream))
-                 (when (and h2-pump (h2-pump-pending-out-p h2-pump))
-                   (setf h2-out (h2-pump-take-out h2-pump)
-                         h2-out-pos 0
-                         phase :h2-write)
-                   (arm-io :write)
-                   (return-from unpause-h2))
-                 (unless (async-request-canceled-p handle)
-                   (arm-io :read)))
+                 (when h2-mux
+                   (h2-mux-kick h2-mux)))
                (begin-h2-stream-body (status headers* set-cookies)
                  "Deliver headers + Gray body; DATA frames feed the queue."
                  (setf reuse-ok-p keep-alive-p
@@ -865,13 +818,12 @@
                  (cond
                    (streaming-final-p
                     (async-body-feed body-feed data :start start :end end)
+                    ;; Backpressure is per stream: hold its WINDOW_UPDATE so the
+                    ;; peer stops; the shared socket keeps reading other streams.
                     (when (and body-feed (async-body-full-p body-feed))
                       (setf read-paused-p t)
                       (when h2-req-stream
-                        (setf (h2-stream-hold-window-p h2-req-stream) t))
-                      (when-let ((io (async-request-io-handle handle)))
-                        (ignore-errors (update-io event-backend io :none))
-                        (setf io-dir :none))))
+                        (setf (h2-stream-hold-window-p h2-req-stream) t))))
                    (t
                     (h2-buf-append h2-body-buf data start end))))
                (on-h2-end (h2-stream)
@@ -901,8 +853,7 @@
                                (coerce body* '(simple-array (unsigned-byte 8) (*)))
                                headers*
                                :decompress (http-request-decompress request))
-                            (setf reuse-ok-p keep-alive-p
-                                  h2-done-stream nil)
+                            (setf reuse-ok-p keep-alive-p)
                             (follow-redirect status headers* body*
                                              set-cookies
                                              (quri:render-uri uri)
@@ -926,15 +877,10 @@
                  (let ((acc (find-symbol (string '#:body-pipe-on-data) :http-protocol)))
                    (when acc
                      (funcall (fdefinition `(setf ,acc)) fn x))))
-               (queue-h2-out ()
-                 (when (and h2-pump (h2-pump-pending-out-p h2-pump))
-                   (setf h2-out (h2-pump-take-out h2-pump)
-                         h2-out-pos 0
-                         phase :h2-write)
-                   t))
                (try-h2-request-body ()
                  "Send one DATA chunk from the request stream/pipe. T if bytes queued."
-                 (when (or (not stream-body-p) h2-req-end-p (null h2-req-stream))
+                 (when (or (not stream-body-p) h2-req-end-p (null h2-req-stream)
+                           (null h2-mux))
                    (return-from try-h2-request-body nil))
                  (cond
                    ((%body-pipe-p body-stream-src)
@@ -945,12 +891,12 @@
                            (n (- end 0)))
                       (cond
                         ((plusp n)
-                         (h2-write-data h2-session h2-req-stream
+                         (h2-write-data nil h2-req-stream
                                         (subseq body-read-buf 0 n)
                                         :end-stream nil)
                          t)
                         ((%pipe-eof body-stream-src)
-                         (h2-write-data h2-session h2-req-stream #()
+                         (h2-write-data nil h2-req-stream #()
                                         :end-stream t)
                          (setf h2-req-end-p t
                                stream-body-p nil)
@@ -960,12 +906,12 @@
                     (let ((n (read-sequence body-read-buf body-stream-src)))
                       (cond
                         ((plusp n)
-                         (h2-write-data h2-session h2-req-stream
+                         (h2-write-data nil h2-req-stream
                                         (subseq body-read-buf 0 n)
                                         :end-stream nil)
                          t)
                         (t
-                         (h2-write-data h2-session h2-req-stream #()
+                         (h2-write-data nil h2-req-stream #()
                                         :end-stream t)
                          (setf h2-req-end-p t
                                stream-body-p nil)
@@ -975,83 +921,88 @@
                    (%pipe-set-on-data
                     body-stream-src
                     (lambda ()
-                      (flet ((kick ()
-                               (unless (async-request-canceled-p handle)
-                                 (try-h2-request-body)
-                                 (when (queue-h2-out)
-                                   (arm-io :write)))))
-                        (let ((wc (find-symbol "WAKE-CALL" :event-protocol)))
-                          (if (and wc (fboundp wc))
-                              (funcall wc event-backend event-loop #'kick)
-                              (progn
-                                (defer event-backend event-loop #'kick)
-                                (ignore-errors
-                                  (wake event-backend event-loop))))))))))
-               (begin-h2 (&key (fresh t))
-                 "Start or continue HTTP/2 on this socket.
-
-                  FRESH T (new TLS connection): create the session. Its
-                  constructor writes the client preface and SETTINGS.
-                  FRESH NIL (pooled session): open another stream on the
-                  existing session and pump. Do not send a second preface.
-                  If that session cannot take a stream, or the open fails,
-                  close it and dial once. The dead session is not pooled."
+                      (call-on-loop
+                       (lambda ()
+                         (unless (or (async-request-canceled-p handle) (null h2-mux))
+                           (h2-mux-kick h2-mux))))))))
+               (hand-socket-to-mux (mux)
+                 "MUX now owns the socket. The armed IO handle goes with it
+                  (re-registering a live fd in the same tick upsets libev)."
+                 (when (and io-cell (async-request-io-handle handle))
+                   (setf (car io-cell)
+                         (h2-mux-adopt-io mux (async-request-io-handle handle) io-dir)))
+                 (setf io-cell nil
+                       io-dir nil
+                       (async-request-io-handle handle) nil
+                       (async-request-socket handle) nil
+                       (async-request-tls-stream handle) nil
+                       sock nil
+                       tls nil
+                       fd nil))
+               (begin-h2 (&key mux)
+                 "Open this request's stream on MUX, or on a new H2-MUX for the
+                  connection that just negotiated h2 (its session writes the
+                  client preface + SETTINGS, RFC 9113 §3.4). HEADERS go out at
+                  once; the mux drives the socket from here on. A pooled MUX
+                  that fails the open is dropped and the request dials."
                  (unless (ensure-http2)
                    (return-from begin-h2
                      (fail (make-condition 'http-version-not-available
                                            :requested version-pref
                                            :negotiated nil
                                            :message "http2 system not loadable"))))
-                 (when fresh
-                   (setf h2-pump (make-instance 'async-h2-pump-stream)
-                         h2-session (make-async-h2-session
-                                     h2-pump
-                                     :stream-class 'async-h2-streaming-client-stream)
-                         h2-pool-key* (h2-pool-key pool-key*)))
-                 (unless fresh
-                   (unless (h2-session-reusable-p h2-session)
-                     (close-connection)
-                     (return-from begin-h2 (do-connect))))
-                 (setf negotiated-version :http/2
-                       h2-callback-finished-p nil
-                       h2-req-end-p nil
-                       h2-done-stream nil
-                       streamed-response nil
-                       (fill-pointer h2-body-buf) 0)
-                 (ensure-http-version-available version-pref negotiated-version
-                                                :backend-name "async")
-                 ;; RFC 9113 §3.4: on a new connection, preface+SETTINGS then
-                 ;; HEADERS immediately. A pooled session already sent the
-                 ;; preface; only HEADERS (and body) go out.
-                 ;; Stream uploads: HEADERS without END_STREAM, DATA as we read.
-                 (handler-case
-                     (setf h2-req-stream
-                           (h2-open-request h2-session method uri headers
-                                            :end-stream (not stream-body-p)
-                                            :body (if stream-body-p nil body-octets)))
-                   (serious-condition (e)
-                     (if fresh
-                         (fail (make-condition 'http-connection-error
-                                               :message (princ-to-string e)))
-                         ;; Second open failed (connection error / GOAWAY the
-                         ;; library raised while building the stream). Close
-                         ;; and dial; do not return this session to the pool.
-                         (progn
-                           (close-connection)
-                           (do-connect)))
-                     (return-from begin-h2 nil)))
-                 (when (typep h2-req-stream 'async-h2-stream-hooks)
-                   (setf (h2-stream-on-headers h2-req-stream) #'on-h2-headers
-                         (h2-stream-on-data h2-req-stream) #'on-h2-data
-                         (h2-stream-on-end h2-req-stream) #'on-h2-end))
-                 (install-pipe-wake)
-                 (when stream-body-p
-                   (try-h2-request-body))
-                 (setf h2-out (h2-pump-take-out h2-pump)
-                       h2-out-pos 0
-                       phase :h2-write)
-                 (arm-io :write)
-                 (next-tick (lambda () (on-io :ok))))
+                 (let ((fresh (null mux)))
+                   (when fresh
+                     (let* ((pump (make-instance 'async-h2-pump-stream))
+                            (session (make-async-h2-session
+                                      pump
+                                      :stream-class 'async-h2-streaming-client-stream)))
+                       (setf mux (make-h2-mux sock :tls tls
+                                                   :session session :pump pump
+                                                   :event-backend event-backend
+                                                   :event-loop event-loop
+                                                   :pool pool
+                                                   :key (h2-pool-key pool-key*)))
+                       (hand-socket-to-mux mux)))
+                   (setf negotiated-version :http/2
+                         phase :h2
+                         h2-callback-finished-p nil
+                         h2-req-end-p nil
+                         streamed-response nil
+                         (fill-pointer h2-body-buf) 0)
+                   (ensure-http-version-available version-pref negotiated-version
+                                                  :backend-name "async")
+                   ;; Stream uploads: HEADERS without END_STREAM, DATA as we read.
+                   (handler-case
+                       (setf h2-req-stream
+                             (h2-mux-open-stream mux #'fail #'try-h2-request-body
+                                                 method uri headers
+                                                 :end-stream (not stream-body-p)
+                                                 :body (if stream-body-p nil body-octets))
+                             h2-mux mux)
+                     (serious-condition (e)
+                       (cond
+                         (fresh
+                          (h2-mux-close mux)
+                          (fail (make-condition 'http-connection-error
+                                                :message (%h2-condition-message e))))
+                         (t
+                          (pool-discard pool mux)
+                          (do-connect)))
+                       (return-from begin-h2 nil)))
+                   (when (typep h2-req-stream 'async-h2-stream-hooks)
+                     (setf (h2-stream-on-headers h2-req-stream) #'on-h2-headers
+                           (h2-stream-on-data h2-req-stream) #'on-h2-data
+                           (h2-stream-on-end h2-req-stream) #'on-h2-end))
+                   (setf (async-request-cancel-hook handle)
+                         (lambda ()
+                           (call-on-loop
+                            (lambda ()
+                              (when h2-mux
+                                (release-h2-stream t))))))
+                   (install-pipe-wake)
+                   (h2-mux-repool mux)
+                   (h2-mux-kick mux)))
                (begin-origin-io ()
                  "After TCP (and optional SOCKS), start TLS or HTTP write."
                  (cond
@@ -1285,94 +1236,6 @@
                      (:want-write
                       (arm-io :write)
                       (return)))))
-               (finish-h2-stream (h2-stream)
-                 "Deliver a completed HTTP/2 stream as an HTTP-RESPONSE hop."
-                 (multiple-value-bind (status headers* body*)
-                     (h2-stream-to-http-parts h2-stream)
-                   (let ((set-cookies
-                           (merge-response-cookies cookie-jar
-                                                   (quri:render-uri uri)
-                                                   headers*)))
-                     (multiple-value-bind (body* headers*)
-                         (apply-response-content-encoding
-                          (coerce body* '(simple-array (unsigned-byte 8) (*)))
-                          headers*
-                          :decompress (http-request-decompress request))
-                       (setf reuse-ok-p keep-alive-p
-                             h2-done-stream nil)
-                       (follow-redirect status headers* body*
-                                        set-cookies
-                                        (quri:render-uri uri))))))
-               (do-h2-write ()
-                 (loop
-                   (when (or (null h2-out) (>= h2-out-pos (length h2-out)))
-                     (setf h2-out nil h2-out-pos 0)
-                     (when (h2-pump-pending-out-p h2-pump)
-                       (setf h2-out (h2-pump-take-out h2-pump)
-                             h2-out-pos 0))
-                     (unless h2-out
-                       (when (try-h2-request-body)
-                         (when (h2-pump-pending-out-p h2-pump)
-                           (setf h2-out (h2-pump-take-out h2-pump)
-                                 h2-out-pos 0)
-                           (return)))
-                       ;; Flush done: if response already complete, deliver it
-                       ;; (SETTINGS ACK often shares the read that finishes the stream).
-                       (when (and h2-done-stream (not h2-callback-finished-p))
-                         (return (finish-h2-stream h2-done-stream)))
-                       (setf phase :h2-read)
-                       (arm-io :read)
-                       (return)))
-                   (multiple-value-bind (pos done want)
-                       (%write-octets h2-out h2-out-pos (length h2-out))
-                     (setf h2-out-pos pos)
-                     (cond
-                       (want (arm-tls-want want) (return))
-                       ((not done) (return))
-                       (t
-                        (setf h2-out nil h2-out-pos 0)
-                        (when (h2-pump-pending-out-p h2-pump)
-                          (setf h2-out (h2-pump-take-out h2-pump))))))))
-               (do-h2-read ()
-                 (loop
-                   (multiple-value-bind (n want)
-                       (if https
-                           (tls-read-octets tls recv-buf)
-                           (values (socket-recv-octets sock recv-buf) nil))
-                     (cond
-                       (want (arm-tls-want want) (return))
-                       ((null n) (arm-io :read) (return))
-                       ((zerop n)
-                        (return (fail (make-condition 'http-connection-error
-                                                      :message "HTTP/2 EOF"))))
-                       (t
-                        (h2-pump-feed-in h2-pump recv-buf n)
-                        (multiple-value-bind (done h2-stream)
-                            ;; GO-AWAY is a serious-condition, not an ERROR.
-                            (handler-case (h2-process-pending h2-session)
-                              (serious-condition (e)
-                                (return (fail (make-condition
-                                               'http-connection-error
-                                               :message (princ-to-string e))))))
-                          (when done
-                            (setf h2-done-stream h2-stream))
-                          (when (h2-pump-pending-out-p h2-pump)
-                            (setf h2-out (h2-pump-take-out h2-pump)
-                                  h2-out-pos 0
-                                  phase :h2-write)
-                            (arm-io :write)
-                            (return (do-h2-write)))
-                          (when (try-h2-request-body)
-                            (when (h2-pump-pending-out-p h2-pump)
-                              (setf h2-out (h2-pump-take-out h2-pump)
-                                    h2-out-pos 0
-                                    phase :h2-write)
-                              (arm-io :write)
-                              (return (do-h2-write))))
-                          (when (and h2-done-stream (not h2-callback-finished-p))
-                            (return (finish-h2-stream h2-done-stream)))
-                          (arm-io :read)
-                          (return)))))))
                (arm-tls-want (want)
                  "Map TLS WANT_* to a single register-io direction (never :read-write)."
                  (arm-io (ecase want
@@ -1486,8 +1349,7 @@
                        (:socks (do-socks))
                        (:http-connect (do-http-connect))
                        (:tls-hs (do-tls-hs))
-                       (:h2-write (do-h2-write))
-                       (:h2-read (do-h2-read))
+                       (:h2 nil)
                        (:write (do-write))
                        (:read (do-read)))
                    (http-error (e) (fail e))
