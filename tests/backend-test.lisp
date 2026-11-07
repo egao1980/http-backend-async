@@ -158,6 +158,47 @@
         (ok (= 1 (length (response-history res))))
         (ok (= 302 (response-status (first (response-history res)))))))))
 
+(defun %one-shot-server (body)
+  "Listener on 127.0.0.1 that answers one request with 200 BODY. → (values port thread)."
+  (let* ((server (usocket:socket-listen "127.0.0.1" 0 :reuseaddress t :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port server))
+         (thread (bt:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (let* ((client (usocket:socket-accept server :element-type '(unsigned-byte 8)))
+                                (stream (usocket:socket-stream client)))
+                           (unwind-protect
+                                (progn
+                                  ;; read the request head
+                                  (loop with tail = 0
+                                        for b = (read-byte stream nil nil)
+                                        while b
+                                        do (setf tail (logand #xffffffff (logior (ash tail 8) b)))
+                                        until (= tail #x0d0a0d0a))
+                                  (write-sequence
+                                   (babel:string-to-octets
+                                    (format nil "HTTP/1.1 200 OK~C~CContent-Length: ~D~C~CConnection: close~C~C~C~C~A"
+                                            #\Return #\Newline (length body) #\Return #\Newline
+                                            #\Return #\Newline #\Return #\Newline body))
+                                   stream)
+                                  (finish-output stream))
+                             (usocket:socket-close client)))
+                      (usocket:socket-close server)))
+                  :name "one-shot origin")))
+    (values port thread)))
+
+(deftest test-redirect-to-another-origin
+  "A redirect to another host:port dials that origin, not the first one."
+  (multiple-value-bind (other-port thread) (%one-shot-server "other")
+    (with-http-fixture ()
+      (with-async-test (eb el hb)
+        (declare (ignore hb))
+        (let ((res (%await-promise (get-async (fixture-url (format nil "/absolute/~D/x" other-port))) eb el)))
+          (ok (= 200 (response-status res)))
+          (ok (equalp (babel:string-to-octets "other") (response-body res)))
+          (ok (= 1 (length (response-history res)))))))
+    (bt:join-thread thread)))
+
 (deftest test-redirect-chain
   (with-http-fixture ()
     (with-async-test (eb el hb)
