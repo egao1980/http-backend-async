@@ -152,6 +152,13 @@
           ((:want-read :want-write) (values nil status))
           (:eof 0))))))
 
+(defun tls-pending-p (session)
+  "True when OpenSSL holds decrypted bytes SSL_read has not returned yet. The
+   socket will not signal them: the record is already off the wire."
+  (let ((handle (and session (tls-session-handle session))))
+    (and handle
+         (plusp (cffi:foreign-funcall "SSL_pending" :pointer handle :int)))))
+
 (defun tls-close (session)
   "Free SSL* without closing the underlying FD (owned by usocket)."
   (when session
