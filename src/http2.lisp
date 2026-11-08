@@ -13,7 +13,8 @@
 ;;; the event loop flushes OUT → TLS and feeds IN from TLS reads.
 ;;; BACKEND-HTTP-VERSIONS for ASYNC-BACKEND is specialized in backend.lisp.
 
-(defvar *http2-loaded* nil)
+(defvar *http2-loaded* nil
+  "T once http2/client loaded, :UNAVAILABLE once it could not be (not retried).")
 (defvar *h2-classes-ready* nil)
 
 (defun ensure-http2 ()
@@ -21,15 +22,29 @@
 
    Load ASDF http2/client (secondary), not the umbrella http2 system.
    CI :with is the registry package http2."
-  (or *http2-loaded*
-      (setf *http2-loaded*
-            (and (or (find-package :http2/client)
-                     (ignore-errors (asdf:load-system "http2/client") t))
-                 t)))
-  (when (and *http2-loaded* (not *h2-classes-ready*))
+  (unless *http2-loaded*
+    (setf *http2-loaded*
+          (if (or (find-package :http2/client)
+                  (ignore-errors (asdf:load-system "http2/client") t))
+              t
+              ;; a failed load is not retried on every request
+              :unavailable)))
+  (when (and (eq *http2-loaded* t) (not *h2-classes-ready*))
     (%ensure-h2-classes)
     (setf *h2-classes-ready* t))
-  *http2-loaded*)
+  (eq *http2-loaded* t))
+
+(declaim (notinline ensure-http2))
+
+(defun alpn-offer (version-pref)
+  "ALPN list for a TLS request preferring VERSION-PREF. :AUTO offers h2 only when
+   http2 loads here: a server that picks h2 from the offer must get an h2 client,
+   not HTTP-VERSION-NOT-AVAILABLE (GHCR picks h2). Forced :HTTP/2 still offers it
+   and fails clearly."
+  (alpn-protocols-for-version
+   (if (and (eq (normalize-http-version version-pref) :auto) (not (ensure-http2)))
+       :http/1.1
+       version-pref)))
 
 (defclass async-h2-stream-hooks ()
   ((on-headers :initform nil :accessor h2-stream-on-headers)

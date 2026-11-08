@@ -1025,7 +1025,7 @@ instead of closing the shared connection.")
                     (setf tls (make-tls-session
                                fd host
                                :verify verify
-                               :alpn-protocols (alpn-protocols-for-version version-pref))
+                               :alpn-protocols (alpn-offer version-pref))
                           (async-request-tls-stream handle) tls
                           phase :tls-hs)
                     (arm-io :write)
