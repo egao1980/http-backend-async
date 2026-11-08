@@ -114,6 +114,12 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
         (tls-read-octets (async-h2-conn-tls mux) buffer)
         (values (socket-recv-octets (async-h2-conn-socket mux) buffer) nil))))
 
+(defgeneric h2-mux-read-pending-p (mux)
+  (:documentation "True when the transport holds octets the socket will not
+   signal (TLS records decrypted but not yet read).")
+  (:method ((mux h2-mux))
+    (tls-pending-p (async-h2-conn-tls mux))))
+
 (defgeneric h2-mux-write (mux octets start end)
   (:documentation "Write OCTETS[START,END). → count, or (values NIL want).")
   (:method ((mux h2-mux) octets start end)
@@ -262,7 +268,11 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
     (h2-mux-pump-bodies mux)
     (cond
       ((h2-mux-queue-out mux) (h2-mux-arm mux :write))
-      ((h2-mux-users mux) (h2-mux-arm mux :read))
+      ((h2-mux-users mux)
+       (h2-mux-arm mux :read)
+       ;; bytes already inside TLS will never make the socket readable
+       (when (h2-mux-read-pending-p mux)
+         (h2-mux-do-read mux)))
       ((eq (h2-mux-state mux) :draining) (h2-mux-close mux))
       (t (h2-mux-disarm mux)))))
 
@@ -291,18 +301,24 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
 (defun %arm-want (mux want)
   (h2-mux-arm mux (ecase want (:want-read :read) (:want-write :write))))
 
-(defun h2-mux-do-write (mux)
+(defun h2-mux-flush-out (mux)
+  "Write the queued output. T when all of it went out; NIL when the socket would
+   block (the mux is then armed for the direction TLS wants)."
   (loop
     (let ((out (h2-mux-out mux)))
       (when (or (null out) (>= (h2-mux-out-pos mux) (length out)))
         (setf (h2-mux-out mux) nil (h2-mux-out-pos mux) 0)
-        (return (h2-mux-kick mux)))
+        (return t))
       (multiple-value-bind (n want)
           (h2-mux-write mux out (h2-mux-out-pos mux) (length out))
         (cond
-          (want (return (%arm-want mux want)))
-          ((or (null n) (zerop n)) (return (h2-mux-arm mux :write)))
+          (want (%arm-want mux want) (return nil))
+          ((or (null n) (zerop n)) (h2-mux-arm mux :write) (return nil))
           (t (incf (h2-mux-out-pos mux) n)))))))
+
+(defun h2-mux-do-write (mux)
+  (when (h2-mux-flush-out mux)
+    (h2-mux-kick mux)))
 
 (defun h2-mux-process (mux)
   "Parse every complete frame buffered on MUX. Stream errors fail only their request;
@@ -356,5 +372,8 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
            (h2-mux-process mux)
            (when (eq (h2-mux-state mux) :dead)
              (return))
-           (when (h2-mux-queue-out mux)
-             (return (h2-mux-do-write mux)))))))))
+           ;; Send WINDOW_UPDATE / SETTINGS ACK now, then keep reading: TLS may
+           ;; hold more records that will not make the socket readable again.
+           (when (and (h2-mux-queue-out mux)
+                      (not (h2-mux-flush-out mux)))
+             (return))))))))

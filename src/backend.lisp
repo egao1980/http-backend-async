@@ -247,6 +247,7 @@ instead of closing the shared connection.")
                (pool-key* (pool-key scheme host port :proxy proxy-url))
                (connect-host host)
                (connect-port port)
+               (previous-pool-key nil)
                (proxied-http-p nil)
                (http-connect-p nil) ; HTTPS via HTTP proxy → CONNECT then TLS
                (proxy-user nil)
@@ -462,7 +463,7 @@ instead of closing the shared connection.")
                      (when (and (not reset) (typep stream 'async-h2-stream-hooks))
                        (ignore-errors (h2-stream-release-window stream)))
                      (h2-mux-stream-done mux stream :reset reset))))
-               (release-or-close (&key (force-close nil))
+               (release-or-close (&key (force-close nil) (key pool-key*))
                  "Return the connection to POOL when it can be reused; else close.
 
                   HTTP/1.1: keep-alive and the response allows reuse. The entry
@@ -483,7 +484,7 @@ instead of closing the shared connection.")
                       (close-connection))
                      (t
                       (let ((conn (detach-connection)))
-                        (pool-release pool pool-key* conn))))))
+                        (pool-release pool key conn))))))
                (complete-request (&key (force-close nil))
                  "Stop IO/timer; pool or close after full response / stream EOF."
                  (unless (async-request-canceled-p handle)
@@ -716,6 +717,8 @@ instead of closing the shared connection.")
                             (multiple-value-bind (m u h b ho po https?)
                                 (prepare-redirect-hop status next method body-octets
                                                       headers cookie-jar ae)
+                              ;; the socket being released belongs to the old origin
+                              (setf previous-pool-key pool-key*)
                               (setf method m
                                     uri u
                                     headers h
@@ -736,13 +739,20 @@ instead of closing the shared connection.")
                                     phase :reconnect
                                     pool-key* (pool-key scheme host port
                                                         :proxy proxy-url))
+                              ;; a direct connection dials the new origin; through a
+                              ;; proxy the target stays the proxy (CONNECT for https)
+                              (if proxy-url
+                                  (setf http-connect-p (and (eq (proxy-kind proxy-url) :http) https)
+                                        proxied-http-p (and (eq (proxy-kind proxy-url) :http) (not https)))
+                                  (setf connect-host host
+                                        connect-port port))
                               (reset-parser)
                               (next-tick
                                (lambda ()
                                  (unless (async-request-canceled-p handle)
                                    ;; Prefer pool release over hard close when
                                    ;; the redirect hop can reuse the socket.
-                                   (release-or-close)
+                                   (release-or-close :key previous-pool-key)
                                    (setf (async-request-canceled-p handle) nil)
                                    (do-connect))))))
                         (http-error (e) (fail e))

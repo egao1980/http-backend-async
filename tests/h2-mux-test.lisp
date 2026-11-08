@@ -374,3 +374,89 @@
     (http-backend-async::h2-mux-on-io mux :ok)
     (ok (eq :dead (http-backend-async::h2-mux-state mux)))
     (ok (equal '("/1" "/2") (sort (mapcar #'car (car errors)) #'string<)))))
+
+;;; TLS-like transport: OpenSSL decrypts whole records and keeps what SSL_read
+;;; did not return, so the socket stops signalling while bytes are still
+;;; readable. READ returns at most 2048 octets; readiness is edge-triggered on
+;;; arrival of new octets (DRIVE-MUX-EDGE), and the leftover is "pending".
+
+(defclass pending-mem-mux (mem-mux)
+  ((fresh :initform nil :accessor pending-mem-mux-fresh)))
+
+(defmethod http-backend-async::h2-mux-read ((mux pending-mem-mux) buffer)
+  (call-next-method mux (make-array (min 2048 (length buffer)) :element-type '(unsigned-byte 8)
+                                                                 :displaced-to buffer)))
+
+(defmethod http-backend-async::h2-mux-read-pending-p ((mux pending-mem-mux))
+  (plusp (length (mem-mux-to-client mux))))
+
+(defun make-pending-mem-pair ()
+  (%ensure-mem-server-classes)
+  (let* ((pump (make-instance 'async-h2-pump-stream))
+         (session (make-async-h2-session
+                   pump :stream-class 'http-backend-async::async-h2-streaming-client-stream))
+         (mux (make-instance 'pending-mem-mux :socket nil :https t :session session :pump pump
+                                              :event-backend nil :event-loop :mem-loop
+                                              :key "mem|h2")))
+    (http-backend-async::h2-mux-kick mux)
+    (%make-mem-pair :mux mux :server (make-instance 'mem-server))))
+
+(defun drive-mux-edge (pair &key (rounds 400))
+  "Like DRIVE-MUX, but a read wakeup happens only when new octets arrive."
+  (let ((mux (mem-pair-mux pair))
+        (server (mem-pair-server pair)))
+    (loop repeat rounds
+          for progress = nil
+          do (when (eq (mem-mux-armed mux) :write)
+               (http-backend-async::h2-mux-on-io mux :ok)
+               (setf progress t))
+             (let ((sent (mem-mux-to-server mux)))
+               (when (plusp (length sent))
+                 (let ((octets (coerce sent '(simple-array (unsigned-byte 8) (*)))))
+                   (setf (fill-pointer sent) 0)
+                   (unless (mem-pair-preface-p pair)
+                     (let ((n (length (symbol-value (%h2c "+CLIENT-PREFACE-START+")))))
+                       (multiple-value-bind (fn need)
+                           (funcall (%h2c "PARSE-CLIENT-PREFACE") server (subseq octets 0 n))
+                         (setf (mem-pair-parse-fn pair) fn
+                               (mem-pair-parse-need pair) need))
+                       (setf octets (subseq octets n)
+                             (mem-pair-preface-p pair) t)))
+                   (%server-feed pair octets)
+                   (setf progress t))))
+             (let ((reply (%server-take server)))
+               (when (plusp (length reply))
+                 (loop for b across reply
+                       do (vector-push-extend b (mem-mux-to-client mux)))
+                 (setf (pending-mem-mux-fresh mux) t
+                       progress t)))
+             (when (and (pending-mem-mux-fresh mux)
+                        (member (mem-mux-armed mux) '(:read :write)))
+               (setf (pending-mem-mux-fresh mux) nil)
+               (http-backend-async::h2-mux-on-io mux :ok)
+               (setf progress t))
+          while progress)))
+
+(deftest h2-mux-reads-what-tls-holds-after-a-write
+  "A large body needs WINDOW_UPDATEs mid-stream; after each write the mux must
+   keep reading bytes TLS already holds, which the socket will not signal."
+  (let* ((pair (make-pending-mem-pair))
+         (results (list nil))
+         (*mem-ended* nil)
+         (body (make-string 200000 :initial-element #\x)))
+    (drive-mux-edge pair)
+    (mem-open pair "/big" results)
+    (drive-mux-edge pair)
+    (let ((server-stream (first *mem-ended*)))
+      (ok server-stream "the server saw the request")
+      (funcall (%h2c "SEND-HEADERS") server-stream '((:status "200")) :end-stream nil)
+      ;; the server's window only allows the first 64 KiB until we credit more
+      (loop for start from 0 below (length body) by 16000
+            do (funcall (%h2c "WRITE-DATA-FRAME") server-stream
+                        (babel:string-to-octets (subseq body start (min (length body) (+ start 16000))))
+                        :end-stream nil))
+      (funcall (%h2c "WRITE-DATA-FRAME") server-stream (babel:string-to-octets "") :end-stream t)
+      (drive-mux-edge pair))
+    (let ((got (cdr (assoc "/big" (car results) :test #'string=))))
+      (ok got "the stream ended")
+      (ok (eql (length got) 200000) "the whole body arrived"))))
