@@ -477,7 +477,7 @@
          (status (parse-integer (funcall get-status h2-stream)))
          (hdrs (%h2-headers-table
                 (%h2-headers-alist (funcall get-headers h2-stream))))
-         (body (or (funcall get-body h2-stream) #())))
+         (body (or (funcall get-body h2-stream) (make-array 0 :element-type '(unsigned-byte 8)))))
     (values status hdrs
             (if (typep body '(vector (unsigned-byte 8)))
                 body

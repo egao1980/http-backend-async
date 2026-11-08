@@ -536,7 +536,8 @@ instead of closing the shared connection.")
                (reset-parser ()
                  (multiple-value-bind (h hd b f p set-body)
                      (make-response-accumulator
-                      :on-headers #'on-response-headers)
+                      :on-headers #'on-response-headers
+                      :no-body-p (string-equal (string method) "HEAD"))
                    (setf http h hdrs hd body b finishedp f parse! p
                          set-body-fn set-body
                          body-feed nil
@@ -1319,7 +1320,8 @@ instead of closing the shared connection.")
                         (when want (arm-tls-want want))
                         (return))
                        ((zerop n)
-                        (funcall parse! #())
+                        ;; EOF: an empty octet vector (fast-http rejects a T vector #())
+                        (funcall parse! (make-array 0 :element-type '(unsigned-byte 8)))
                         (if (funcall finishedp)
                             (finish-response)
                             (fail (make-condition
