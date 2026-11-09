@@ -341,3 +341,36 @@
                                                      :url (fixture-url "/ok")))))
         (ok (= 200 (response-status res)))
         (ok (equalp (babel:string-to-octets "ok") (response-body res)))))))
+
+;;; --- responses without a body (RFC 9110 §6.4.1, §9.3.2) ---
+
+(defun %head-handler (method path headers body)
+  "HEAD /blob → the headers a GET would get (a gzip body of 1234 octets), no body.
+   /no-content → 204 with a stale Content-Length."
+  (declare (ignore headers body))
+  (cond ((string= path "/no-content")
+         (values 204 '(("content-length" . "10"))))
+        ((string-equal method "HEAD")
+         (values 200 '(("content-length" . "1234") ("content-encoding" . "gzip")
+                       ("docker-content-digest" . "sha256:00"))))
+        (t (values 200 '(("content-type" . "text/plain")) (babel:string-to-octets "ok")))))
+
+(deftest-parametrize head-response-ends-with-its-headers
+    ((keep-alive)
+     (nil)
+     ;; a kept-alive connection: waiting for 1234 body octets hung until the
+     ;; timeout (every cl-repo blob push on 0.27.5-0.27.6)
+     (t))
+  (with-http-fixture (#'%head-handler :keep-alive keep-alive)
+    (with-async-test (eb el hb)
+      (declare (ignore hb))
+      (let ((res (%await-promise (head-async (fixture-url "/blob")) eb el :timeout 3.0)))
+        (ok (= 200 (response-status res)))
+        (ok (zerop (length (response-body res))) "no body, nothing decoded")
+        (ok (equal "sha256:00" (response-header res :docker-content-digest))))
+      (let ((res (%await-promise (get-async (fixture-url "/no-content")) eb el :timeout 3.0)))
+        (ok (= 204 (response-status res))))
+      (when keep-alive
+        (let ((res (%await-promise (get-async (fixture-url "/ok")) eb el :timeout 3.0)))
+          (ok (equalp (babel:string-to-octets "ok") (response-body res))
+              "the connection is reusable after a HEAD"))))))

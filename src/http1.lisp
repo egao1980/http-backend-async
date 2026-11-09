@@ -194,7 +194,10 @@
      (let* ((ce (gethash "content-encoding" headers))
             (codings (parse-content-encoding ce)))
        (cond
-         ((or (null decompress) (null codings))
+         ((or (null decompress) (null codings)
+              ;; HEAD, 204 and 304 carry Content-Encoding but no body: there
+              ;; is nothing to decode (gzip of zero octets is "Unexpected EOF")
+              (zerop (length body)))
           (values body headers))
          (t
           (let* ((decoded (decode-content-codings codings body))
@@ -205,8 +208,12 @@
                        n)))
             (values decoded ht))))))))
 
-(defun make-response-accumulator (&key on-headers)
+(defun make-response-accumulator (&key on-headers no-body-p)
   "Return (values http headers-ht body-vector finished-fn parser-fn set-body-fn headers-done-fn).
+
+   NO-BODY-P: the request was HEAD. Its response, like any 204 or 304, ends
+   with the header block (RFC 9110 §6.4.1, §9.3.2) whatever Content-Length
+   says; waiting for that many body octets hung until the timeout.
 
    SET-BODY-FN (fn) replaces the body callback (fn data start end).
    Default body callback accumulates into BODY-VECTOR.
@@ -229,6 +236,9 @@
                                (setf (gethash (string-downcase k) headers) v))
                              h)
                     (setf headers-done t)
+                    (when (or no-body-p
+                              (member (fast-http:http-status http) '(204 304)))
+                      (setf finished t))
                     (when on-headers
                       (funcall on-headers http headers)))
                   :body-callback

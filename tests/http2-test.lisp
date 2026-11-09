@@ -19,6 +19,17 @@
   (ok (equal '(:http/1.1 :http/2)
              (backend-http-versions (make-async-backend)))))
 
+(deftest alpn-offer-without-http2
+  "GHCR picks h2 when offered; without a loadable http2 :AUTO must offer only
+   http/1.1 (cl-repo 0.27.5 publishes failed with \"http2 system not loadable\")."
+  (let ((http-backend-async::*http2-loaded* :unavailable))
+    (ok (equal '("http/1.1") (http-backend-async::alpn-offer :auto)))
+    (ok (equal '("h2" "http/1.1") (http-backend-async::alpn-offer :http/2)))
+    (ok (equal '("http/1.1") (http-backend-async::alpn-offer :http/1.1)))
+    (ok (null (http-backend-async::ensure-http2)) "a failed load is not retried"))
+  (when (http-backend-async::ensure-http2)
+    (ok (equal '("h2" "http/1.1") (http-backend-async::alpn-offer :auto)))))
+
 (deftest http2-streaming-hooks-feed-data
   (let* ((s (make-instance 'async-h2-stream-hooks))
          (got nil))
