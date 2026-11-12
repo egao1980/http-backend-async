@@ -1,5 +1,5 @@
 (defsystem "http-backend-async"
-  :version "0.2.15"
+  :version "0.2.16"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
@@ -15,12 +15,13 @@
                "trivial-gray-streams"
                "cffi"
                "usocket"
-               "cl+ssl")
+               ;; not cl+ssl directly: cl-stack-ssl points cl+ssl at its own
+               ;; OpenSSL before cl+ssl loads (a bare cl+ssl took Homebrew's)
+               "cl-stack-ssl")
   :properties
   (:cl-repo
-   (:ci (:with ("cl-stack-ssl" "http2" "fast-websocket"
+   (:ci (:with ("http2" "fast-websocket"
                 "http-encoding-brotli" "cl-stack-brotli")
-         :load-before-test ("cl+ssl" "cl-stack-ssl")
          :record-versions (("cl-stack-ssl" . "CL_STACK_SSL_VERSION")))))
   :serial t
   :pathname "src"
