@@ -1,15 +1,14 @@
 (in-package #:http-backend-async)
 
-;;; Async TLS via cl+ssl (+ optional cl-stack-ssl overlay).
+;;; Async TLS via cl+ssl, loaded through cl-stack-ssl (its OpenSSL).
 ;;; Socket-BIO on a nonblocking FD; SSL_connect / SSL_read / SSL_write driven
 ;;; by event-protocol:register-io (WANT_READ / WANT_WRITE). Quicklisp cl+ssl
 ;;; has no MemoryBIO — FD BIO + WANT_* is the asyncio-equivalent path.
 
 (defun ensure-tls ()
-  "Load cl-stack-ssl when present, else bare cl+ssl."
-  (or (ignore-errors (asdf:load-system "cl-stack-ssl") t)
-      (asdf:load-system "cl+ssl")
-      t))
+  "TLS is ready: cl-stack-ssl, and through it cl+ssl, load with this system.
+   Kept for callers (CI hooks) that call it before the first request."
+  t)
 
 (defun %verify-arg (verify)
   (cond ((null verify) nil)

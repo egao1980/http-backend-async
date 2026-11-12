@@ -5,7 +5,8 @@
                         ((string= backend "libev") "event-backend-libev")
                         (t (error "Unknown HTTP_ASYNC_EVENT_BACKEND: ~a" backend)))))
   (format t "~&; ci: pre-test event backend ~a~%" backend)
-  (asdf:load-system "cl+ssl")
+  ;; cl-stack-ssl (which loads cl+ssl) first: it points cl+ssl at its own
+  ;; OpenSSL. Loading cl+ssl alone took Homebrew's OpenSSL 4 on macOS.
   (asdf:load-system "cl-stack-ssl")
   (asdf:load-system event-sys)
   (asdf:load-system "http-protocol")
