@@ -28,6 +28,7 @@
                 #:with-event-backend
                 #:with-event-loop-var
                 #:make-event-loop
+                #:close-event-loop
                 #:run
                 #:stop
                 #:defer

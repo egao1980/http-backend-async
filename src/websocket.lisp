@@ -712,7 +712,10 @@
                          (with-event-backend (event-backend)
                            (with-event-loop-var (event-loop)
                              (run event-backend event-loop
-                                  :stop-when-idle nil))))
+                                  :stop-when-idle nil)
+                             ;; RUN returned (the connection stopped it): the
+                             ;; loop is this pump's to release.
+                             (close-event-loop event-backend event-loop))))
                        :name "async-ws-event-loop"))))
               ;; If OWNS-LOOP is NIL, caller must already be pumping the loop
               ;; (do not call blocking CONNECT on the loop thread — deadlock).

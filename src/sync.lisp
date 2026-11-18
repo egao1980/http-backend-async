@@ -7,10 +7,11 @@
   "Run SEND-ASYNC to completion on a fresh/bound event loop. Returns HTTP-RESPONSE.
    :WANT-STREAM T slurps the body on a worker (urllib3 preload_content shape) so the
    event loop can keep feeding until EOF."
-  (multiple-value-bind (event-backend event-loop) (%ensure-event-context)
+  (multiple-value-bind (event-backend event-loop owned-p) (%ensure-event-context)
     (let ((result nil)
           (err nil)
           (done nil)
+          (in-run nil)
           (want-stream-p (http-request-want-stream request)))
       (labels ((finish (res)
                  (setf result res done t)
@@ -36,19 +37,28 @@
                                                :request (response-request res))))
                              :error-callback #'fail)
                      (finish res))))
-        (with-event-backend (event-backend)
-          (with-event-loop-var (event-loop)
-            (send-async
-             backend client request
-             :callback #'on-response
-             :error-callback #'fail)
-            (sleep* event-backend event-loop timeout-seconds
-                    :callback (lambda ()
-                                (unless done
-                                  (fail (make-condition
-                                         'http-timeout-error
-                                         :message "sync await timed out")))))
-            (event-protocol:run event-backend event-loop :stop-when-idle nil))))
+        (unwind-protect
+             (with-event-backend (event-backend)
+               (with-event-loop-var (event-loop)
+                 (send-async
+                  backend client request
+                  :callback #'on-response
+                  :error-callback #'fail)
+                 (sleep* event-backend event-loop timeout-seconds
+                         :callback (lambda ()
+                                     (unless done
+                                       (fail (make-condition
+                                              'http-timeout-error
+                                              :message "sync await timed out")))))
+                 (setf in-run t)
+                 (event-protocol:run event-backend event-loop :stop-when-idle nil)
+                 (setf in-run nil)))
+          ;; A loop made for this call is this call's to release: each open
+          ;; libuv loop keeps a descriptor, so one per SEND exhausted
+          ;; FD_SETSIZE in long-lived clients. Never close it from an unwind
+          ;; out of RUN itself (libuv is mid-iteration there).
+          (when (and owned-p (not in-run))
+            (close-event-loop event-backend event-loop))))
       (when err (error err))
       result)))
 (defun %sleep-retry (seconds)

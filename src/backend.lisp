@@ -173,18 +173,21 @@ instead of closing the shared connection.")
   handle)
 
 (defun %ensure-event-context ()
-  "Return (values event-backend event-loop). Prefer dynamics; else make from *event-backend-maker*."
+  "Return (values event-backend event-loop owned-p). Prefer dynamics; else make
+   a fresh loop from *event-backend-maker*. OWNED-P is true for a fresh loop:
+   the caller runs it and must CLOSE-EVENT-LOOP it when done (a libuv loop
+   holds a kqueue/epoll descriptor until closed)."
   (let ((eb event-protocol:*event-backend*)
         (el event-protocol:*event-loop*))
     (cond
-      ((and eb el) (values eb el))
+      ((and eb el) (values eb el nil))
       (t
        (unless *event-backend-maker*
          (error 'http-error
                 :message "No event loop: bind event-protocol:*event-backend*/*event-loop* or *event-backend-maker*"))
        (let* ((backend (funcall *event-backend-maker*))
               (loop (make-event-loop backend)))
-         (values backend loop))))))
+         (values backend loop t))))))
 
 (defun %timeout-seconds (request client)
   (timeout-total-seconds (effective-timeout request client)))
