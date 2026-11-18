@@ -374,3 +374,40 @@
         (let ((res (%await-promise (get-async (fixture-url "/ok")) eb el :timeout 3.0)))
           (ok (equalp (babel:string-to-octets "ok") (response-body res))
               "the connection is reusable after a HEAD"))))))
+
+;;; --- blocking SEND releases the event loop it made ---
+
+(defun %open-fd-count ()
+  "Open descriptors of this process, or NIL where there is no fd directory."
+  (let ((dir (find-if #'uiop:directory-exists-p '("/proc/self/fd/" "/dev/fd/"))))
+    (when dir
+      (length (uiop:directory* (merge-pathnames "*" dir))))))
+
+(deftest-parametrize sync-send-closes-its-event-loop
+    ((keep-alive)
+     (nil)
+     (t))
+  ;; With no loop bound, each SEND makes one from *EVENT-BACKEND-MAKER*. An
+  ;; unclosed libuv loop keeps a kqueue/epoll descriptor: cl-repo held ~1900
+  ;; descriptors after 39 pulls and SBCL serve-event (FD_SETSIZE) refused the
+  ;; next pipe.
+  (with-http-fixture (nil :keep-alive keep-alive)
+    (with-async-test (eb el hb)
+      (declare (ignore eb el))
+      (let ((event-protocol:*event-backend* nil)
+            (event-protocol:*event-loop* nil)
+            (client (make-http-client hb :timeout (make-http-timeout :total 5))))
+        (flet ((get-ok ()
+                 (send hb client (make-http-request :method :get
+                                                    :url (fixture-url "/ok")))))
+          (get-ok)
+          (let ((before (%open-fd-count)))
+            (dotimes (i 100)
+              (let ((res (get-ok)))
+                (unless (= 200 (response-status res))
+                  (fail "a send failed"))))
+            (let ((after (%open-fd-count)))
+              (if before
+                  (ok (<= after (+ before 8))
+                      (format nil "descriptors ~D -> ~D over 100 sends" before after))
+                  (skip "no fd directory on this platform")))))))))

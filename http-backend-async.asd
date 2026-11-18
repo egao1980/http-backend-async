@@ -1,10 +1,10 @@
 (defsystem "http-backend-async"
-  :version "0.2.16"
+  :version "0.2.17"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "http-protocol" "0.3.9")
-               "event-protocol"
+               (:version "event-protocol" "0.2.2")
                "ws-protocol"
                "http-encoding-chipz"
                "quri"
