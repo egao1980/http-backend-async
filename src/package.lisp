@@ -54,6 +54,8 @@
            #:h2-pool-key
            #:h2-mux
            #:*h2-max-streams-per-connection*
+           #:*h2-stream-wait-timeout*
+           #:*h2-max-stream-waiters*
            #:*h2-mux-count*
            #:h2-mux-peer-max-streams
            #:h2-mux-active-count

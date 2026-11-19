@@ -1,5 +1,5 @@
 (defsystem "http-backend-async"
-  :version "0.2.18"
+  :version "0.2.19"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
