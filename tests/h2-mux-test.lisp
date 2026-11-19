@@ -12,7 +12,35 @@
                                       :adjustable t :fill-pointer 0)
               :accessor mem-mux-to-client)
    (armed :initform nil :accessor mem-mux-armed)
-   (closed :initform nil :accessor mem-mux-closed)))
+   (closed :initform nil :accessor mem-mux-closed)
+   (ticks :initform '() :accessor mem-mux-ticks
+          :documentation "Thunks the mux scheduled, newest first (RUN-TICKS).")
+   (timers :initform '() :accessor mem-mux-timers
+           :documentation "Timer handles (FN) newest first; FN NIL once canceled.")))
+
+(defmethod http-backend-async::h2-mux-schedule ((mux mem-mux) function)
+  (push function (mem-mux-ticks mux)))
+
+(defmethod http-backend-async::h2-mux-start-timer ((mux mem-mux) seconds function)
+  (declare (ignore seconds))
+  (let ((handle (list function)))
+    (push handle (mem-mux-timers mux))
+    handle))
+
+(defmethod http-backend-async::h2-mux-cancel-timer ((mux mem-mux) timer)
+  (when timer (setf (car timer) nil)))
+
+(defun run-ticks (mux)
+  "Run what MUX scheduled, oldest first, including what those runs schedule."
+  (loop while (mem-mux-ticks mux)
+        do (let ((fn (car (last (mem-mux-ticks mux)))))
+             (setf (mem-mux-ticks mux) (butlast (mem-mux-ticks mux)))
+             (funcall fn))))
+
+(defun fire-timers (mux)
+  "Expire every live timer MUX started."
+  (dolist (handle (reverse (shiftf (mem-mux-timers mux) '())))
+    (when (car handle) (funcall (car handle)))))
 
 (defmethod connection-alive-p ((mux mem-mux))
   (http-backend-async::h2-mux-usable-p mux))
@@ -279,6 +307,100 @@
         (mem-open pair "/only" (list nil))
         (ok (null (http-backend-async::acquire-pooled-connection pool "mem" :mem-loop :https t)))
         (ok (eq :open (http-backend-async::h2-mux-state mux)) "busy, not closed"))))
+
+;;; Stream wait (#48): a full connection queues requests for its next stream.
+
+(defmacro with-full-mux ((pair mux pool) &body body)
+  "PAIR's mux at a one-stream peer limit, pooled in POOL, carrying one stream."
+  `(if (null (find-symbol "GET-PEER-MAX-CONCURRENT-STREAMS" :http2/core))
+       (skip "http2 < 2.1.2 does not report SETTINGS_MAX_CONCURRENT_STREAMS")
+       (let* ((*mem-ended* nil)
+              (,pool (make-lru-connection-pool :max-size 4))
+              (,pair (make-mem-pair :max-streams 1 :pool ,pool))
+              (,mux (mem-pair-mux ,pair)))
+         (declare (ignorable ,pool))
+         (warm-up ,pair)
+         ,@body)))
+
+(deftest h2-mux-full-connection-queues-requests-in-order
+  (with-full-mux (pair mux pool)
+    (let ((first-stream (mem-open pair "/1" (list nil)))
+          (got '())
+          (streams '()))
+      (http-backend-async::h2-mux-repool mux)
+      (ok (eq mux (http-backend-async::find-full-h2-mux pool "mem|h2" :mem-loop))
+          "a full mux is found for the origin")
+      (ok (null (http-backend-async::find-full-h2-mux pool "mem|h2" :other-loop))
+          "never for another event loop")
+      (ok (null (http-backend-async::acquire-pooled-connection pool "mem" :mem-loop :https t))
+          "the pool has nothing with a free stream")
+      (flet ((waiter (name)
+               (lambda (m)
+                 (push (cons name m) got)
+                 (when m (push (mem-open pair (format nil "/~(~A~)" name) (list nil))
+                               streams)))))
+        (ok (http-backend-async::h2-mux-wait-for-stream mux (waiter :a)) "queued")
+        (ok (http-backend-async::h2-mux-wait-for-stream mux (waiter :b)) "queued behind")
+        (http-backend-async::h2-mux-stream-done mux first-stream :reset t)
+        (ok (null got) "the stream goes to the waiter on the next tick")
+        (ok (not (http-backend-async::h2-mux-pooled-p mux)) "promised, so not pooled")
+        (ok (not (http-backend-async::h2-mux-has-capacity-p mux)) "the promise holds the slot")
+        (run-ticks mux)
+        (ok (equal (list (cons :a mux)) got) "the oldest waiter got the stream")
+        (ok (= 1 (h2-mux-active-count mux)))
+        (http-backend-async::h2-mux-stream-done mux (pop streams) :reset t)
+        (run-ticks mux)
+        (ok (equal (list (cons :b mux) (cons :a mux)) got) "then the next")
+        (ok (= 1 (h2-mux-peak-streams mux)) "never above the peer's limit")
+        (http-backend-async::h2-mux-stream-done mux (pop streams) :reset t)
+        (run-ticks mux)
+        (ok (http-backend-async::h2-mux-pooled-p mux) "no waiters left: back in the pool")
+        (ok (null (http-backend-async::find-full-h2-mux pool "mem|h2" :mem-loop)))))))
+
+(deftest h2-mux-stream-wait-times-out-and-is-bounded
+  (with-full-mux (pair mux pool)
+    (mem-open pair "/1" (list nil))
+    (let ((got '()))
+      (ok (not (http-backend-async::h2-mux-wait-for-stream mux (lambda (m) m) :timeout nil))
+          "no timeout: do not wait")
+      (let ((*h2-max-stream-waiters* 1))
+        (ok (http-backend-async::h2-mux-wait-for-stream mux (lambda (m) (push m got))))
+        (ok (not (http-backend-async::h2-mux-wait-for-stream mux (lambda (m) m)))
+            "the queue is full: the request dials"))
+      (fire-timers mux)
+      (ok (equal '(nil) got) "a timed-out waiter is told to dial")
+      (ok (null (http-backend-async::h2-mux-waiters mux)) "and leaves the queue"))))
+
+(deftest h2-mux-dying-connection-sends-waiters-to-dial
+  (with-full-mux (pair mux pool)
+    (mem-open pair "/1" (list nil))
+    (http-backend-async::h2-mux-repool mux)
+    (let ((got '()))
+      (http-backend-async::h2-mux-wait-for-stream mux (lambda (m) (push (list :w m) got)))
+      (http-backend-async::h2-mux-close mux)
+      (run-ticks mux)
+      (ok (equal '((:w nil)) got))
+      (ok (null (http-backend-async::find-full-h2-mux pool "mem|h2" :mem-loop))
+          "a closed mux is forgotten")
+      (fire-timers mux)
+      (ok (= 1 (length got)) "a waiter runs once"))))
+
+(deftest h2-mux-canceled-waiter-passes-its-stream-on
+  (with-full-mux (pair mux pool)
+    (let ((first-stream (mem-open pair "/1" (list nil)))
+          (got '()))
+      (http-backend-async::h2-mux-repool mux)
+      ;; :GONE's request was canceled while it waited: it opens nothing
+      (http-backend-async::h2-mux-wait-for-stream mux (lambda (m) (push (cons :gone m) got)))
+      (http-backend-async::h2-mux-wait-for-stream
+       mux (lambda (m)
+             (push (cons :next m) got)
+             (when m (mem-open pair "/next" (list nil)))))
+      (http-backend-async::h2-mux-stream-done mux first-stream :reset t)
+      (run-ticks mux)
+      (ok (equal (list (cons :next mux) (cons :gone mux)) got))
+      (ok (= 1 (h2-mux-active-count mux)))
+      (ok (zerop (http-backend-async::h2-mux-reserved mux))))))
 
 (deftest h2-mux-peer-reset-fails-one-stream
   (let* ((*mem-ended* nil)

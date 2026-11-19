@@ -11,6 +11,11 @@
 ;;; ACQUIRE-POOLED-CONNECTION takes it out, the request opens its stream, and
 ;;; H2-MUX-REPOOL puts it back while capacity remains. A finishing stream re-pools
 ;;; it. Eviction or a loop mismatch drains it: open streams finish, then it closes.
+;;;
+;;; Stream wait (RFC 9113 §5.1.2): a full mux is out of the pool, so a request
+;;; finds it with FIND-FULL-H2-MUX and queues (FIFO, at most *H2-MAX-STREAM-WAITERS*)
+;;; for its next free stream. A freed stream goes to the oldest waiter before the
+;;; pool sees it. A waiter that times out (*H2-STREAM-WAIT-TIMEOUT*) dials.
 
 (defvar *h2-max-streams-per-connection* 100
   "Upper bound on concurrent streams per HTTP/2 connection, below the peer's limit.")
@@ -18,6 +23,18 @@
 (defvar *h2-unknown-peer-max-streams* 1
   "Streams allowed when the http2 library cannot report the peer's
    SETTINGS_MAX_CONCURRENT_STREAMS (http2 < 2.1.2): sequential reuse only.")
+
+(defvar *h2-stream-wait-timeout* 2.0
+  "Seconds a request waits for a stream on a full HTTP/2 connection to its origin
+   before it dials another connection. NIL or 0: dial at once.")
+
+(defvar *h2-max-stream-waiters* 32
+  "Requests that may queue on one full HTTP/2 connection; the next one dials.")
+
+(defstruct (h2-stream-waiter (:constructor make-h2-stream-waiter (fn)))
+  "A request queued for a stream. FN gets the mux (a stream is free for it) or
+   NIL (timed out, or the connection died): dial."
+  fn timer (done nil))
 
 (defstruct (h2-mux-user (:constructor make-h2-mux-user (stream on-error pump-body)))
   "A request's stream on a mux. ON-ERROR (condition) fails the request;
@@ -42,6 +59,10 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
    (pool :initarg :pool :initform nil :accessor h2-mux-pool)
    (key :initarg :key :initform nil :accessor h2-mux-key)
    (pooled-p :initform nil :accessor h2-mux-pooled-p)
+   (waiters :initform '() :accessor h2-mux-waiters
+            :documentation "H2-STREAM-WAITERs, oldest first.")
+   (reserved :initform 0 :accessor h2-mux-reserved
+             :documentation "Free streams promised to waiters not yet run.")
    (peak-streams :initform 0 :accessor h2-mux-peak-streams
                  :documentation "Most streams open at once (diagnostics, tests)."))
   (:documentation "Pooled HTTP/2 connection carrying several concurrent streams."))
@@ -80,7 +101,46 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
 
 (defun h2-mux-has-capacity-p (mux)
   (and (h2-mux-usable-p mux)
-       (< (h2-mux-active-count mux) (h2-mux-peer-max-streams mux))))
+       (< (+ (h2-mux-active-count mux) (h2-mux-reserved mux))
+          (h2-mux-peer-max-streams mux))))
+
+;;; Full muxes by h2 pool key, so a request can wait on one (the pool only
+;;; holds muxes with a free stream). Event loops may run on several threads.
+
+(defvar *h2-full-muxes* (make-hash-table :test #'equal))
+(defvar *h2-full-muxes-lock* (bt:make-lock "h2-full-muxes"))
+
+(defun %h2-track-full (mux)
+  "Record MUX under its key while it is open, pooled and full; forget it otherwise."
+  (let ((key (h2-mux-key mux))
+        (full (and (h2-mux-pool mux)
+                   (h2-mux-usable-p mux)
+                   (not (h2-mux-has-capacity-p mux)))))
+    (when key
+      (bt:with-lock-held (*h2-full-muxes-lock*)
+        (let ((muxes (remove mux (gethash key *h2-full-muxes*))))
+          (when full (push mux muxes))
+          (if muxes
+              (setf (gethash key *h2-full-muxes*) muxes)
+              (remhash key *h2-full-muxes*)))))))
+
+(defun find-full-h2-mux (pool key event-loop)
+  "A full, usable mux of POOL under h2 KEY on EVENT-LOOP with room in its wait
+   queue (the shortest queue), or NIL."
+  (let ((candidates
+          (bt:with-lock-held (*h2-full-muxes-lock*)
+            (copy-list (gethash key *h2-full-muxes*)))))
+    (loop with best = nil
+          for mux in candidates
+          when (and (eq (h2-mux-pool mux) pool)
+                    (eq (async-h2-conn-event-loop mux) event-loop)
+                    (eq (h2-mux-state mux) :open)
+                    (h2-mux-usable-p mux)
+                    (< (length (h2-mux-waiters mux)) *h2-max-stream-waiters*)
+                    (or (null best)
+                        (< (length (h2-mux-waiters mux)) (length (h2-mux-waiters best)))))
+            do (setf best mux)
+          finally (return best))))
 
 (defmethod connection-alive-p ((mux h2-mux))
   (and (h2-mux-usable-p mux)
@@ -91,6 +151,7 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
   "Evicted or refused: stop taking streams; close once the open ones finish."
   (declare (ignore pool))
   (setf (h2-mux-pooled-p mux) nil)
+  (h2-mux-release-waiters mux)
   (if (h2-mux-users mux)
       (when (eq (h2-mux-state mux) :open)
         (setf (h2-mux-state mux) :draining))
@@ -99,6 +160,7 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
 
 (defun h2-mux-repool (mux)
   "Put MUX back in its pool while it can take another stream."
+  (%h2-track-full mux)
   (when (and (h2-mux-pool mux)
              (not (h2-mux-pooled-p mux))
              (h2-mux-has-capacity-p mux))
@@ -126,6 +188,23 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
     (if (async-h2-conn-tls mux)
         (tls-write-octets (async-h2-conn-tls mux) octets start end)
         (values (socket-send-octets (async-h2-conn-socket mux) octets start end) nil))))
+
+(defgeneric h2-mux-schedule (mux function)
+  (:documentation "Call FUNCTION from MUX's event loop soon, not from the caller.")
+  (:method ((mux h2-mux) function)
+    (sleep* (h2-mux-event-backend mux) (async-h2-conn-event-loop mux) 0
+            :callback function)))
+
+(defgeneric h2-mux-start-timer (mux seconds function)
+  (:documentation "Call FUNCTION after SECONDS on MUX's event loop. → a handle.")
+  (:method ((mux h2-mux) seconds function)
+    (sleep* (h2-mux-event-backend mux) (async-h2-conn-event-loop mux) seconds
+            :callback function)))
+
+(defgeneric h2-mux-cancel-timer (mux timer)
+  (:method ((mux h2-mux) timer)
+    (when timer
+      (ignore-errors (cancel (h2-mux-event-backend mux) timer)))))
 
 (defgeneric h2-mux-arm (mux direction)
   (:documentation "Register or update interest in DIRECTION (:read or :write).")
@@ -170,6 +249,9 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
   (unless (eq (h2-mux-state mux) :dead)
     (setf (h2-mux-state mux) :dead
           (h2-mux-pooled-p mux) nil)
+    (%h2-track-full mux)
+    (setf (h2-mux-reserved mux) 0)
+    (h2-mux-release-waiters mux)
     (h2-mux-disarm mux)
     (h2-mux-close-transport mux)
     (setf (async-h2-conn-alive-p mux) nil
@@ -209,14 +291,22 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
 
 (defun h2-mux-stream-done (mux stream &key reset)
   "A request is finished with STREAM: reset it if asked (or still open), then
-   re-pool, drain or idle MUX."
+   hand the stream to a waiter, or re-pool, drain or idle MUX."
   (setf (h2-mux-users mux)
         (remove stream (h2-mux-users mux) :key #'h2-mux-user-stream))
   (unless (eq (h2-mux-state mux) :dead)
     (when reset
       (h2-mux-reset-stream mux stream))
+    (h2-mux-settle mux)))
+
+(defun h2-mux-settle (mux)
+  "After a stream left MUX: grant free streams to waiters, then re-pool, drain
+   or idle it."
+  (unless (eq (h2-mux-state mux) :dead)
+    (h2-mux-grant-waiters mux)
     (cond
       ((and (null (h2-mux-users mux))
+            (zerop (h2-mux-reserved mux))
             (or (not (eq (h2-mux-state mux) :open))
                 (null (h2-mux-pool mux))
                 (not (h2-mux-usable-p mux))))
@@ -224,6 +314,56 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
       (t
        (h2-mux-repool mux)
        (h2-mux-kick mux)))))
+
+(defun h2-mux-wait-for-stream (mux fn &key (timeout *h2-stream-wait-timeout*))
+  "Queue FN for MUX's next free stream. T when queued; NIL (do not wait) when
+   MUX is unusable, its queue is full, or TIMEOUT is NIL/0. FN runs once, from
+   the event loop: with MUX when a stream is free for it, with NIL after
+   TIMEOUT seconds or when MUX dies."
+  (when (and timeout (plusp timeout)
+             (h2-mux-usable-p mux)
+             (< (length (h2-mux-waiters mux)) *h2-max-stream-waiters*))
+    (let ((waiter (make-h2-stream-waiter fn)))
+      (setf (h2-stream-waiter-timer waiter)
+            (h2-mux-start-timer
+             mux timeout
+             (lambda ()
+               (unless (h2-stream-waiter-done waiter)
+                 (setf (h2-stream-waiter-done waiter) t
+                       (h2-mux-waiters mux) (remove waiter (h2-mux-waiters mux)))
+                 (funcall fn nil)))))
+      (setf (h2-mux-waiters mux) (append (h2-mux-waiters mux) (list waiter)))
+      t)))
+
+(defun %h2-take-waiter (mux)
+  (let ((waiter (pop (h2-mux-waiters mux))))
+    (setf (h2-stream-waiter-done waiter) t)
+    (h2-mux-cancel-timer mux (h2-stream-waiter-timer waiter))
+    waiter))
+
+(defun h2-mux-grant-waiters (mux)
+  "Promise each free stream to the oldest waiter; it runs on the next tick. A
+   waiter that no longer wants it (request canceled) passes it on."
+  (loop while (and (h2-mux-waiters mux) (h2-mux-has-capacity-p mux))
+        do (let ((waiter (%h2-take-waiter mux)))
+             (incf (h2-mux-reserved mux))
+             (h2-mux-schedule
+              mux
+              (lambda ()
+                (if (eq (h2-mux-state mux) :dead)
+                    ;; closed since: H2-MUX-CLOSE dropped the promise
+                    (funcall (h2-stream-waiter-fn waiter) nil)
+                    (progn
+                      (decf (h2-mux-reserved mux))
+                      (funcall (h2-stream-waiter-fn waiter)
+                               (and (h2-mux-usable-p mux) mux))
+                      (h2-mux-settle mux))))))))
+
+(defun h2-mux-release-waiters (mux)
+  "MUX takes no more streams: every waiter dials (FN with NIL), on the next tick."
+  (loop while (h2-mux-waiters mux)
+        do (let ((fn (h2-stream-waiter-fn (%h2-take-waiter mux))))
+             (h2-mux-schedule mux (lambda () (funcall fn nil))))))
 
 (defun h2-mux-flush-then-close (mux)
   (let ((pump (async-h2-conn-pump mux)))

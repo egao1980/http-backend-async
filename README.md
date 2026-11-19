@@ -21,8 +21,10 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
 - HTTP/2 over ALPN `h2`, multiplexed: one pooled `h2-mux` per origin and event
   loop carries concurrent requests as streams, up to the peer's
   `SETTINGS_MAX_CONCURRENT_STREAMS` (RFC 9113 §5.1.2) capped by
-  `*h2-max-streams-per-connection*` (100). A full connection leaves the pool
-  and the next request dials; a finished stream puts it back. Needs http2
+  `*h2-max-streams-per-connection*` (100). A full connection leaves the pool;
+  the next request queues (FIFO) for its next free stream, and dials another
+  connection only after `*h2-stream-wait-timeout*` (2 s; NIL dials at once) or
+  when `*h2-max-stream-waiters*` (32) already wait. Needs http2
   ≥ 2.1.2 to read the peer's limit — older http2 reuses one stream at a time.
   Live h2 tests: `HTTP_ASYNC_H2_LIVE=1`
 

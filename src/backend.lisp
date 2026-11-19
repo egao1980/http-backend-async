@@ -287,6 +287,8 @@ instead of closing the shared connection.")
                                           :adjustable t :fill-pointer 0))
                (h2-callback-finished-p nil)
                (h2-req-end-p nil)
+               ;; T once this request queued for a stream on a full mux.
+               (h2-waited-p nil)
                (streamed-response nil))
           (when proxy-url
             (multiple-value-bind (pscheme phost pport puser ppass)
@@ -616,21 +618,42 @@ instead of closing the shared connection.")
                      (:h2 (adopt-pooled-h2 conn))
                      (:http/1.1 (adopt-pooled conn))
                      (t
-                      (handler-case
-                          (multiple-value-bind (usock status)
-                              (tcp-connect-nb connect-host connect-port)
-                            (setf sock usock
-                                  (async-request-socket handle) sock
-                                  fd (socket-fd sock)
-                                  from-pool-p nil
-                                  phase :connecting)
-                            (ecase status
-                              (:connected (on-connected))
-                              (:pending (arm-io :write))))
-                        (http-error (e) (fail e))
-                        (error (e)
-                          (fail (make-condition 'http-connection-error
-                                                :message (princ-to-string e)))))))))
+                      (unless (wait-for-h2-stream)
+                        (dial-origin))))))
+               (wait-for-h2-stream ()
+                 "Every pooled HTTP/2 connection to this origin is full: queue
+                  for a stream on one of them (FIFO, bounded) instead of
+                  dialing. T when queued; the slot or the timeout resumes us.
+                  A request waits at most once, then dials."
+                 (let ((full (and pool (not h2-waited-p)
+                                  (request-may-use-h2-pool-p https version-pref)
+                                  (find-full-h2-mux pool (h2-pool-key pool-key*)
+                                                    event-loop))))
+                   (when (and full
+                              (h2-mux-wait-for-stream
+                               full
+                               (lambda (mux)
+                                 (unless (async-request-canceled-p handle)
+                                   (if mux
+                                       (adopt-pooled-h2 mux)
+                                       (do-connect))))))
+                     (setf h2-waited-p t))))
+               (dial-origin ()
+                 (handler-case
+                     (multiple-value-bind (usock status)
+                         (tcp-connect-nb connect-host connect-port)
+                       (setf sock usock
+                             (async-request-socket handle) sock
+                             fd (socket-fd sock)
+                             from-pool-p nil
+                             phase :connecting)
+                       (ecase status
+                         (:connected (on-connected))
+                         (:pending (arm-io :write))))
+                   (http-error (e) (fail e))
+                   (error (e)
+                     (fail (make-condition 'http-connection-error
+                                           :message (princ-to-string e))))))
                (fail (condition)
                  ;; After COMPLETE-REQUEST a late error (e.g. a stray ARM-IO
                  ;; from the reader thread) must not poison a body that was
