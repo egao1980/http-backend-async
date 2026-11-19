@@ -292,11 +292,24 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
 (defun %h2-condition-message (condition)
   "Text for CONDITION. http2 conditions are named, not printed: some of their
    report functions read unbound slots (memory fault under safety 0)."
-  (let ((pkg (symbol-package (type-of condition))))
-    (if (and pkg (search "HTTP2" (package-name pkg)))
-        (format nil "HTTP/2 ~(~A~)" (type-of condition))
-        (or (ignore-errors (princ-to-string condition))
-            (format nil "~(~A~)" (type-of condition))))))
+  (let ((pkg (symbol-package (type-of condition)))
+        (inner (%h2-inner-error condition)))
+    (cond
+      ((and pkg (search "HTTP2" (package-name pkg)) inner)
+       ;; DECOMPRESSION-FAILED wraps whatever broke inside the header block
+       (format nil "HTTP/2 ~(~A~): ~A" (type-of condition) (%h2-condition-message inner)))
+      ((and pkg (search "HTTP2" (package-name pkg)))
+       (format nil "HTTP/2 ~(~A~)" (type-of condition)))
+      (t
+       (or (ignore-errors (princ-to-string condition))
+           (format nil "~(~A~)" (type-of condition)))))))
+
+(defun %h2-inner-error (condition)
+  "The error an http2 condition wraps (DECOMPRESSION-FAILED :INTERNAL-ERROR), or NIL."
+  (let ((reader (find-symbol "GET-INTERNAL-ERROR" :http2/core)))
+    (and reader (fboundp reader)
+         (let ((inner (ignore-errors (funcall reader condition))))
+           (and (typep inner 'condition) (not (eq inner condition)) inner)))))
 
 (defun %arm-want (mux want)
   (h2-mux-arm mux (ecase want (:want-read :read) (:want-write :write))))
