@@ -215,3 +215,13 @@
              (res (send backend client req)))
         (ok (member (response-http-version res) '(:http/1.1 :http/2) :test #'eq))
         (ok (<= 200 (response-status res) 399))))))
+
+(deftest h2-condition-message-names-the-inner-error
+  "DECOMPRESSION-FAILED says what broke inside the header block (CI once showed
+   only the wrapper; the cause was HEADER-STRING-TOO-LONG)."
+  (ensure-http2)
+  (let ((c (make-condition (find-symbol "DECOMPRESSION-FAILED" :http2/core)
+                           :internal-error (make-condition 'simple-error
+                                                           :format-control "boom"))))
+    (ok (equal "HTTP/2 decompression-failed: boom"
+               (http-backend-async::%h2-condition-message c)))))

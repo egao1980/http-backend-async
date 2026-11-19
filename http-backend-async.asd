@@ -1,5 +1,5 @@
 (defsystem "http-backend-async"
-  :version "0.2.17"
+  :version "0.2.18"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
@@ -22,6 +22,12 @@
   (:cl-repo
    (:ci (:with ("http2" "fast-websocket"
                 "http-encoding-brotli" "cl-stack-brotli")
+         ;; The event backend is a matrix choice: a local `cl-repo test`
+         ;; installs and loads the same one CI does.
+         :env (("HTTP_ASYNC_EVENT_BACKEND" :default "libuv"
+                :install t :load-before-test t
+                :systems (("libuv" "event-backend-libuv")
+                          ("libev" "event-backend-libev"))))
          :record-versions (("cl-stack-ssl" . "CL_STACK_SSL_VERSION")))))
   :serial t
   :pathname "src"
