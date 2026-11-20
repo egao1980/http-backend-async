@@ -17,12 +17,30 @@
   (declare (ignore backend))
   '(:http/1.1 :http/2))
 
+(defvar *soft-encodings-tried* nil
+  "T once MAKE-ASYNC-BACKEND has tried the optional encoding systems.")
+
+(defparameter +soft-encoding-systems+ '("http-encoding-brotli" "http-encoding-zstd")
+  "Optional content-encoding systems MAKE-ASYNC-BACKEND loads when installed.")
+
+(defun %load-soft-encodings ()
+  "Load each of +SOFT-ENCODING-SYSTEMS+ that is installed and not yet loaded,
+once per image. An absent or broken system is skipped. Later calls do not
+touch ASDF, so making a backend inside a running operation (a test-op, a
+program) gives no recursive-operate warnings."
+  (unless *soft-encodings-tried*
+    (setf *soft-encodings-tried* t)
+    (dolist (name +soft-encoding-systems+)
+      (unless (asdf:component-loaded-p name)
+        (ignore-errors
+         (when (asdf:find-system name nil)
+           (asdf:load-system name)))))))
+
 (defun make-async-backend ()
-  "Load chipz encoding (+ soft br/zstd/TLS) and return ASYNC-BACKEND."
-  (asdf:load-system "http-encoding-chipz")
-  (ignore-errors (asdf:load-system "http-encoding-brotli"))
-  (ignore-errors (asdf:load-system "http-encoding-zstd"))
-  (ignore-errors (ensure-tls))
+  "→ a new ASYNC-BACKEND. chipz (gzip / deflate) and TLS load with this system;
+brotli and zstd are loaded the first time, when installed (see
+%LOAD-SOFT-ENCODINGS). Cheap to call per request."
+  (%load-soft-encodings)
   (make-instance 'async-backend))
 
 (defclass async-pooled-connection ()

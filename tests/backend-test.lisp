@@ -411,3 +411,17 @@
                   (ok (<= after (+ before 8))
                       (format nil "descriptors ~D -> ~D over 100 sends" before after))
                   (skip "no fd directory on this platform")))))))))
+
+(deftest test-make-async-backend-touches-asdf-once
+  "#52: after the first call, MAKE-ASYNC-BACKEND does not call ASDF again."
+  (http-backend-async::make-async-backend)
+  (ok (eq t http-backend-async::*soft-encodings-tried*))
+  (let ((calls 0))
+    #+sbcl (sb-int:encapsulate 'asdf:operate 'count-calls
+                               (lambda (f &rest args) (incf calls) (apply f args)))
+    (unwind-protect
+         (dotimes (i 3)
+           (ok (typep (http-backend-async::make-async-backend)
+                      'http-backend-async::async-backend)))
+      #+sbcl (sb-int:unencapsulate 'asdf:operate 'count-calls))
+    (ok (zerop calls))))
