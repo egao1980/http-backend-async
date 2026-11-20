@@ -79,7 +79,10 @@ brotli and zstd are loaded the first time, when installed (see
   (and (async-conn-alive-p c)
        (async-conn-socket c)
        (not (async-conn-idle-expired-p c))
-       (ignore-errors (usocket:socket (async-conn-socket c)))))
+       (ignore-errors (usocket:socket (async-conn-socket c)))
+       ;; cleartext only: probing a TLS socket would eat its records
+       (or (async-conn-tls c)
+           (socket-idle-open-p (async-conn-socket c)))))
 
 (defmethod pool-discard ((pool lru-connection-pool) (c async-pooled-connection))
   (declare (ignore pool))
@@ -1489,7 +1492,12 @@ instead of closing the shared connection.")
                        (:h2 nil)
                        (:write (do-write))
                        (:read (do-read)))
-                   (http-error (e) (fail e))
+                   (http-error (e)
+                     (if (and (typep e 'http-connection-error)
+                              (member phase '(:write :read))
+                              (stale-pooled-p))
+                         (retry-on-fresh-connection)
+                         (fail e)))
                    (serious-condition (e)
                      ;; ECONNRESET / EPIPE on a pooled socket the server
                      ;; already closed: same as EOF before the response.

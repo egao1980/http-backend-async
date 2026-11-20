@@ -74,8 +74,9 @@
           (ok (= 2 *fixture-request-count*))
           (pool-clear pool))))))
 
-(deftest stale-pooled-post-is-not-replayed
-  "POST is not idempotent: on a stale pooled socket it fails, it is not sent twice."
+(deftest stale-pooled-socket-is-dropped-before-post
+  "Before reuse, an idle cleartext socket is probed: the server's close shows
+   as EOF, so the POST goes out once, on a new connection."
   (let ((http-protocol:*default-connection-pool* nil))
     (with-http-fixture ((%lmstudio-models-handler 5)
                         :keep-alive :close-after-response)
@@ -86,12 +87,13 @@
                       (%await-promise
                        (get-async (fixture-url "/v1/models") :client client)
                        eb el))))
-          (ok (signals (%await-promise
-                        (post-async (fixture-url "/v1/chat") :client client
-                                                              :content "{}")
-                        eb el)
-                       'http-error))
-          (ok (= 1 *fixture-request-count*))
+          (ok (= 200 (response-status
+                      (%await-promise
+                       (post-async (fixture-url "/v1/chat") :client client
+                                                             :content "{}")
+                       eb el))))
+          (ok (= 2 *fixture-accept-count*))
+          (ok (= 2 *fixture-request-count*))
           (pool-clear pool))))))
 
 (deftest keep-alive-timeout-retires-idle-connection
@@ -112,3 +114,51 @@
                        eb el))))
           (ok (= 2 *fixture-accept-count*))
           (pool-clear pool))))))
+
+;;; Without the probe (it can miss a close that races the request, and it
+;;; skips TLS sockets) the request itself reads EOF on the stale socket.
+
+(defmacro %without-probe-unless-windows (&body body)
+  ;; Windows SBCL can report recv's -1 (WSAECONNRESET) as a huge count, which
+  ;; reads as would-block: the reset socket then never ends the request.
+  #+(or windows win32) `(progn (skip "stale-socket retry: Windows recv hides ECONNRESET") nil)
+  #-(or windows win32)
+  `(let ((http-backend-async::*probe-idle-sockets* nil)) ,@body))
+
+(deftest stale-pooled-get-is-replayed
+  (%without-probe-unless-windows
+    (let ((http-protocol:*default-connection-pool* nil))
+      (with-http-fixture ((%lmstudio-models-handler 5)
+                          :keep-alive :close-after-response)
+        (with-async-test (eb el hb)
+          (let* ((pool (make-lru-connection-pool :max-size 4))
+                 (client (make-http-client hb :pool pool)))
+            (dotimes (i 2)
+              (let ((res (%await-promise
+                          (get-async (fixture-url "/v1/models") :client client)
+                          eb el)))
+                (ok (= 200 (response-status res)))))
+            (ok (= 2 *fixture-accept-count*))
+            (ok (= 2 *fixture-request-count*))
+            (pool-clear pool)))))))
+
+(deftest stale-pooled-post-is-not-replayed
+  "POST is not idempotent: on a stale socket it fails; it is not sent twice."
+  (%without-probe-unless-windows
+    (let ((http-protocol:*default-connection-pool* nil))
+      (with-http-fixture ((%lmstudio-models-handler 5)
+                          :keep-alive :close-after-response)
+        (with-async-test (eb el hb)
+          (let* ((pool (make-lru-connection-pool :max-size 4))
+                 (client (make-http-client hb :pool pool)))
+            (ok (= 200 (response-status
+                        (%await-promise
+                         (get-async (fixture-url "/v1/models") :client client)
+                         eb el))))
+            (ok (signals (%await-promise
+                          (post-async (fixture-url "/v1/chat") :client client
+                                                                :content "{}")
+                          eb el)
+                         'http-error))
+            (ok (= 1 *fixture-request-count*))
+            (pool-clear pool)))))))
