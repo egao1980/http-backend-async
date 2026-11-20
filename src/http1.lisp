@@ -20,7 +20,9 @@
                     (string (if (consp pair) (car pair) pair)))
         for value = (if (consp pair) (cdr pair) nil)
         when value
-          collect (cons name (if (stringp value) value (princ-to-string value)))))
+          collect (cons name (if (or (stringp value) (secret-p value))
+                                 value
+                                 (princ-to-string value)))))
 
 (defun %merge-headers (client-headers request-headers)
   (append (%header-alist client-headers)
@@ -74,7 +76,7 @@
       (emit-line (format nil "CONNECT ~A HTTP/1.1" authority))
       (emit-line (format nil "Host: ~A" authority))
       (when proxy-authorization
-        (emit-line (format nil "Proxy-Authorization: ~A" proxy-authorization)))
+        (emit-line (format nil "Proxy-Authorization: ~A" (reveal proxy-authorization))))
       (emit crlf)
       (coerce out '(simple-array (unsigned-byte 8) (*))))))
 
@@ -128,7 +130,7 @@
                (emit crlf)))
       (emit-line (format nil "~A ~A HTTP/1.1" (%method-string method) target))
       (dolist (h headers)
-        (emit-line (format nil "~A: ~A" (car h) (cdr h))))
+        (emit-line (format nil "~A: ~A" (car h) (reveal (cdr h)))))
       (cond
         (chunked-p
          (unless (assoc "transfer-encoding" headers :test #'string-equal)

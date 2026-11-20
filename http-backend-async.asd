@@ -1,9 +1,9 @@
 (defsystem "http-backend-async"
-  :version "0.2.20"
+  :version "0.2.21"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "http-protocol" "0.3.9")
+  :depends-on ((:version "http-protocol" "0.4.0")
                (:version "event-protocol" "0.2.2")
                "ws-protocol"
                "http-encoding-chipz"
@@ -47,12 +47,15 @@
   :in-order-to ((test-op (test-op "http-backend-async/tests"))))
 
 (defsystem "http-backend-async/tests"
-  :depends-on ("http-backend-async" "rove" "bordeaux-threads" "usocket" "ws-protocol")
+  :depends-on ("http-backend-async" "rove" "bordeaux-threads" "usocket" "ws-protocol"
+               "trivial-gray-streams")
   :pathname "tests"
   :serial t
   :components ((:file "package")
                (:file "fixture")
                (:file "pool-test")
+               (:file "keep-alive-test")
+               (:file "redact-test")
                (:file "proxy-test")
                (:file "socks-test")
                (:file "backend-test")
