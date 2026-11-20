@@ -12,6 +12,11 @@
   ()
   (:default-initargs :name "async"))
 
+(defmethod backend-keeps-secrets-p ((backend async-backend))
+  "SECRET header values stay wrapped until the request octets are built (#54)."
+  (declare (ignore backend))
+  t)
+
 (defmethod backend-http-versions ((backend async-backend))
   "RFC 9112 + RFC 9113 (ALPN h2). Cleartext h2c = not yet."
   (declare (ignore backend))
@@ -47,18 +52,37 @@ brotli and zstd are loaded the first time, when installed (see
   ((socket :initarg :socket :accessor async-conn-socket)
    (tls :initarg :tls :accessor async-conn-tls :initform nil)
    (https :initarg :https :accessor async-conn-https-p :initform nil)
-   (alive :initform t :accessor async-conn-alive-p)))
+   (alive :initform t :accessor async-conn-alive-p)
+   (idle-timeout :initarg :idle-timeout :accessor async-conn-idle-timeout
+                 :initform nil
+                 :documentation "Seconds the server keeps the idle connection
+(Keep-Alive: timeout=N), or NIL when it did not say.")
+   (idle-since :initform (get-internal-real-time) :accessor async-conn-idle-since)))
 
-(defun make-async-pooled-connection (socket &key tls https)
+(defun make-async-pooled-connection (socket &key tls https idle-timeout)
   (make-instance 'async-pooled-connection
-                 :socket socket :tls tls :https https))
+                 :socket socket :tls tls :https https
+                 :idle-timeout idle-timeout))
+
+(defun async-conn-idle-expired-p (c)
+  "T when C sat idle past (most of) the server's Keep-Alive timeout: the
+   server closes it about then, and a request written to it reads EOF."
+  (let ((limit (async-conn-idle-timeout c)))
+    (and limit
+         (>= (/ (- (get-internal-real-time) (async-conn-idle-since c))
+                internal-time-units-per-second)
+             (keep-alive-reuse-limit limit)))))
 
 (defmethod connection-alive-p ((c async-pooled-connection))
   "Alive if we still hold a usocket. Avoid probing the Lisp stream — on Windows
    stream/socket-receive mixing breaks keep-alive reuse (INVALID-VERSION)."
   (and (async-conn-alive-p c)
        (async-conn-socket c)
-       (ignore-errors (usocket:socket (async-conn-socket c)))))
+       (not (async-conn-idle-expired-p c))
+       (ignore-errors (usocket:socket (async-conn-socket c)))
+       ;; cleartext only: probing a TLS socket would eat its records
+       (or (async-conn-tls c)
+           (socket-idle-open-p (async-conn-socket c)))))
 
 (defmethod pool-discard ((pool lru-connection-pool) (c async-pooled-connection))
   (declare (ignore pool))
@@ -292,6 +316,12 @@ instead of closing the shared connection.")
                (keep-alive-p (not (null pool)))
                (reuse-ok-p nil)
                (from-pool-p nil)
+               ;; Stale keep-alive (#55): the request octets, kept for one
+               ;; replay on a fresh socket when a pooled one reads EOF before
+               ;; any response octet.
+               (replay-octets nil)
+               (response-octets-seen 0)
+               (stale-retried-p nil)
                (version-pref (effective-http-version client request))
                (negotiated-version :http/1.1)
                ;; The H2-MUX carrying this request's stream. The mux owns the
@@ -335,8 +365,9 @@ instead of closing the shared connection.")
                         :message "SOCKS4 not implemented; use socks5:// or socks5h://")))))
           (labels
               ((build-headers-and-body ()
-                 (setf headers (%merge-headers (http-client-headers client)
-                                               (http-request-headers request)))
+                 (setf headers (%merge-headers
+                                (protect-headers (http-client-headers client))
+                                (protect-headers (http-request-headers request))))
                  (setf headers (inject-auth-range-headers
                                 headers
                                 :auth (effective-auth client request)
@@ -359,9 +390,12 @@ instead of closing the shared connection.")
                                         :test #'string-equal)))
                    (let ((v (proxy-authorization-value proxy-user proxy-pass)))
                      (when v
-                       (setf headers (acons "proxy-authorization" v headers)))))
+                       (setf headers (acons "proxy-authorization" (make-secret v) headers)))))
                  (setf headers (inject-cookie-header headers cookie-jar
                                                      (quri:render-uri uri)))
+                 ;; Credentials travel as SECRETs: frames and conditions below
+                 ;; print them redacted; the wire step REVEALs them (#54).
+                 (setf headers (protect-headers headers))
                  (multiple-value-bind (content extra-headers content-length)
                      (%prepare-body request)
                    (dolist (pair extra-headers)
@@ -461,11 +495,55 @@ instead of closing the shared connection.")
                        fd nil
                        from-pool-p nil
                        reuse-ok-p nil))
+               (stale-pooled-p ()
+                 "T when this HTTP/1.1 request went out on a pooled socket, no
+                  response octet came back, and it may be sent again: the
+                  server closed the idle connection (Keep-Alive timeout)
+                  before it read the request. Only idempotent methods with a
+                  replayable body (RFC 9110 §9.2.2), and only once."
+                 (and from-pool-p
+                      (not stale-retried-p)
+                      (null h2-mux)
+                      (zerop response-octets-seen)
+                      (not stream-body-p)
+                      (or replay-octets req-octets)
+                      (member (string-upcase (string method))
+                              '("GET" "HEAD" "OPTIONS" "TRACE" "PUT" "DELETE")
+                              :test #'string=)))
+               (retry-on-fresh-connection ()
+                 "Drop the stale pooled socket and send the request again on a
+                  new connection. The request timer keeps running."
+                 (let ((octets (or replay-octets req-octets)))
+                   (when-let ((io (async-request-io-handle handle)))
+                     (ignore-errors (cancel event-backend io))
+                     (setf (async-request-io-handle handle) nil))
+                   (setf io-dir nil
+                         io-cell nil)
+                   (ignore-errors (tls-close tls))
+                   (ignore-errors (close-socket sock))
+                   (setf tls nil
+                         (async-request-tls-stream handle) nil
+                         sock nil
+                         (async-request-socket handle) nil
+                         fd nil
+                         from-pool-p nil
+                         stale-retried-p t
+                         req-octets octets
+                         replay-octets nil
+                         wpos 0
+                         response-octets-seen 0
+                         phase :reconnect)
+                   (reset-parser)
+                   (next-tick
+                    (lambda ()
+                      (unless (async-request-canceled-p handle)
+                        (dial-origin))))))
                (detach-connection ()
                  "Hand socket/TLS to an HTTP/1.1 pool entry without closing."
                  (stop-io-and-timer)
                  (let ((conn (make-async-pooled-connection
-                              sock :tls tls :https https)))
+                              sock :tls tls :https https
+                              :idle-timeout (keep-alive-timeout hdrs))))
                    (setf sock nil
                          tls nil
                          fd nil
@@ -1260,8 +1338,9 @@ instead of closing the shared connection.")
                           connect-out (build-connect-request-octets
                                        host port
                                        :proxy-authorization
-                                       (proxy-authorization-value
-                                        proxy-user proxy-pass))
+                                       (make-secret
+                                        (proxy-authorization-value
+                                         proxy-user proxy-pass)))
                           connect-wpos 0
                           (fill-pointer connect-in) 0)
                     (arm-io :write)
@@ -1310,6 +1389,7 @@ instead of closing the shared connection.")
                           ((not done) (return))
                           ((not stream-body-p)
                            (setf phase :read
+                                 replay-octets req-octets
                                  req-octets nil)
                            (arm-io :read)
                            (return))
@@ -1363,6 +1443,9 @@ instead of closing the shared connection.")
                        ((null n)
                         (when want (arm-tls-want want))
                         (return))
+                       ((and (zerop n) (stale-pooled-p))
+                        (retry-on-fresh-connection)
+                        (return))
                        ((zerop n)
                         ;; EOF: an empty octet vector (fast-http rejects a T vector #())
                         (funcall parse! (make-array 0 :element-type '(unsigned-byte 8)))
@@ -1373,6 +1456,7 @@ instead of closing the shared connection.")
                                    :message "incomplete HTTP response")))
                         (return))
                        (t
+                        (incf response-octets-seen n)
                         (when (handler-case
                                   (funcall parse! recv-buf :end n)
                                 (error (e)
@@ -1408,11 +1492,20 @@ instead of closing the shared connection.")
                        (:h2 nil)
                        (:write (do-write))
                        (:read (do-read)))
-                   (http-error (e) (fail e))
+                   (http-error (e)
+                     (if (and (typep e 'http-connection-error)
+                              (member phase '(:write :read))
+                              (stale-pooled-p))
+                         (retry-on-fresh-connection)
+                         (fail e)))
                    (serious-condition (e)
-                     (fail (make-condition
-                            (if https 'http-tls-error 'http-connection-error)
-                            :message (princ-to-string e)))))))
+                     ;; ECONNRESET / EPIPE on a pooled socket the server
+                     ;; already closed: same as EOF before the response.
+                     (if (and (member phase '(:write :read)) (stale-pooled-p))
+                         (retry-on-fresh-connection)
+                         (fail (make-condition
+                                (if https 'http-tls-error 'http-connection-error)
+                                :message (princ-to-string e))))))))
             ;; RFC 9113 h2c prior-knowledge is P2 — fail before TCP.
             (when (and (not https) (eq version-pref :http/2))
               (error 'http-version-not-available

@@ -121,3 +121,19 @@
                       http-version
                       (ignore-errors (read-from-string (string http-version))))))
            (and v (>= (float v 1.0d0) 1.1d0)))))))
+
+(defun keep-alive-timeout (headers)
+  "Seconds from a Keep-Alive: timeout=N response header (RFC 2068 §19.7.1.1),
+   or NIL. HEADERS is the response's EQUAL hash-table (lowercase keys)."
+  (let ((raw (and (hash-table-p headers) (gethash "keep-alive" headers))))
+    (when (stringp raw)
+      (let ((pos (search "timeout=" raw :test #'char-equal)))
+        (when pos
+          (let ((n (parse-integer raw :start (+ pos 8) :junk-allowed t)))
+            (and n (plusp n) n)))))))
+
+(defun keep-alive-reuse-limit (timeout)
+  "Idle seconds after which a connection the server keeps for TIMEOUT seconds
+   is no longer reused: one second early (half the time for short timeouts),
+   so the request does not race the server's close."
+  (max (/ timeout 2) (- timeout 1)))

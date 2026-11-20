@@ -10,7 +10,8 @@
 (defvar *fixture-last-request-target* nil
   "Raw request-target from the last fixture request (origin- or absolute-form).")
 (defvar *fixture-keep-alive* nil
-  "When T, respond with Connection: keep-alive and accept pipelined/reuse.")
+  "When T, respond with Connection: keep-alive and accept pipelined/reuse.
+   :CLOSE-AFTER-RESPONSE: say keep-alive, then close after each response.")
 (defvar *fixture-accept-count* 0
   "Number of accepted TCP clients (for connection-pool reuse tests).")
 (defvar *fixture-request-count* 0
@@ -313,7 +314,12 @@
                           (let ((stream (usocket:socket-stream client)))
                             (loop
                               (unless (%serve-one stream) (return))
-                              (unless *fixture-keep-alive* (return))))
+                              (unless *fixture-keep-alive* (return))
+                              ;; :close-after-response says keep-alive but
+                              ;; hangs up, as a server whose idle timeout
+                              ;; fired does (#55)
+                              (when (eq *fixture-keep-alive* :close-after-response)
+                                (return))))
                        (ignore-errors (usocket:socket-close client))))
                  (error ()
                    (when (null *fixture-socket*) (return))))))

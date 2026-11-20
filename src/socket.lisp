@@ -329,3 +329,20 @@ Returns NIL if connect still pending (spurious wakeup)."
 (defun close-socket (usock)
   (when usock
     (ignore-errors (usocket:socket-close usock))))
+
+(defvar *probe-idle-sockets* t
+  "When T, SOCKET-IDLE-OPEN-P probes a pooled cleartext socket before reuse.
+   Tests bind it to NIL to exercise the stale-socket retry.")
+
+(defun socket-idle-open-p (usock)
+  "T when idle USOCK still looks open: a nonblocking recv would block.
+   EOF (the peer closed it, e.g. its keep-alive timeout fired), stray octets
+   or an error mean it must not carry another request. Raw (SBCL)
+   socket-receive only -- the stream fallback would block -- and never on a
+   TLS socket, whose records the probe would consume."
+  (if (or (not *probe-idle-sockets*)
+          (null (%soft :sb-bsd-sockets "SOCKET-RECEIVE")))
+      t
+      (let ((probe (make-array 1 :element-type '(unsigned-byte 8))))
+        (handler-case (null (socket-recv-octets usock probe))
+          (error () nil)))))

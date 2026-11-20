@@ -1,0 +1,164 @@
+(in-package #:http-backend-async/tests)
+
+;;; #55: LM Studio (Express) answers GET /v1/models with Content-Length framing,
+;;; Connection: keep-alive and Keep-Alive: timeout=5, then closes the idle
+;;; socket after 5 s. The next request on the pooled socket read EOF before any
+;;; response octet: "incomplete HTTP response".
+
+(defparameter +lmstudio-models-body+
+  (babel:string-to-octets
+   "{
+  \"data\": [
+    {
+      \"id\": \"qwen3.5-2b\",
+      \"object\": \"model\",
+      \"owned_by\": \"organization_owner\"
+    }
+  ],
+  \"object\": \"list\"
+}"))
+
+(defun %lmstudio-models-handler (keep-alive-timeout)
+  "Response head as LM Studio sends it (captured with curl -sv)."
+  (lambda (method path headers body)
+    (declare (ignore method path headers body))
+    (values 200
+            `(("X-Powered-By" . "Express")
+              ("Content-Type" . "application/json; charset=utf-8")
+              ("Content-Length" . ,(princ-to-string
+                                    (length +lmstudio-models-body+)))
+              ("ETag" . "W/\"26a-3gTbltnD7QTQdmN+U+MOBsnxyg8\"")
+              ("Date" . "Fri, 20 Nov 2026 10:25:34 GMT")
+              ("Keep-Alive" . ,(format nil "timeout=~D" keep-alive-timeout)))
+            +lmstudio-models-body+)))
+
+(deftest keep-alive-timeout-header
+  (let ((ht (make-hash-table :test #'equal)))
+    (ok (null (http-backend-async::keep-alive-timeout ht)))
+    (setf (gethash "keep-alive" ht) "timeout=5")
+    (ok (eql 5 (http-backend-async::keep-alive-timeout ht)))
+    (setf (gethash "keep-alive" ht) "timeout=60, max=100")
+    (ok (eql 60 (http-backend-async::keep-alive-timeout ht)))
+    (setf (gethash "keep-alive" ht) "max=100")
+    (ok (null (http-backend-async::keep-alive-timeout ht))))
+  (ok (= 4 (http-backend-async::keep-alive-reuse-limit 5)))
+  (ok (= 1/2 (http-backend-async::keep-alive-reuse-limit 1))))
+
+(deftest pooled-connection-expires-after-keep-alive-timeout
+  (let ((c (http-backend-async::make-async-pooled-connection nil :idle-timeout 5)))
+    (ok (not (http-backend-async::async-conn-idle-expired-p c)))
+    (decf (http-backend-async::async-conn-idle-since c)
+          (* 5 internal-time-units-per-second))
+    (ok (http-backend-async::async-conn-idle-expired-p c)))
+  (let ((c (http-backend-async::make-async-pooled-connection nil)))
+    (decf (http-backend-async::async-conn-idle-since c)
+          (* 3600 internal-time-units-per-second))
+    (ok (not (http-backend-async::async-conn-idle-expired-p c)))))
+
+(deftest stale-pooled-connection-is-redialed
+  "The server says keep-alive, then hangs up (its idle timeout fired): the
+   second GET reads EOF on the pooled socket and is sent again on a new one."
+  (let ((http-protocol:*default-connection-pool* nil))
+    (with-http-fixture ((%lmstudio-models-handler 5)
+                        :keep-alive :close-after-response)
+      (with-async-test (eb el hb)
+        (let* ((pool (make-lru-connection-pool :max-size 4))
+               (client (make-http-client hb :pool pool)))
+          (dotimes (i 2)
+            (let ((res (%await-promise
+                        (get-async (fixture-url "/v1/models") :client client)
+                        eb el)))
+              (ok (= 200 (response-status res)))
+              (ok (equalp +lmstudio-models-body+ (response-body res)))))
+          (ok (= 2 *fixture-accept-count*))
+          (ok (= 2 *fixture-request-count*))
+          (pool-clear pool))))))
+
+(deftest stale-pooled-socket-is-dropped-before-post
+  "Before reuse, an idle cleartext socket is probed: the server's close shows
+   as EOF, so the POST goes out once, on a new connection."
+  (let ((http-protocol:*default-connection-pool* nil))
+    (with-http-fixture ((%lmstudio-models-handler 5)
+                        :keep-alive :close-after-response)
+      (with-async-test (eb el hb)
+        (let* ((pool (make-lru-connection-pool :max-size 4))
+               (client (make-http-client hb :pool pool)))
+          (ok (= 200 (response-status
+                      (%await-promise
+                       (get-async (fixture-url "/v1/models") :client client)
+                       eb el))))
+          (ok (= 200 (response-status
+                      (%await-promise
+                       (post-async (fixture-url "/v1/chat") :client client
+                                                             :content "{}")
+                       eb el))))
+          (ok (= 2 *fixture-accept-count*))
+          (ok (= 2 *fixture-request-count*))
+          (pool-clear pool))))))
+
+(deftest keep-alive-timeout-retires-idle-connection
+  "Keep-Alive: timeout=1 → after 0.6 s idle the pooled socket is not reused."
+  (let ((http-protocol:*default-connection-pool* nil))
+    (with-http-fixture ((%lmstudio-models-handler 1) :keep-alive t)
+      (with-async-test (eb el hb)
+        (let* ((pool (make-lru-connection-pool :max-size 4))
+               (client (make-http-client hb :pool pool)))
+          (ok (= 200 (response-status
+                      (%await-promise
+                       (get-async (fixture-url "/v1/models") :client client)
+                       eb el))))
+          (sleep 0.6)
+          (ok (= 200 (response-status
+                      (%await-promise
+                       (get-async (fixture-url "/v1/models") :client client)
+                       eb el))))
+          (ok (= 2 *fixture-accept-count*))
+          (pool-clear pool))))))
+
+;;; Without the probe (it can miss a close that races the request, and it
+;;; skips TLS sockets) the request itself reads EOF on the stale socket.
+
+(defmacro %without-probe-unless-windows (&body body)
+  ;; Windows SBCL can report recv's -1 (WSAECONNRESET) as a huge count, which
+  ;; reads as would-block: the reset socket then never ends the request.
+  #+(or windows win32) `(progn (skip "stale-socket retry: Windows recv hides ECONNRESET") nil)
+  #-(or windows win32)
+  `(let ((http-backend-async::*probe-idle-sockets* nil)) ,@body))
+
+(deftest stale-pooled-get-is-replayed
+  (%without-probe-unless-windows
+    (let ((http-protocol:*default-connection-pool* nil))
+      (with-http-fixture ((%lmstudio-models-handler 5)
+                          :keep-alive :close-after-response)
+        (with-async-test (eb el hb)
+          (let* ((pool (make-lru-connection-pool :max-size 4))
+                 (client (make-http-client hb :pool pool)))
+            (dotimes (i 2)
+              (let ((res (%await-promise
+                          (get-async (fixture-url "/v1/models") :client client)
+                          eb el)))
+                (ok (= 200 (response-status res)))))
+            (ok (= 2 *fixture-accept-count*))
+            (ok (= 2 *fixture-request-count*))
+            (pool-clear pool)))))))
+
+(deftest stale-pooled-post-is-not-replayed
+  "POST is not idempotent: on a stale socket it fails; it is not sent twice."
+  (%without-probe-unless-windows
+    (let ((http-protocol:*default-connection-pool* nil))
+      (with-http-fixture ((%lmstudio-models-handler 5)
+                          :keep-alive :close-after-response)
+        (with-async-test (eb el hb)
+          (let* ((pool (make-lru-connection-pool :max-size 4))
+                 (client (make-http-client hb :pool pool)))
+            (ok (= 200 (response-status
+                        (%await-promise
+                         (get-async (fixture-url "/v1/models") :client client)
+                         eb el))))
+            (ok (signals (%await-promise
+                          (post-async (fixture-url "/v1/chat") :client client
+                                                                :content "{}")
+                          eb el)
+                         'http-error))
+            (ok (= 1 *fixture-request-count*))
+            (pool-clear pool)))))))
