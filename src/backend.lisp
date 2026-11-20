@@ -700,7 +700,10 @@ instead of closing the shared connection.")
                               io-cell cell
                               (async-request-io-handle handle)
                               (register-io event-backend event-loop fd direction
-                                           (lambda (status)
+                                           ;; event-backend-libuv calls (:error code)
+                                           ;; on a failed poll: two arguments.
+                                           (lambda (status &optional code)
+                                             (declare (ignore code))
                                              (if (car cell)
                                                  (funcall (car cell) status)
                                                  (on-io status))))))))))
@@ -1478,9 +1481,14 @@ instead of closing the shared connection.")
                            (eq phase :reconnect))
                    (return-from on-io nil))
                  (when (eq status :error)
+                   ;; The poll itself failed (libuv: the peer reset the socket).
+                   ;; On a stale pooled socket that is the same as EOF before
+                   ;; the response.
                    (return-from on-io
-                     (fail (make-condition 'http-connection-error
-                                           :message "register-io error"))))
+                     (if (and (member phase '(:write :read)) (stale-pooled-p))
+                         (retry-on-fresh-connection)
+                         (fail (make-condition 'http-connection-error
+                                               :message "register-io error")))))
                  (handler-case
                      (ecase phase
                        (:connecting

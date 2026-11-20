@@ -118,15 +118,13 @@
 ;;; Without the probe (it can miss a close that races the request, and it
 ;;; skips TLS sockets) the request itself reads EOF on the stale socket.
 
-(defmacro %without-probe-unless-windows (&body body)
-  ;; Windows SBCL can report recv's -1 (WSAECONNRESET) as a huge count, which
-  ;; reads as would-block: the reset socket then never ends the request.
-  #+(or windows win32) `(progn (skip "stale-socket retry: Windows recv hides ECONNRESET") nil)
-  #-(or windows win32)
+(defmacro %without-probe (&body body)
+  ;; On Windows too since #57: a reset socket is a connection error there,
+  ;; not a would-block read.
   `(let ((http-backend-async::*probe-idle-sockets* nil)) ,@body))
 
 (deftest stale-pooled-get-is-replayed
-  (%without-probe-unless-windows
+  (%without-probe
     (let ((http-protocol:*default-connection-pool* nil))
       (with-http-fixture ((%lmstudio-models-handler 5)
                           :keep-alive :close-after-response)
@@ -144,7 +142,7 @@
 
 (deftest stale-pooled-post-is-not-replayed
   "POST is not idempotent: on a stale socket it fails; it is not sent twice."
-  (%without-probe-unless-windows
+  (%without-probe
     (let ((http-protocol:*default-connection-pool* nil))
       (with-http-fixture ((%lmstudio-models-handler 5)
                           :keep-alive :close-after-response)
@@ -162,3 +160,43 @@
                          'http-error))
             (ok (= 1 *fixture-request-count*))
             (pool-clear pool)))))))
+
+;;; #57: a socket the peer reset is a connection error, not a would-block read
+;;; (Windows SBCL used to read recv's -1 as 4294967295 and wait).
+
+(deftest reset-socket-recv-is-a-connection-error
+  (let ((server (usocket:socket-listen "127.0.0.1" 0 :reuse-address t
+                                                     :element-type '(unsigned-byte 8))))
+    (unwind-protect
+         (let* ((port (usocket:get-local-port server))
+                (client (http-backend-async::tcp-connect "127.0.0.1" port))
+                (peer (usocket:socket-accept server :element-type '(unsigned-byte 8))))
+           (unwind-protect
+                (progn
+                  (http-backend-async::set-socket-nonblocking client t)
+                  (ok (null (http-backend-async::socket-recv-octets
+                             client (make-array 16 :element-type '(unsigned-byte 8))))
+                      "nothing sent yet: would-block")
+                  ;; Unread data at close makes the peer send RST, not FIN.
+                  (ok (eql 4 (http-backend-async::socket-send-octets
+                              client (make-array 4 :element-type '(unsigned-byte 8)
+                                                   :initial-element 65)
+                              0 4)))
+                  (sleep 0.2)
+                  (usocket:socket-close peer)
+                  (setf peer nil)
+                  (let ((outcome
+                          (loop repeat 100
+                                for r = (handler-case
+                                            (http-backend-async::socket-recv-octets
+                                             client (make-array 16 :element-type '(unsigned-byte 8)))
+                                          (http-connection-error () :reset))
+                                when r return r
+                                do (sleep 0.02))))
+                    (ok (member outcome '(:reset 0))
+                        "reset (or EOF): never would-block for ever")
+                    (ok (not (http-backend-async::socket-idle-open-p client))
+                        "the idle probe drops it")))
+             (when peer (usocket:socket-close peer))
+             (http-backend-async::close-socket client)))
+      (usocket:socket-close server))))

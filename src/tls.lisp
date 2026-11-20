@@ -66,6 +66,11 @@
         (error 'http-tls-error
                :message (format nil "TLS setup failed for ~A: ~A" host e))))))
 
+(define-condition tls-connection-error (http-tls-error http-connection-error) ()
+  (:documentation "SSL_ERROR_SYSCALL with ret -1: the socket under the TLS session
+   failed (the peer reset it). Both a TLS error and a connection error, so a
+   stale pooled HTTPS socket is retried like a cleartext one (#57)."))
+
 (defun %ssl-step (session func &rest args)
   "One nonblocking SSL_* call → (:ok n) | (:want-read n) | (:want-write n) | (:eof 0)."
   (let* ((stream (tls-session-stream session))
@@ -83,7 +88,7 @@
            (#.cl+ssl::+ssl-error-syscall+
             (if (zerop ret)
                 (values :eof 0)
-                (error 'http-tls-error
+                (error 'tls-connection-error
                        :message (format nil "SSL syscall error ret=~A" ret))))
            (t
             (handler-case

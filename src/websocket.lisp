@@ -536,7 +536,8 @@
                    (error (e)
                      (fail (make-condition 'ws-protocol:ws-connection-error
                                            :message (princ-to-string e))))))
-               (on-io (status)
+               (on-io (status &optional code)
+                 (declare (ignore code))
                  (when finished-p (return-from on-io nil))
                  (when (eq status :error)
                    (return-from on-io

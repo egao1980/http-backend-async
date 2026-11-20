@@ -220,7 +220,9 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
                (h2-mux-io mux)
                (register-io (h2-mux-event-backend mux) (async-h2-conn-event-loop mux)
                             (socket-fd (async-h2-conn-socket mux)) direction
-                            (lambda (status) (h2-mux-on-io mux status)))))))))
+                            (lambda (status &optional code)
+                              (declare (ignore code))
+                              (h2-mux-on-io mux status)))))))))
 
 (defgeneric h2-mux-disarm (mux)
   (:documentation "Drop socket interest (idle mux: the loop may quiesce).")
@@ -241,7 +243,9 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
    Returns the trampoline that request's ON-IO must call."
   (setf (h2-mux-io mux) io
         (h2-mux-io-dir mux) direction
-        (h2-mux-io-trampoline mux) (lambda (status) (h2-mux-on-io mux status))))
+        (h2-mux-io-trampoline mux) (lambda (status &optional code)
+                              (declare (ignore code))
+                              (h2-mux-on-io mux status))))
 
 ;;; Life cycle
 

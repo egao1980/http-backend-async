@@ -248,12 +248,70 @@ Returns NIL if connect still pending (spurious wakeup)."
     (set-socket-nonblocking usock t)
     t))
 
+;;; --- Windows: recv / send through Winsock directly ---------------------------
+;;;
+;;; SB-BSD-SOCKETS declares recvfrom / send as returning SSIZE-T (64-bit on
+;;; win64), but Winsock's return an int. A failed call leaves -1 in EAX; the
+;;; upper half of RAX is zero, so SBCL reads 4294967295, the (= len -1) error
+;;; test never fires and WSAGetLastError is never read: a socket the peer reset
+;;; (WSAECONNRESET) looked like a huge count, which we had to treat as
+;;; would-block, so the request waited for its timeout (#57). Calling recv /
+;;; send with an :int return type and reading WSAGetLastError right after
+;;; gives the real outcome.
+
+(defconstant +wsaeintr+ 10004)
+(defconstant +wsaewouldblock+ 10035)
+(defconstant +wsaeinprogress+ 10036)
+
+(defun %wsa-error-name (code)
+  (case code
+    (10004 "WSAEINTR") (10035 "WSAEWOULDBLOCK") (10036 "WSAEINPROGRESS")
+    (10038 "WSAENOTSOCK") (10050 "WSAENETDOWN") (10052 "WSAENETRESET")
+    (10053 "WSAECONNABORTED") (10054 "WSAECONNRESET") (10057 "WSAENOTCONN")
+    (10058 "WSAESHUTDOWN") (10060 "WSAETIMEDOUT")
+    (t "WSA error")))
+
+#+(and sbcl win32)
+(defun %wsa-io (usock operation octets start end)
+  "recv (OPERATION :RECV) into, or send (:SEND) from, OCTETS[START,END) on
+USOCK's SOCKET. → count (0 = EOF for :RECV), NIL for would-block; any other
+Winsock error → HTTP-CONNECTION-ERROR."
+  (let* ((handle (sb-bsd-sockets:socket-file-descriptor (%impl-socket usock)))
+         (len (- end start))
+         (buf (if (and (typep octets '(simple-array (unsigned-byte 8) (*)))
+                       (zerop start))
+                  octets
+                  (let ((copy (make-array len :element-type '(unsigned-byte 8))))
+                    (when (eq operation :send)
+                      (replace copy octets :start2 start :end2 end))
+                    copy)))
+         (n 0) (err 0))
+    (cffi:with-pointer-to-vector-data (ptr buf)
+      (setf n (if (eq operation :recv)
+                  (cffi:foreign-funcall "recv" :uintptr handle :pointer ptr
+                                               :int len :int 0 :int)
+                  (cffi:foreign-funcall "send" :uintptr handle :pointer ptr
+                                               :int len :int 0 :int)))
+      (when (minusp n)
+        (setf err (cffi:foreign-funcall "WSAGetLastError" :int))))
+    (cond
+      ((not (minusp n))
+       (when (and (eq operation :recv) (not (eq buf octets)))
+         (replace octets buf :start1 start :end2 n))
+       n)
+      ((member err (list +wsaewouldblock+ +wsaeintr+ +wsaeinprogress+)) nil)
+      (t (error 'http-connection-error
+                :message (format nil "socket ~(~a~) failed: ~a (~d)"
+                                 operation (%wsa-error-name err) err))))))
+
 (defun socket-send-octets (usock octets start end)
   "Write OCTETS[START,END). Returns bytes sent, or NIL if would-block."
   (let* ((len (- end start))
          (impl (%impl-socket usock))
          (send (%soft :sb-bsd-sockets "SOCKET-SEND")))
     (when (zerop len) (return-from socket-send-octets 0))
+    #+(and sbcl win32)
+    (return-from socket-send-octets (%wsa-io usock :send octets start end))
     (cond
       (send
        ;; SBCL SOCKET-SEND has no offset — displace for partial sends.
@@ -292,7 +350,10 @@ Returns NIL if connect still pending (spurious wakeup)."
                         :message (format nil "socket send failed: ~A" e))))))))))
 
 (defun socket-recv-octets (usock buffer)
-  "Read into BUFFER. Returns byte count, 0 on EOF, NIL if would-block."
+  "Read into BUFFER. Returns byte count, 0 on EOF, NIL if would-block. A
+   socket error (the peer reset it) → HTTP-CONNECTION-ERROR."
+  #+(and sbcl win32)
+  (return-from socket-recv-octets (%wsa-io usock :recv buffer 0 (length buffer)))
   (let* ((impl (%impl-socket usock))
          (recv (%soft :sb-bsd-sockets "SOCKET-RECEIVE")))
     (cond
@@ -302,10 +363,9 @@ Returns NIL if connect still pending (spurious wakeup)."
              (multiple-value-bind (buf n)
                  (funcall recv impl buffer (length buffer))
                (declare (ignore buf))
-               ;; NIL length → would-block on nonblocking SBCL sockets.
-               ;; Windows SBCL can leak recv()'s -1 (WSAEWOULDBLOCK) as an
-               ;; unsigned count (4294967295) instead of signaling — treat any
-               ;; out-of-range count as would-block, never as data.
+               ;; NIL length → would-block on nonblocking SBCL sockets. An
+               ;; out-of-range count is never data (Windows SBCL reads recv's
+               ;; -1 as 4294967295; that platform goes through %WSA-IO).
                (if (and (integerp n) (<= 0 n (length buffer)))
                    n
                    nil))
