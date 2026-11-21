@@ -6,16 +6,23 @@
 ;;; Cleartext + TLS: nonblocking connect (SBCL) → OS FD for
 ;;; event-protocol:register-io → nonblocking send/recv / SSL_* on the FD.
 
+(defun %soft-symbol (package name)
+  "NAME in PACKAGE, or NIL when PACKAGE does not exist in this Lisp.
+FIND-SYMBOL signals PACKAGE-ERROR on a missing package (SB-BSD-SOCKETS on
+CCL), so look the package up first."
+  (let ((p (find-package package)))
+    (and p (values (find-symbol name p)))))
+
 (defun %soft (package name)
-  (let ((s (find-symbol name package)))
+  (let ((s (%soft-symbol package name)))
     (when (and s (fboundp s)) s)))
 
 (defun %soft-class (package name)
-  (let ((s (find-symbol name package)))
+  (let ((s (%soft-symbol package name)))
     (when (and s (find-class s nil)) s)))
 
 (defun %soft-setf (package name)
-  (let ((s (find-symbol name package)))
+  (let ((s (%soft-symbol package name)))
     (when (and s (fboundp `(setf ,s))) `(setf ,s))))
 
 (defun tcp-connect (host port &key timeout)

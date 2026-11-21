@@ -1,5 +1,5 @@
 (defsystem "http-backend-async"
-  :version "0.2.22"
+  :version "0.2.23"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
@@ -53,6 +53,7 @@
   :serial t
   :components ((:file "package")
                (:file "fixture")
+               (:file "socket-test")
                (:file "pool-test")
                (:file "keep-alive-test")
                (:file "redact-test")
