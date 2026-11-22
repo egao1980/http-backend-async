@@ -190,6 +190,8 @@ brotli and zstd are loaded the first time, when installed (see
   ((canceled-p :initform nil :accessor async-request-canceled-p)
    (io-handle :initform nil :accessor async-request-io-handle)
    (timer-handle :initform nil :accessor async-request-timer-handle)
+   (idle-timer-handle :initform nil :accessor async-request-idle-timer-handle
+                      :documentation "Connect / read (idle) watchdog timer.")
    (socket :initform nil :accessor async-request-socket)
    (tls-stream :initform nil :accessor async-request-tls-stream) ; tls-session
    (cancel-hook :initform nil :accessor async-request-cancel-hook
@@ -208,6 +210,9 @@ instead of closing the shared connection.")
       (when-let ((io (async-request-io-handle handle)))
         (ignore-errors (cancel eb io)))
       (when-let ((tm (async-request-timer-handle handle)))
+        (ignore-errors (cancel eb tm)))
+      (when-let ((tm (async-request-idle-timer-handle handle)))
+        (setf (async-request-idle-timer-handle handle) nil)
         (ignore-errors (cancel eb tm))))
     (tls-close (async-request-tls-stream handle))
     (setf (async-request-tls-stream handle) nil)
@@ -232,7 +237,26 @@ instead of closing the shared connection.")
          (values backend loop t))))))
 
 (defun %timeout-seconds (request client)
-  (timeout-total-seconds (effective-timeout request client)))
+  "Wall-clock cap (seconds) for one attempt, or NIL for none. See %PHASE-TIMEOUTS."
+  (nth-value 2 (%phase-timeouts request client)))
+
+(defun %phase-timeouts (request client)
+  "(values CONNECT READ TOTAL), each seconds or NIL, from the protocol
+   HTTP-TIMEOUT (request over client).
+   CONNECT bounds TCP, proxy and TLS setup. READ bounds the silence between
+   octets once the request is going out: a response that keeps arriving is
+   never cut off, one that goes quiet for READ seconds fails. TOTAL caps the
+   whole attempt. A bare number is :TOTAL (so `:timeout 180` keeps its
+   meaning); when neither :READ nor :TOTAL is set the protocol fallback
+   (TIMEOUT-TOTAL-SECONDS) is the cap, so a request is never unbounded by
+   accident. `(:connect 30 :read 300)` has no total cap."
+  (let ((tm (effective-timeout request client)))
+    (flet ((secs (x) (and x (plusp x) (float x 1.0d0))))
+      (values (secs (timeout-connect tm))
+              (secs (timeout-read tm))
+              (secs (if (or (timeout-total tm) (timeout-read tm))
+                        (timeout-total tm)
+                        (timeout-total-seconds tm)))))))
 
 (defmethod send-async ((backend async-backend) client request
                        &key callback error-callback)
@@ -337,7 +361,13 @@ instead of closing the shared connection.")
                (h2-req-end-p nil)
                ;; T once this request queued for a stream on a full mux.
                (h2-waited-p nil)
-               (streamed-response nil))
+               (streamed-response nil)
+               ;; Connect / read watchdog (protocol HTTP-TIMEOUT phases).
+               (connect-limit nil)
+               (read-limit nil)
+               (last-activity (get-internal-real-time)))
+          (multiple-value-setq (connect-limit read-limit)
+            (%phase-timeouts request client))
           (when proxy-url
             (multiple-value-bind (pscheme phost pport puser ppass)
                 (parse-proxy-uri proxy-url)
@@ -364,7 +394,44 @@ instead of closing the shared connection.")
                         :operation :socks4-proxy
                         :message "SOCKS4 not implemented; use socks5:// or socks5h://")))))
           (labels
-              ((build-headers-and-body ()
+              ((touch ()
+                 "Octets moved (or the consumer drained the body): restart
+                  the read clock."
+                 (setf last-activity (get-internal-real-time)))
+               (connect-phase-p ()
+                 (member phase '(:connect :connecting :socks :http-connect
+                                 :tls-hs :reconnect)))
+               (arm-idle-watchdog (seconds)
+                 (setf (async-request-idle-timer-handle handle)
+                       (sleep* event-backend event-loop (max 0.05d0 seconds)
+                               :callback #'check-idle)))
+               (check-idle ()
+                 "Lazy watchdog: I/O only stamps LAST-ACTIVITY; this timer
+                  compares and re-arms for the remainder, so a steady stream
+                  costs no timer churn."
+                 (setf (async-request-idle-timer-handle handle) nil)
+                 (unless (async-request-canceled-p handle)
+                   (let* ((connecting (connect-phase-p))
+                          (limit (if connecting connect-limit read-limit))
+                          (idle (/ (- (get-internal-real-time) last-activity)
+                                   internal-time-units-per-second)))
+                     (cond
+                       ;; No limit for this phase, or the consumer is not
+                       ;; reading (backpressure): look again later.
+                       ((or (null limit) read-paused-p)
+                        (touch)
+                        (arm-idle-watchdog (or connect-limit read-limit 1.0d0)))
+                       ((>= idle limit)
+                        (fail (make-condition
+                               'http-timeout-error
+                               :message
+                               (if connecting
+                                   (format nil "connect timed out after ~,1F s (~A)"
+                                           limit (quri:uri-host uri))
+                                   (format nil "read timed out: no data for ~,1F s (~A)"
+                                           limit (quri:uri-host uri))))))
+                       (t (arm-idle-watchdog (- limit idle)))))))
+               (build-headers-and-body ()
                  (setf headers (%merge-headers
                                 (protect-headers (http-client-headers client))
                                 (protect-headers (http-request-headers request))))
@@ -468,6 +535,7 @@ instead of closing the shared connection.")
                    n))
                (unpause-read ()
                  (when read-paused-p
+                   (touch)
                    (setf read-paused-p nil)
                    (next-tick
                     (lambda ()
@@ -482,6 +550,9 @@ instead of closing the shared connection.")
                  (when-let ((tm (async-request-timer-handle handle)))
                    (ignore-errors (cancel event-backend tm))
                    (setf (async-request-timer-handle handle) nil))
+                 (when-let ((tm (async-request-idle-timer-handle handle)))
+                   (ignore-errors (cancel event-backend tm))
+                   (setf (async-request-idle-timer-handle handle) nil))
                  (setf io-dir nil
                        io-cell nil))
                (close-connection ()
@@ -917,6 +988,7 @@ instead of closing the shared connection.")
                    (call-on-loop #'unpause-h2)))
                (unpause-h2 ()
                  "The body queue drained: send the held WINDOW_UPDATE credit."
+                 (touch)
                  (setf read-paused-p nil)
                  (when h2-req-stream
                    (h2-stream-release-window h2-req-stream))
@@ -939,6 +1011,7 @@ instead of closing the shared connection.")
                           :history-for-final (nreverse (copy-list history))))
                    (deliver-stream streamed-response)))
                (on-h2-headers (h2-stream)
+                 (touch)
                  (multiple-value-bind (status headers*)
                      (h2-streaming-status-headers h2-stream)
                    (let ((set-cookies
@@ -950,6 +1023,7 @@ instead of closing the shared connection.")
                                 (not (will-follow-redirect-p status headers*)))
                        (begin-h2-stream-body status headers* set-cookies)))))
                (on-h2-data (data start end)
+                 (touch)
                  (cond
                    (streaming-final-p
                     (async-body-feed body-feed data :start start :end end)
@@ -1099,6 +1173,7 @@ instead of closing the shared connection.")
                                                    :pool pool
                                                    :key (h2-pool-key pool-key*)))
                        (hand-socket-to-mux mux)))
+                   (touch)
                    (setf negotiated-version :http/2
                          phase :h2
                          h2-callback-finished-p nil
@@ -1483,6 +1558,7 @@ instead of closing the shared connection.")
                  (when (or (async-request-canceled-p handle)
                            (eq phase :reconnect))
                    (return-from on-io nil))
+                 (touch)
                  (when (eq status :error)
                    ;; The poll itself failed (libuv: the peer reset the socket).
                    ;; On a stale pooled socket that is the same as EOF before
@@ -1530,13 +1606,19 @@ instead of closing the shared connection.")
             (reset-parser)
             (with-event-backend (event-backend)
               (with-event-loop-var (event-loop)
-                (setf (async-request-timer-handle handle)
-                      (sleep* event-backend event-loop
-                              (%timeout-seconds request client)
-                              :callback
-                              (lambda ()
-                                (fail (make-condition
-                                       'http-timeout-error
-                                       :message "request timed out")))))
+                (let ((total (%timeout-seconds request client)))
+                  (when total
+                    (setf (async-request-timer-handle handle)
+                          (sleep* event-backend event-loop total
+                                  :callback
+                                  (lambda ()
+                                    (fail (make-condition
+                                           'http-timeout-error
+                                           :message
+                                           (format nil "request timed out after ~,1F s (~A)"
+                                                   total (quri:uri-host uri)))))))))
+                (when (or connect-limit read-limit)
+                  (touch)
+                  (arm-idle-watchdog (or connect-limit read-limit)))
                 (defer event-backend event-loop #'do-connect)))
             handle))))))

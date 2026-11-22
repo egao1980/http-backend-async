@@ -27,6 +27,11 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
   when `*h2-max-stream-waiters*` (32) already wait. Needs http2
   ≥ 2.1.2 to read the peer's limit — older http2 reuses one stream at a time.
   Live h2 tests: `HTTP_ASYNC_H2_LIVE=1`
+- Timeouts follow `http-protocol:http-timeout`: `:connect` bounds TCP/proxy/TLS
+  setup, `:read` the silence between octets (a stream that keeps arriving is
+  never cut off), `:total` the whole attempt. A bare number is `:total`;
+  `(:connect 30 :read 300)` has no total cap. Errors are `http-timeout-error`
+  ("connect timed out …", "read timed out: no data for N s …").
 
 ## Use
 
