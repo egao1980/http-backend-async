@@ -399,9 +399,16 @@ instead of closing the shared connection.")
                (connect-phase-p ()
                  (member phase '(:connect :connecting :socks :http-connect
                                  :tls-hs :reconnect)))
+               (watchdog-tick ()
+                 "The longest the watchdog may sleep: the smaller limit, so a
+                  switch from connect to read is seen in time."
+                 (if (and connect-limit read-limit)
+                     (min connect-limit read-limit)
+                     (or connect-limit read-limit)))
                (arm-idle-watchdog (seconds)
                  (setf (async-request-idle-timer-handle handle)
-                       (sleep* event-backend event-loop (max 0.05d0 seconds)
+                       (sleep* event-backend event-loop
+                               (max 0.05d0 (min seconds (watchdog-tick)))
                                :callback #'check-idle)))
                (check-idle ()
                  "Lazy watchdog: I/O only stamps LAST-ACTIVITY; this timer
@@ -418,7 +425,7 @@ instead of closing the shared connection.")
                        ;; reading (backpressure): look again later.
                        ((or (null limit) read-paused-p)
                         (touch)
-                        (arm-idle-watchdog (or connect-limit read-limit 1.0d0)))
+                        (arm-idle-watchdog (watchdog-tick)))
                        ((>= idle limit)
                         (fail (make-condition
                                'http-timeout-error
@@ -1615,8 +1622,8 @@ instead of closing the shared connection.")
                                            :message
                                            (format nil "request timed out after ~,1F s (~A)"
                                                    total (quri:uri-host uri)))))))))
-                (when (or connect-limit read-limit)
+                (when (watchdog-tick)
                   (touch)
-                  (arm-idle-watchdog (or connect-limit read-limit)))
+                  (arm-idle-watchdog (watchdog-tick)))
                 (defer event-backend event-loop #'do-connect)))
             handle))))))

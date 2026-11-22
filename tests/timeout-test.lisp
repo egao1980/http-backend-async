@@ -134,7 +134,9 @@
                                  (cons 0.2 "data: b")
                                  (cons 6 nil)))
       (multiple-value-bind (c secs)
-          (%timeout-condition (lambda () (%sync url '(:connect 2 :read 1)
+          ;; a connect limit far above the read limit (30 s vs 1 s, as
+          ;; llm-protocol-openai sends): the read limit still rules
+          (%timeout-condition (lambda () (%sync url '(:connect 30 :read 1)
                                                 :want-stream want-stream)))
         (ok (typep c 'http-timeout-error))
         (ok (and c (search "read timed out" (princ-to-string c)))
