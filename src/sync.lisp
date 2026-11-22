@@ -6,7 +6,9 @@
 (defun %await-send-async (backend client request &key (timeout-seconds 30.0))
   "Run SEND-ASYNC to completion on a fresh/bound event loop. Returns HTTP-RESPONSE.
    :WANT-STREAM T slurps the body on a worker (urllib3 preload_content shape) so the
-   event loop can keep feeding until EOF."
+   event loop can keep feeding until EOF.
+   TIMEOUT-SECONDS caps the whole wait; NIL means no cap here (SEND-ASYNC's
+   connect / read watchdog still ends a stalled request)."
   (multiple-value-bind (event-backend event-loop owned-p) (%ensure-event-context)
     (let ((result nil)
           (err nil)
@@ -44,12 +46,15 @@
                   backend client request
                   :callback #'on-response
                   :error-callback #'fail)
-                 (sleep* event-backend event-loop timeout-seconds
-                         :callback (lambda ()
-                                     (unless done
-                                       (fail (make-condition
-                                              'http-timeout-error
-                                              :message "sync await timed out")))))
+                 (when timeout-seconds
+                   (sleep* event-backend event-loop timeout-seconds
+                           :callback (lambda ()
+                                       (unless done
+                                         (fail (make-condition
+                                                'http-timeout-error
+                                                :message
+                                                (format nil "sync await timed out after ~,1F s"
+                                                        timeout-seconds)))))))
                  (setf in-run t)
                  (event-protocol:run event-backend event-loop :stop-when-idle nil)
                  (setf in-run nil)))
@@ -67,9 +72,10 @@
 
 (defmethod send ((backend async-backend) client request &key)
   "Blocking send: await SEND-ASYNC with HTTP-RETRY backoff."
-  (let* ((timeout (effective-timeout request client))
-         (retry (effective-retry request client))
-         (total-s (timeout-total-seconds timeout))
+  (let* ((retry (effective-retry request client))
+         ;; Only a :TOTAL cap bounds the wait: a streamed body that keeps
+         ;; arriving under a :READ (idle) timeout is never cut off.
+         (total-s (%timeout-seconds request client))
          (attempt 0)
          (last-condition nil)
          (last-response nil))
