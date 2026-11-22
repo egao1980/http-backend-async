@@ -189,3 +189,19 @@
     (ok (equal '(30.0d0 300.0d0 600.0d0) (pt '(:connect 30 :read 300 :total 600))))
     (ok (equal '(5.0d0 nil nil) (pt '(:connect 5))) "connect only bounds the setup")
     (ok (equal '(nil nil 30.0d0) (pt nil)) "default")))
+
+(deftest read-timeout-resets-on-every-byte
+  ;; #66: one byte a second for 5 s under a 1.5 s read timeout and no total.
+  ;; The timeout is the longest wait for the next bytes, not a cap on the
+  ;; whole answer.
+  (with-async-test (eb el hb)
+    (declare (ignore eb el hb))
+    (with-drip-origin (url (loop repeat 5 collect (cons 1 "x")))
+      (multiple-value-bind (res secs)
+          (let ((start (get-internal-real-time)))
+            (values (%sync url '(:connect 2 :read 1.5) :want-stream t)
+                    (%elapsed-since start)))
+        (ok (= 200 (response-status res)))
+        (ok (equal "xxxxx" (babel:octets-to-string (response-body res)
+                                                   :encoding :utf-8)))
+        (ok (> secs 4.5) (format nil "the stream ran ~,2F s, past 1.5 s" secs))))))
