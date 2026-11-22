@@ -185,5 +185,5 @@
     (ok (equal '(nil nil 180.0d0) (pt 180)) "a number is the total")
     (ok (equal '(30.0d0 300.0d0 nil) (pt '(:connect 30 :read 300))) "no total cap")
     (ok (equal '(30.0d0 300.0d0 600.0d0) (pt '(:connect 30 :read 300 :total 600))))
-    (ok (equal '(5.0d0 nil 5.0d0) (pt '(:connect 5))) "connect only keeps a cap")
+    (ok (equal '(5.0d0 nil nil) (pt '(:connect 5))) "connect only bounds the setup")
     (ok (equal '(nil nil 30.0d0) (pt nil)) "default")))

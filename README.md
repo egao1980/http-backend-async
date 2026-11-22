@@ -29,7 +29,8 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
   Live h2 tests: `HTTP_ASYNC_H2_LIVE=1`
 - Timeouts follow `http-protocol:http-timeout`: `:connect` bounds TCP/proxy/TLS
   setup, `:read` the silence between octets (a stream that keeps arriving is
-  never cut off), `:total` the whole attempt. A bare number is `:total`;
+  never cut off), `:total` the whole attempt. An unset phase has no limit. A
+  bare number is `:total`; no timeout is the protocol default (30 s total);
   `(:connect 30 :read 300)` has no total cap. Errors are `http-timeout-error`
   ("connect timed out …", "read timed out: no data for N s …").
 

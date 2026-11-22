@@ -246,17 +246,15 @@ instead of closing the shared connection.")
    CONNECT bounds TCP, proxy and TLS setup. READ bounds the silence between
    octets once the request is going out: a response that keeps arriving is
    never cut off, one that goes quiet for READ seconds fails. TOTAL caps the
-   whole attempt. A bare number is :TOTAL (so `:timeout 180` keeps its
-   meaning); when neither :READ nor :TOTAL is set the protocol fallback
-   (TIMEOUT-TOTAL-SECONDS) is the cap, so a request is never unbounded by
-   accident. `(:connect 30 :read 300)` has no total cap."
+   whole attempt. An unset (NIL) phase has no limit. A bare number is
+   :TOTAL (so `:timeout 180` keeps its meaning), and no timeout at all is
+   the protocol default (30 s total). `(:connect 30 :read 300)` has no
+   total cap; `(:connect 30)` bounds only the setup."
   (let ((tm (effective-timeout request client)))
     (flet ((secs (x) (and x (plusp x) (float x 1.0d0))))
       (values (secs (timeout-connect tm))
               (secs (timeout-read tm))
-              (secs (if (or (timeout-total tm) (timeout-read tm))
-                        (timeout-total tm)
-                        (timeout-total-seconds tm)))))))
+              (secs (timeout-total tm))))))
 
 (defmethod send-async ((backend async-backend) client request
                        &key callback error-callback)
