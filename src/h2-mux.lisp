@@ -221,8 +221,7 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
                (register-io (h2-mux-event-backend mux) (async-h2-conn-event-loop mux)
                             (socket-fd (async-h2-conn-socket mux)) direction
                             (lambda (status &optional code)
-                              (declare (ignore code))
-                              (h2-mux-on-io mux status)))))))))
+                              (h2-mux-on-io mux status code)))))))))
 
 (defgeneric h2-mux-disarm (mux)
   (:documentation "Drop socket interest (idle mux: the loop may quiesce).")
@@ -244,8 +243,7 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
   (setf (h2-mux-io mux) io
         (h2-mux-io-dir mux) direction
         (h2-mux-io-trampoline mux) (lambda (status &optional code)
-                              (declare (ignore code))
-                              (h2-mux-on-io mux status))))
+                              (h2-mux-on-io mux status code))))
 
 ;;; Life cycle
 
@@ -420,11 +418,11 @@ its ON-IO then forwards here (no cancel + re-register of a live fd).")
       ((eq (h2-mux-state mux) :draining) (h2-mux-close mux))
       (t (h2-mux-disarm mux)))))
 
-(defun h2-mux-on-io (mux status)
+(defun h2-mux-on-io (mux status &optional code)
   (unless (eq (h2-mux-state mux) :dead)
     (handler-case
         (if (eq status :error)
-            (error 'http-connection-error :message "register-io error")
+            (error 'http-connection-error :message (poll-error-message code))
             (if (h2-mux-out mux)
                 (h2-mux-do-write mux)
                 (h2-mux-do-read mux)))

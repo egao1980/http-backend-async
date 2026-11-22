@@ -42,6 +42,15 @@ CCL), so look the package up first."
       (error 'http-connection-error
              :message (format nil "connect ~A:~A failed: ~A" host port e)))))
 
+(defun poll-error-message (&optional code)
+  "Message for a failed poll. Every REGISTER-IO / UPDATE-IO callback here is
+   called as (STATUS &optional CODE): STATUS is :OK or :ERROR, and CODE is the
+   backend's error status when it has one (event-backend-libuv passes the
+   negative UV_E* code; libev and NIO pass none)."
+  (if code
+      (format nil "poll failed on the socket (event backend status ~A)" code)
+      "poll failed on the socket"))
+
 (defun %impl-socket (usock)
   (usocket:socket usock))
 
