@@ -389,7 +389,7 @@
                            io-handle nil
                            io-dir nil))
                    (%async-ws-arm-io conn :read
-                                     (lambda (st) (%async-ws-on-io conn st)))
+                                     (%async-ws-io-callback conn))
                    (%async-ws-fire conn :open)
                    (handler-case (funcall cb conn)
                      (error (e) (warn "ws callback failed: ~A" e)))))
@@ -537,12 +537,11 @@
                      (fail (make-condition 'ws-protocol:ws-connection-error
                                            :message (princ-to-string e))))))
                (on-io (status &optional code)
-                 (declare (ignore code))
                  (when finished-p (return-from on-io nil))
                  (when (eq status :error)
                    (return-from on-io
                      (fail (make-condition 'ws-protocol:ws-connection-error
-                                           :message "register-io error"))))
+                                           :message (poll-error-message code)))))
                  (handler-case
                      (ecase phase
                        (:connecting
@@ -571,21 +570,26 @@
 
 ;;; Steady-state I/O after open (loop thread).
 
-(defun %async-ws-on-io (conn status)
+(defun %async-ws-io-callback (conn)
+  "REGISTER-IO callback for CONN: (STATUS &optional CODE), as libuv calls it."
+  (lambda (status &optional code)
+    (%async-ws-on-io conn status code)))
+
+(defun %async-ws-on-io (conn status &optional code)
   (when (async-ws-closed-p conn)
     (return-from %async-ws-on-io nil))
   (when (eq status :error)
     (%async-ws-fire conn :error
                     (make-condition 'ws-protocol:ws-connection-error
-                                    :message "register-io error"))
+                                    :message (poll-error-message code)))
     (%async-ws-teardown conn)
     (return-from %async-ws-on-io nil))
   (handler-case
       (ecase (async-ws-phase conn)
         (:ws-write
-         (when (%async-ws-flush-out conn (lambda (st) (%async-ws-on-io conn st)))
+         (when (%async-ws-flush-out conn (%async-ws-io-callback conn))
            (setf (async-ws-phase conn) :ws-open)
-           (%async-ws-arm-io conn :read (lambda (st) (%async-ws-on-io conn st)))))
+           (%async-ws-arm-io conn :read (%async-ws-io-callback conn))))
         (:ws-open
          (loop
            (multiple-value-bind (n want)
@@ -593,11 +597,11 @@
              (cond
                (want
                 (%async-ws-arm-tls-want
-                 conn want (lambda (st) (%async-ws-on-io conn st)))
+                 conn want (%async-ws-io-callback conn))
                 (return))
                ((null n)
                 (%async-ws-arm-io conn :read
-                                  (lambda (st) (%async-ws-on-io conn st)))
+                                  (%async-ws-io-callback conn))
                 (return))
                ((zerop n)
                 (%async-ws-fire conn :close :code nil :reason "eof")
@@ -619,11 +623,11 @@
                         (async-ws-out-pos conn) 0
                         (async-ws-phase conn) :ws-write)
                   (%async-ws-arm-io conn :write
-                                    (lambda (st) (%async-ws-on-io conn st)))
+                                    (%async-ws-io-callback conn))
                   (return-from %async-ws-on-io
                     (%async-ws-on-io conn :ok)))
                 (%async-ws-arm-io conn :read
-                                  (lambda (st) (%async-ws-on-io conn st)))
+                                  (%async-ws-io-callback conn))
                 (return)))))))
     (error (e)
       (%async-ws-fire conn :error e)

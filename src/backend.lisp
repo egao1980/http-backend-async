@@ -703,10 +703,9 @@ instead of closing the shared connection.")
                                            ;; event-backend-libuv calls (:error code)
                                            ;; on a failed poll: two arguments.
                                            (lambda (status &optional code)
-                                             (declare (ignore code))
                                              (if (car cell)
-                                                 (funcall (car cell) status)
-                                                 (on-io status))))))))))
+                                                 (funcall (car cell) status code)
+                                                 (on-io status code))))))))))
                (do-connect ()
                  (multiple-value-bind (conn kind)
                      (acquire-pooled-connection
@@ -1476,7 +1475,11 @@ instead of closing the shared connection.")
                           (return))
                         (when read-paused-p
                           (return)))))))
-               (on-io (status)
+               (on-io (status &optional code)
+                 ;; (STATUS &optional CODE), like every IO callback: libuv calls
+                 ;; (:ERROR code) on a failed poll. A one-argument ON-IO made
+                 ;; that call itself fail, libuv only warned, and the request
+                 ;; never completed (#62).
                  (when (or (async-request-canceled-p handle)
                            (eq phase :reconnect))
                    (return-from on-io nil))
@@ -1487,8 +1490,11 @@ instead of closing the shared connection.")
                    (return-from on-io
                      (if (and (member phase '(:write :read)) (stale-pooled-p))
                          (retry-on-fresh-connection)
-                         (fail (make-condition 'http-connection-error
-                                               :message "register-io error")))))
+                         (fail (make-condition
+                                (if (and https (eq phase :tls-hs))
+                                    'http-tls-error
+                                    'http-connection-error)
+                                :message (poll-error-message code))))))
                  (handler-case
                      (ecase phase
                        (:connecting
