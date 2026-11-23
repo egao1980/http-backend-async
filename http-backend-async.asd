@@ -1,9 +1,9 @@
 (defsystem "http-backend-async"
-  :version "0.2.27"
+  :version "0.2.28"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "http-protocol" "0.4.0")
+  :depends-on ((:version "http-protocol" "0.4.3")
                (:version "event-protocol" "0.2.2")
                "ws-protocol"
                "http-encoding-chipz"
@@ -63,6 +63,7 @@
                (:file "poll-error-test")
                (:file "timeout-test")
                (:file "live-stream-test")
+               (:file "error-response-test")
                (:file "http2-test")
                (:file "h2-mux-test")
                (:file "websocket-test")

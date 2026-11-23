@@ -57,21 +57,36 @@ brotli and zstd are loaded the first time, when installed (see
                  :initform nil
                  :documentation "Seconds the server keeps the idle connection
 (Keep-Alive: timeout=N), or NIL when it did not say.")
+   (idle-limit :initarg :idle-limit :accessor async-conn-idle-limit
+               :initform nil
+               :documentation "Idle seconds after which the connection is not
+reused when IDLE-TIMEOUT is NIL (the pool's POOL-IDLE-LIMIT), or NIL.")
    (idle-since :initform (get-internal-real-time) :accessor async-conn-idle-since)))
 
-(defun make-async-pooled-connection (socket &key tls https idle-timeout)
+(defun make-async-pooled-connection (socket &key tls https idle-timeout
+                                              (idle-limit *pool-idle-limit*))
   (make-instance 'async-pooled-connection
                  :socket socket :tls tls :https https
-                 :idle-timeout idle-timeout))
+                 :idle-timeout idle-timeout
+                 :idle-limit idle-limit))
+
+(defun async-conn-reuse-limit (c)
+  "Idle seconds after which C is not reused: just under the server's
+   Keep-Alive timeout when it sent one, else C's IDLE-LIMIT (NIL: none)."
+  (let ((timeout (async-conn-idle-timeout c)))
+    (if timeout
+        (keep-alive-reuse-limit timeout)
+        (async-conn-idle-limit c))))
 
 (defun async-conn-idle-expired-p (c)
-  "T when C sat idle past (most of) the server's Keep-Alive timeout: the
-   server closes it about then, and a request written to it reads EOF."
-  (let ((limit (async-conn-idle-timeout c)))
+  "T when C sat idle past its reuse limit (ASYNC-CONN-REUSE-LIMIT): the
+   server closes it about then, or may already have closed it without saying
+   when, and a request written to it reads EOF (#55, #75)."
+  (let ((limit (async-conn-reuse-limit c)))
     (and limit
          (>= (/ (- (get-internal-real-time) (async-conn-idle-since c))
                 internal-time-units-per-second)
-             (keep-alive-reuse-limit limit)))))
+             limit))))
 
 (defmethod connection-alive-p ((c async-pooled-connection))
   "Alive if we still hold a usocket. Avoid probing the Lisp stream — on Windows
@@ -630,7 +645,8 @@ reader never waits on a request that no longer runs.")
                  (stop-io-and-timer)
                  (let ((conn (make-async-pooled-connection
                               sock :tls tls :https https
-                              :idle-timeout (keep-alive-timeout hdrs))))
+                              :idle-timeout (keep-alive-timeout hdrs)
+                              :idle-limit (pool-idle-limit pool))))
                    (setf sock nil
                          tls nil
                          fd nil
@@ -1546,9 +1562,11 @@ reader never waits on a request that no longer runs.")
                         (funcall parse! (make-array 0 :element-type '(unsigned-byte 8)))
                         (if (funcall finishedp)
                             (finish-response)
+                            ;; Typed (#64): HTTP-RETRY resends an idempotent
+                            ;; request whose response was cut off.
                             (fail (make-condition
-                                   'http-protocol-error
-                                   :message "incomplete HTTP response")))
+                                   'http-incomplete-response
+                                   :octets response-octets-seen)))
                         (return))
                        (t
                         (incf response-octets-seen n)

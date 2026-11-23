@@ -50,11 +50,41 @@
     (decf (http-backend-async::async-conn-idle-since c)
           (* 5 internal-time-units-per-second))
     (ok (http-backend-async::async-conn-idle-expired-p c)))
-  (let ((c (http-backend-async::make-async-pooled-connection nil)))
+  (let ((c (http-backend-async::make-async-pooled-connection
+            nil :idle-timeout 5 :idle-limit 1)))
+    (decf (http-backend-async::async-conn-idle-since c)
+          (* 2 internal-time-units-per-second))
+    (ok (not (http-backend-async::async-conn-idle-expired-p c))
+        "the server's Keep-Alive timeout rules, not the pool's idle limit"))
+  (let ((c (http-backend-async::make-async-pooled-connection nil :idle-limit nil)))
     (decf (http-backend-async::async-conn-idle-since c)
           (* 3600 internal-time-units-per-second))
-    (ok (not (http-backend-async::async-conn-idle-expired-p c)))))
+    (ok (not (http-backend-async::async-conn-idle-expired-p c))
+        "no Keep-Alive timeout and no idle limit: reused however long it idled")))
 
+;;; #75: api.anthropic.com sends no Keep-Alive header. Its idle TLS socket
+;;; (never probed) was reused after 25 minutes, the POST read EOF and failed
+;;; with "incomplete HTTP response". Without a Keep-Alive timeout the pool's
+;;; idle limit (*POOL-IDLE-LIMIT*, 30 s) retires the connection.
+
+(deftest pooled-connection-without-keep-alive-timeout-expires-at-idle-limit
+  (ok (eql 30 *pool-idle-limit*))
+  (let ((c (http-backend-async::make-async-pooled-connection nil)))
+    (ok (eql *pool-idle-limit* (http-backend-async::async-conn-idle-limit c)))
+    (decf (http-backend-async::async-conn-idle-since c)
+          (* 29 internal-time-units-per-second))
+    (ok (not (http-backend-async::async-conn-idle-expired-p c)) "29 s idle: reused")
+    (decf (http-backend-async::async-conn-idle-since c)
+          (* 2 internal-time-units-per-second))
+    (ok (http-backend-async::async-conn-idle-expired-p c) "31 s idle: retired"))
+  (ok (eql 30 (pool-idle-limit (make-lru-connection-pool))))
+  (ok (eql 2 (pool-idle-limit (make-lru-connection-pool :idle-limit 2))))
+  (ok (null (pool-idle-limit (make-lru-connection-pool :idle-limit nil))))
+  (let ((*pool-idle-limit* 7))
+    (ok (eql 7 (lru-pool-idle-limit (make-lru-connection-pool)))
+        "a pool reads *POOL-IDLE-LIMIT* when it is made")
+    (ok (eql 7 (pool-idle-limit :not-an-lru-pool)) "other pools: the special"))
+  (ok (signals (make-lru-connection-pool :idle-limit -1) 'type-error)))
 (deftest stale-pooled-connection-is-redialed
   "The server says keep-alive, then hangs up (its idle timeout fired): the
    second GET reads EOF on the pooled socket and is sent again on a new one."
@@ -159,6 +189,65 @@
                           eb el)
                          'http-error))
             (ok (= 1 *fixture-request-count*))
+            (pool-clear pool)))))))
+
+;;; #75 end to end, probe off: a TLS socket is never probed before reuse.
+
+(defun %no-keep-alive-header-handler (method path headers body)
+  "200 JSON with Connection: keep-alive (the fixture's) and no Keep-Alive
+   header, as api.anthropic.com answers."
+  (declare (ignore method path headers body))
+  (values 200 '(("content-type" . "application/json"))
+          (babel:string-to-octets "{\"ok\":true}")))
+
+(deftest idle-limit-retires-a-pooled-socket-before-post
+  "The server says keep-alive, sends no Keep-Alive timeout and drops the idle
+   socket. Unprobed (as a TLS socket is), the POST after the pool's idle limit
+   goes out on a new connection instead of reading EOF on the old one."
+  (%without-probe
+    (let ((http-protocol:*default-connection-pool* nil))
+      (with-http-fixture (#'%no-keep-alive-header-handler
+                          :keep-alive :close-after-response)
+        (with-async-test (eb el hb)
+          (let* ((pool (make-lru-connection-pool :max-size 4 :idle-limit 0.3))
+                 (client (make-http-client hb :pool pool)))
+            (ok (= 200 (response-status
+                        (%await-promise
+                         (get-async (fixture-url "/v1/models") :client client)
+                         eb el))))
+            (sleep 0.5)
+            (let ((res (handler-case
+                           (%await-promise
+                            (post-async (fixture-url "/v1/messages") :client client
+                                                                      :content "{}")
+                            eb el)
+                         (http-error (e) e))))
+              (ok (typep res 'http-response) (princ-to-string res))
+              (ok (and (typep res 'http-response) (= 200 (response-status res)))))
+            (ok (= 2 *fixture-accept-count*))
+            (ok (= 2 *fixture-request-count*) "the POST was sent once")
+            (pool-clear pool)))))))
+
+(deftest pooled-socket-is-reused-within-the-idle-limit
+  "No Keep-Alive timeout and a live socket: a POST inside the idle limit
+   reuses the pooled connection."
+  (%without-probe
+    (let ((http-protocol:*default-connection-pool* nil))
+      (with-http-fixture (#'%no-keep-alive-header-handler :keep-alive t)
+        (with-async-test (eb el hb)
+          (let* ((pool (make-lru-connection-pool :max-size 4 :idle-limit 5))
+                 (client (make-http-client hb :pool pool)))
+            (ok (= 200 (response-status
+                        (%await-promise
+                         (get-async (fixture-url "/v1/models") :client client)
+                         eb el))))
+            (ok (= 200 (response-status
+                        (%await-promise
+                         (post-async (fixture-url "/v1/messages") :client client
+                                                                   :content "{}")
+                         eb el))))
+            (ok (= 1 *fixture-accept-count*))
+            (ok (= 2 *fixture-request-count*))
             (pool-clear pool)))))))
 
 ;;; #57: a socket the peer reset is a connection error, not a would-block read

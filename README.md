@@ -40,6 +40,16 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
   streams signal from the read, and are not retried. On a loop the caller
   bound (`event-protocol:*event-loop*`), a streamed request runs on a private
   loop of the same event backend.
+- HTTP/1.1 keep-alive pool (`make-lru-connection-pool`): an idle connection
+  is reused until just before the server's `Keep-Alive: timeout=N`. Without
+  that header it is reused for `*pool-idle-limit*` seconds (30; per pool
+  `:idle-limit`, NIL for no limit), then closed: servers that drop idle
+  sockets without saying when (api.anthropic.com) otherwise answer the next
+  request with EOF. An idempotent request (GET, HEAD, OPTIONS, TRACE, PUT,
+  DELETE) that reads EOF before any response octet on a reused socket is
+  sent again on a new one; a POST is not.
+- A response cut off by EOF is `http-protocol:http-incomplete-response`, a
+  connection error: `:retry` resends an idempotent request.
 
 ## Use
 
