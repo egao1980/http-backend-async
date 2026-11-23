@@ -191,37 +191,54 @@
         (ok (%wait-until (lambda () (null (%pump-threads))) 3)
             "the pump thread ended")))))
 
+(defun %h2-drip-request ()
+  "The live drip request; NIL plus the condition when the origin cannot be
+   reached (TLS or connection failure before any header), after one retry."
+  (let ((last nil))
+    (loop repeat 2
+          do (handler-case
+                 (return-from %h2-drip-request
+                   (let ((event-protocol:*event-backend* nil)
+                         (event-protocol:*event-loop* nil))
+                     (http:request :get "https://httpbingo.org/drip?duration=3&numbytes=3&delay=0"
+                                   ;; httpbingo answers 402 without one
+                                   :headers '(("user-agent" . "http-backend-async-tests"))
+                                   ;; identity: a br/gzip decoder holds its
+                                   ;; output until EOF (http-protocol#47)
+                                   :accept-encoding nil
+                                   :timeout '(:connect 10 :read 10)
+                                   :want-stream t)))
+               ((or http-tls-error http-connection-error) (c)
+                 (setf last c)
+                 (sleep 1))))
+    (values nil last)))
+
 (deftest sync-want-stream-h2-live
   "Live H2 :want-stream via the blocking SEND: chunks arrive over time.
-   Gate with HTTP_ASYNC_H2_LIVE=1 (httpbingo.org /drip)."
+   Gate with HTTP_ASYNC_H2_LIVE=1 (httpbingo.org /drip). Skipped when the
+   origin refuses the connection (a TLS EOF from Windows runners)."
   (if (not (equal (uiop:getenv "HTTP_ASYNC_H2_LIVE") "1"))
       (skip "set HTTP_ASYNC_H2_LIVE=1")
       (with-async-test (eb el hb)
         (declare (ignore eb el hb))
-        (let* ((start (get-internal-real-time))
-               (res (let ((event-protocol:*event-backend* nil)
-                          (event-protocol:*event-loop* nil))
-                      (http:request :get "https://httpbingo.org/drip?duration=3&numbytes=3&delay=0"
-                                    ;; httpbingo answers 402 without one
-                                    :headers '(("user-agent" . "http-backend-async-tests"))
-                                    ;; identity: a br/gzip decoder holds its
-                                    ;; output until EOF (http-protocol#47)
-                                    :accept-encoding nil
-                                    :timeout '(:connect 10 :read 10)
-                                    :want-stream t)))
-               (returned (%elapsed-since start))
-               (s (body-stream res))
-               (times '()))
-          (unwind-protect
-               (loop for b = (read-byte s nil nil)
-                     while b do (push (%elapsed-since start) times))
-            (close (response-body res)))
-          (setf times (nreverse times))
-          (ok (= 200 (response-status res)))
-          (ok (eq :http/2 (response-http-version res)))
-          (ok (= 3 (length times)))
-          (ok (and times
-                   ;; relative: the round trip to the origin varies (2 s on CI)
-                   (< returned (- (car (last times)) 1.0))
-                   (< (first times) (- (car (last times)) 1.0)))
-              (format nil "returned ~,2F s; bytes at ~{~,2F~^ ~}" returned times))))))
+        (let ((start (get-internal-real-time)))
+          (multiple-value-bind (res unreachable) (%h2-drip-request)
+            (if (null res)
+                (skip (format nil "httpbingo unreachable: ~A" unreachable))
+                (let ((returned (%elapsed-since start))
+                      (s (body-stream res))
+                      (times '()))
+                  (unwind-protect
+                       (loop for b = (read-byte s nil nil)
+                             while b do (push (%elapsed-since start) times))
+                    (close (response-body res)))
+                  (setf times (nreverse times))
+                  (ok (= 200 (response-status res)))
+                  (ok (eq :http/2 (response-http-version res)))
+                  (ok (= 3 (length times)))
+                  (ok (and times
+                           ;; relative: the round trip to the origin varies
+                           (< returned (- (car (last times)) 1.0))
+                           (< (first times) (- (car (last times)) 1.0)))
+                      (format nil "returned ~,2F s; bytes at ~{~,2F~^ ~}"
+                              returned times)))))))))
