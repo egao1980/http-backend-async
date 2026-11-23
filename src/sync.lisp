@@ -6,8 +6,9 @@
 ;;; :WANT-STREAM T returns as soon as the headers arrive, with the live
 ;;; ASYNC-BODY-INPUT-STREAM as the body (#70). On a loop made for this call,
 ;;; a pump thread keeps running the loop until the body ends (EOF, error,
-;;; CLOSE by the reader, or a timeout). On a loop the caller bound, the body
-;;; is read whole here first: another thread must not run the caller's loop.
+;;; CLOSE by the reader, or a timeout). When the caller bound a loop
+;;; (event-protocol:*event-loop*), a streamed request gets a private loop of
+;;; the same backend instead: another thread must never run the caller's.
 
 (defun %spawn-stream-pump (backend event-backend event-loop handle feed
                            total-timer)
@@ -33,14 +34,30 @@
   (handler-case (progn (event-protocol:wake-call event-backend event-loop (lambda ())) t)
     (error () nil)))
 
+(defun %await-event-context (want-stream-p)
+  "(values event-backend event-loop owned-p) for one blocking SEND. A
+   streamed request on a loop the caller bound gets a private loop of the
+   same backend, so its pump never runs the caller's loop."
+  (multiple-value-bind (eb el owned-p) (%ensure-event-context)
+    (if (or owned-p (not want-stream-p))
+        (values eb el owned-p)
+        (let ((private (make-event-loop eb)))
+          (if (%stream-pump-p eb private)
+              (values eb private t)
+              (progn (close-event-loop eb private)
+                     (values eb el nil)))))))
+
 (defun %await-send-async (backend client request &key (timeout-seconds 30.0))
   "Run SEND-ASYNC to completion on a fresh/bound event loop. Returns HTTP-RESPONSE.
-   :WANT-STREAM T on a fresh loop returns at the headers; the body is the
-   live stream, fed by a pump thread until it ends. Read it to EOF or CLOSE
-   it. On a bound loop the body is read whole on a worker first.
+   :WANT-STREAM T returns at the headers; the body is the live stream, fed
+   by a pump thread until it ends. Read it to EOF or CLOSE it. With a loop
+   the caller bound, a streamed request runs on a private loop of the same
+   event backend (pumped and closed like a fresh one); an event backend
+   without WAKE-CALL reads the body whole on a worker first.
    TIMEOUT-SECONDS caps the whole wait, body included; NIL means no cap here
    (SEND-ASYNC's connect / read watchdog still ends a stalled request)."
-  (multiple-value-bind (event-backend event-loop owned-p) (%ensure-event-context)
+  (multiple-value-bind (event-backend event-loop owned-p)
+      (%await-event-context (http-request-want-stream request))
     (let* ((result nil)
            (err nil)
            (done nil)
