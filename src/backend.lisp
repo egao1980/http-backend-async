@@ -197,6 +197,10 @@ brotli and zstd are loaded the first time, when installed (see
    (cancel-hook :initform nil :accessor async-request-cancel-hook
                 :documentation "Thunk run on cancel: an HTTP/2 request resets its stream
 instead of closing the shared connection.")
+   (body-feed :initform nil :accessor async-request-body-feed
+              :documentation "The streamed response body (ASYNC-BODY-INPUT-STREAM)
+once headers are delivered with :WANT-STREAM T. CANCEL-REQUEST ends it, so a
+reader never waits on a request that no longer runs.")
    (event-backend :initarg :event-backend :reader async-request-event-backend)
    (event-loop :initarg :event-loop :reader async-request-event-loop)))
 
@@ -216,7 +220,10 @@ instead of closing the shared connection.")
         (ignore-errors (cancel eb tm))))
     (tls-close (async-request-tls-stream handle))
     (setf (async-request-tls-stream handle) nil)
-    (close-socket (async-request-socket handle)))
+    (close-socket (async-request-socket handle))
+    (when-let ((feed (async-request-body-feed handle)))
+      (async-body-abort feed (make-condition 'http-connection-error
+                                             :message "request canceled"))))
   handle)
 
 (defun %ensure-event-context ()
@@ -538,6 +545,10 @@ instead of closing the shared connection.")
                            (t nil))
                          wpos 0)
                    n))
+               (unpause-read-threadsafe ()
+                 "ON-SPACE runs on the body reader's thread; hop onto the loop."
+                 (unless (async-request-canceled-p handle)
+                   (call-on-loop #'unpause-read)))
                (unpause-read ()
                  (when read-paused-p
                    (touch)
@@ -684,7 +695,8 @@ instead of closing the shared connection.")
                                headers* (fast-http:http-version http)))
                          body-feed
                          (make-async-body-input-stream
-                          :on-space #'unpause-read)
+                          :on-space #'unpause-read-threadsafe)
+                         (async-request-body-feed handle) body-feed
                          streaming-final-p t)
                    (funcall set-body-fn
                             (lambda (data start end)
@@ -1004,6 +1016,7 @@ instead of closing the shared connection.")
                  (setf reuse-ok-p keep-alive-p
                        body-feed (make-async-body-input-stream
                                   :on-space #'unpause-h2-threadsafe)
+                       (async-request-body-feed handle) body-feed
                        streaming-final-p t)
                  (multiple-value-bind (app-stream headers**)
                      (apply-response-content-encoding

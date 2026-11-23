@@ -33,6 +33,12 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
   bare number is `:total`; no timeout is the protocol default (30 s total);
   `(:connect 30 :read 300)` has no total cap. Errors are `http-timeout-error`
   ("connect timed out …", "read timed out: no data for N s …").
+- Blocking `send` with `:want-stream t` returns when the headers arrive; the
+  body is the live stream (SSE events reach the reader as they arrive). A
+  pump thread runs the request's own loop until the body ends; read it to EOF
+  or `close` it (closing early ends the request). Timeouts while the body
+  streams signal from the read, and are not retried. On a loop the caller
+  bound (`event-protocol:*event-loop*`), the body is read whole first.
 
 ## Use
 
