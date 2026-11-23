@@ -79,11 +79,25 @@
   (format nil "~{~A~}" (loop for i below n collect (format nil "data: t~D~%" i))))
 
 (defun %sync (url timeout &key want-stream (method :get) retry)
-  "Blocking SEND with no event loop bound: the backend makes its own."
-  (let ((event-protocol:*event-backend* nil)
-        (event-protocol:*event-loop* nil))
-    (http:request method url :timeout timeout :want-stream want-stream
-                             :retry retry)))
+  "Blocking SEND with no event loop bound: the backend makes its own.
+   A live :WANT-STREAM body (#70) is read to EOF here, as a caller does, so
+   a timeout while it streams signals from this call; the result then holds
+   the octets."
+  (let* ((res (let ((event-protocol:*event-backend* nil)
+                    (event-protocol:*event-loop* nil))
+                (http:request method url :timeout timeout :want-stream want-stream
+                                         :retry retry)))
+         (body (response-body res)))
+    (if (streamp body)
+        (make-instance 'http-response
+                       :status (response-status res)
+                       :headers (response-headers res)
+                       :body (unwind-protect (http-backend-async::slurp-octets
+                                              (body-stream res))
+                               (close body))
+                       :url (response-url res)
+                       :request (response-request res))
+        res)))
 
 (defun %elapsed-since (start)
   (/ (- (get-internal-real-time) start) internal-time-units-per-second))
@@ -158,10 +172,18 @@
         (ok (= 1 *drip-accepts*) (format nil "POST connections: ~D" *drip-accepts*))
         (setf *drip-accepts* 0)
         (ok (typep (%timeout-condition
+                    (lambda () (%sync url '(:read 0.5) :method :get :retry retry)))
+                   'http-timeout-error))
+        (ok (= 3 *drip-accepts*) (format nil "GET connections: ~D" *drip-accepts*))
+        ;; #70: a live :WANT-STREAM body has reached the caller once SEND
+        ;; returns, so a timeout while it streams is the reader's, not retried.
+        (setf *drip-accepts* 0)
+        (ok (typep (%timeout-condition
                     (lambda () (%sync url '(:read 0.5) :method :get :retry retry
                                                        :want-stream t)))
                    'http-timeout-error))
-        (ok (= 3 *drip-accepts*) (format nil "GET connections: ~D" *drip-accepts*))))))
+        (ok (= 1 *drip-accepts*)
+            (format nil "streamed GET connections: ~D" *drip-accepts*))))))
 
 (deftest connect-timeout-applies-to-setup-only
   ;; A routable-nowhere address never answers the SYN: the :connect limit

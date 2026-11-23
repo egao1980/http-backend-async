@@ -1,5 +1,5 @@
 (defsystem "http-backend-async"
-  :version "0.2.25"
+  :version "0.2.26"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
@@ -62,6 +62,7 @@
                (:file "backend-test")
                (:file "poll-error-test")
                (:file "timeout-test")
+               (:file "live-stream-test")
                (:file "http2-test")
                (:file "h2-mux-test")
                (:file "websocket-test")
