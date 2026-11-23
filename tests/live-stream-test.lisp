@@ -184,7 +184,7 @@
 
 (deftest sync-want-stream-h2-live
   "Live H2 :want-stream via the blocking SEND: chunks arrive over time.
-   Gate with HTTP_ASYNC_H2_LIVE=1 (nghttp2.org httpbin /drip)."
+   Gate with HTTP_ASYNC_H2_LIVE=1 (httpbingo.org /drip)."
   (if (not (equal (uiop:getenv "HTTP_ASYNC_H2_LIVE") "1"))
       (skip "set HTTP_ASYNC_H2_LIVE=1")
       (with-async-test (eb el hb)
@@ -192,7 +192,7 @@
         (let* ((start (get-internal-real-time))
                (res (let ((event-protocol:*event-backend* nil)
                           (event-protocol:*event-loop* nil))
-                      (http:request :get "https://nghttp2.org/httpbin/drip?duration=3&numbytes=3&delay=0"
+                      (http:request :get "https://httpbingo.org/drip?duration=3&numbytes=3&delay=0"
                                     :timeout '(:connect 10 :read 10)
                                     :want-stream t)))
                (returned (%elapsed-since start))
@@ -203,6 +203,7 @@
                      while b do (push (%elapsed-since start) times))
             (close (response-body res)))
           (setf times (nreverse times))
+          (ok (= 200 (response-status res)))
           (ok (eq :http/2 (response-http-version res)))
           (ok (= 3 (length times)))
           (ok (and times (< returned 2.0) (< (first times) (- (car (last times)) 1.0)))
