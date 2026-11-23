@@ -211,5 +211,8 @@
           (ok (= 200 (response-status res)))
           (ok (eq :http/2 (response-http-version res)))
           (ok (= 3 (length times)))
-          (ok (and times (< returned 2.0) (< (first times) (- (car (last times)) 1.0)))
+          (ok (and times
+                   ;; relative: the round trip to the origin varies (2 s on CI)
+                   (< returned (- (car (last times)) 1.0))
+                   (< (first times) (- (car (last times)) 1.0)))
               (format nil "returned ~,2F s; bytes at ~{~,2F~^ ~}" returned times))))))
