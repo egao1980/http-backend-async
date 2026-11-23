@@ -193,6 +193,11 @@
                (res (let ((event-protocol:*event-backend* nil)
                           (event-protocol:*event-loop* nil))
                       (http:request :get "https://httpbingo.org/drip?duration=3&numbytes=3&delay=0"
+                                    ;; httpbingo answers 402 without one
+                                    :headers '(("user-agent" . "http-backend-async-tests"))
+                                    ;; identity: a br/gzip decoder holds its
+                                    ;; output until EOF (http-protocol#47)
+                                    :accept-encoding nil
                                     :timeout '(:connect 10 :read 10)
                                     :want-stream t)))
                (returned (%elapsed-since start))
