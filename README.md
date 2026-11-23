@@ -38,7 +38,8 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
   pump thread runs the request's own loop until the body ends; read it to EOF
   or `close` it (closing early ends the request). Timeouts while the body
   streams signal from the read, and are not retried. On a loop the caller
-  bound (`event-protocol:*event-loop*`), the body is read whole first.
+  bound (`event-protocol:*event-loop*`), a streamed request runs on a private
+  loop of the same event backend.
 
 ## Use
 

@@ -79,11 +79,14 @@
 (defmacro with-gate-origin ((origin-var &rest serve-args) &body body)
   `(call-with-gate-origin (lambda (,origin-var) ,@body) ,@serve-args))
 
-(defun %sync-live (url timeout)
-  "Blocking SEND, no loop bound, :WANT-STREAM T: the response as returned."
-  (let ((event-protocol:*event-backend* nil)
-        (event-protocol:*event-loop* nil))
-    (http:request :get url :timeout timeout :want-stream t)))
+(defun %sync-live (url timeout &key bound)
+  "Blocking SEND, :WANT-STREAM T: the response as returned. BOUND keeps the
+   caller's event loop bound (as cl-stack-code does); else none is."
+  (if bound
+      (http:request :get url :timeout timeout :want-stream t)
+      (let ((event-protocol:*event-backend* nil)
+            (event-protocol:*event-loop* nil))
+        (http:request :get url :timeout timeout :want-stream t))))
 
 (defun %read-lf-line (stream)
   "One LF-terminated line as a string (without the LF), NIL at EOF."
@@ -110,11 +113,16 @@
         do (sleep 0.05))
   (funcall predicate))
 
-(deftest sync-want-stream-delivers-each-event-as-it-arrives
+(deftest-parametrize sync-want-stream-delivers-each-event-as-it-arrives
+    ((bound)
+     (nil)
+     ;; the caller bound its own loop: the request runs on a private one
+     (t))
   (with-async-test (eb el hb)
     (declare (ignore eb el hb))
     (with-gate-origin (origin :events 5 :first-delay 1 :gap 0.3)
-      (let* ((res (%sync-live (gate-origin-url origin) '(:connect 5 :read 5)))
+      (let* ((res (%sync-live (gate-origin-url origin) '(:connect 5 :read 5)
+                              :bound bound))
              (returned-at (%gate-seconds origin))
              (seen '()))
         (ok (= 200 (response-status res)))
@@ -149,7 +157,8 @@
   (with-async-test (eb el hb)
     (declare (ignore eb el hb))
     (with-gate-origin (origin :events 100 :gap 0.1 :gated nil)
-      (let* ((res (%sync-live (gate-origin-url origin) '(:connect 5 :read 5)))
+      (let* ((res (%sync-live (gate-origin-url origin) '(:connect 5 :read 5)
+                              :bound t))
              (s (body-stream res))
              (line (loop for l = (%read-lf-line s)
                          while l
