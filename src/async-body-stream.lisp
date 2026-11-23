@@ -37,6 +37,17 @@ that drains it below LIMIT clears it and runs ON-SPACE.")
               :documentation "Thunk run once when the body is FINISHED, on the
 thread that ended it. See ASYNC-BODY-WATCH-FINISH.")))
 
+;; SBCL has no STREAM-ELEMENT-TYPE or STREAM-CLEAR-INPUT method for binary
+;; Gray streams: a consumer asking the element type before it reads an error
+;; body (llm-protocol-openai) got NO-APPLICABLE-METHOD (#74).
+(defmethod stream-element-type ((s async-body-input-stream))
+  '(unsigned-byte 8))
+
+(defmethod trivial-gray-streams:stream-clear-input ((s async-body-input-stream))
+  "No-op: a body is not interactive, and dropping queued octets would only
+   lose body data."
+  nil)
+
 (defun make-async-body-input-stream (&key (limit (%async-body-limit)) on-space)
   (make-instance 'async-body-input-stream :limit limit :on-space on-space))
 

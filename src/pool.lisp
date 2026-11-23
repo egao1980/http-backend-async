@@ -10,17 +10,43 @@
    (connection :initarg :connection :accessor lru-entry-connection)
    (on-evict :initarg :on-evict :accessor lru-entry-on-evict :initform nil)))
 
+(defvar *pool-idle-limit* 30
+  "Seconds a pooled HTTP/1.1 connection may sit idle and still be reused when
+   its server sent no Keep-Alive: timeout=N. Past it the pool closes the
+   connection instead of reusing it: a server or load balancer that drops idle
+   sockets without saying when (api.anthropic.com) answers a request on one
+   with EOF, and a POST is not resent (#75). NIL: no limit. A Keep-Alive
+   timeout, when the server sends one, applies instead.
+   A pool reads it when it is made; MAKE-LRU-CONNECTION-POOL :IDLE-LIMIT
+   sets it per pool.")
+
 (defclass lru-connection-pool (http-connection-pool)
   ((lock :initform (bt:make-lock "http-connection-pool") :reader lru-pool-lock)
    (table :initform (make-hash-table :test #'equal) :reader lru-pool-table)
    (head :initform nil :accessor lru-pool-head)
    (tail :initform nil :accessor lru-pool-tail)
    (count :initform 0 :accessor lru-pool-count)
-   (max-size :initarg :max-size :accessor lru-pool-max-size :initform 8))
+   (max-size :initarg :max-size :accessor lru-pool-max-size :initform 8)
+   (idle-limit :initarg :idle-limit :accessor lru-pool-idle-limit
+               :initform *pool-idle-limit*
+               :documentation "Idle seconds after which a connection whose
+server sent no Keep-Alive timeout is not reused, or NIL (*POOL-IDLE-LIMIT*)."))
   (:documentation "LRU multi-map: same KEY may hold several connections."))
 
-(defun make-lru-connection-pool (&key (max-size 8))
-  (make-instance 'lru-connection-pool :max-size max-size))
+(defun make-lru-connection-pool (&key (max-size 8) (idle-limit *pool-idle-limit*))
+  "LRU pool of at most MAX-SIZE idle connections. IDLE-LIMIT: idle seconds
+   after which a connection whose server sent no Keep-Alive timeout is closed
+   instead of reused (NIL: no limit)."
+  (check-type idle-limit (or null (real 0)))
+  (make-instance 'lru-connection-pool :max-size max-size :idle-limit idle-limit))
+
+(defgeneric pool-idle-limit (pool)
+  (:documentation "Idle seconds after which POOL does not reuse a connection
+   whose server sent no Keep-Alive timeout, or NIL for no limit.")
+  (:method ((pool t))
+    *pool-idle-limit*)
+  (:method ((pool lru-connection-pool))
+    (lru-pool-idle-limit pool)))
 
 (defun %lru-unlink (pool entry)
   (let ((prev (lru-entry-prev entry))

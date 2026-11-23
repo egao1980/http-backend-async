@@ -47,6 +47,9 @@
            #:async-request-canceled-p
            #:lru-connection-pool
            #:make-lru-connection-pool
+           #:*pool-idle-limit*
+           #:lru-pool-idle-limit
+           #:pool-idle-limit
            #:async-pooled-connection
            #:make-async-pooled-connection
            #:async-pooled-h2-connection
