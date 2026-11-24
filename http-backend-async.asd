@@ -1,5 +1,5 @@
 (defsystem "http-backend-async"
-  :version "0.2.29"
+  :version "0.2.30"
   :description "Async http-protocol backend on event-protocol (register-io)"
   :author "egao1980"
   :license "MIT"
@@ -39,6 +39,7 @@
                (:file "http1")
                (:file "http2")
                (:file "redirect")
+               (:file "route")
                (:file "tls")
                (:file "h2-mux")
                (:file "backend")

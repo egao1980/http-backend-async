@@ -314,3 +314,52 @@
                (%check-hop (nth i hops) url (%hop-proxy-kind proxies url) authorization-p)
                (setf previous url)))
     (ok (null errors) (format nil "fixture errors: ~S" errors))))
+
+(deftest-parametrize hop-route-forms
+    ((proxy url form host port tls-p)
+     (nil "http://origin.test/a" :direct "origin.test" 80 nil)
+     (nil "https://origin.test:8443/a" :direct "origin.test" 8443 nil)
+     ("http://user:secret@127.0.0.1:3128" "http://origin.test/a"
+      :absolute-form "127.0.0.1" 3128 nil)
+     ("http://user:secret@127.0.0.1:3128" "https://origin.test/a"
+      :connect "127.0.0.1" 3128 nil)
+     ("https://user:secret@127.0.0.1:8443" "http://origin.test/a"
+      :absolute-form "127.0.0.1" 8443 t)
+     ("https://user:secret@127.0.0.1:8443" "https://origin.test/a"
+      :connect "127.0.0.1" 8443 t)
+     ("socks5h://user:secret@127.0.0.1:1080" "https://origin.test/a"
+      :socks5 "127.0.0.1" 1080 nil))
+  (let ((route (http-backend-async::hop-route proxy (quri:uri url))))
+    (ok (eq form (http-backend-async::route-form route))
+        (format nil "~A via ~A: ~S" url proxy (http-backend-async::route-form route)))
+    (ok (equal host (http-backend-async::route-host route)) "dials the proxy, or the origin")
+    (ok (eql port (http-backend-async::route-port route)))
+    (ok (eq tls-p (http-backend-async::route-tls-p route)) "TLS to an https:// proxy")
+    (ok (equal (and proxy "user") (http-backend-async::route-user route)))
+    (ok (eq (eq form :absolute-form)
+            (and (assoc "proxy-authorization"
+                        (http-backend-async::add-proxy-authorization '() route)
+                        :test #'string-equal)
+                 t))
+        "Proxy-Authorization in the request head for absolute-form only")))
+
+(deftest-parametrize prepare-redirect-hop-credentials
+    ((to authorization-p)
+     ("http://origin.test/b" t)
+     ("http://origin.test:80/b" t)
+     ("https://origin.test/b" nil)
+     ("http://origin.test:8080/b" nil)
+     ("http://other.test/b" nil))
+  (multiple-value-bind (method uri headers)
+      (http-backend-async::prepare-redirect-hop
+       302 (quri:uri "http://origin.test/a") (quri:uri to) :get #()
+       '(("authorization" . "Basic YWxpY2U6bWFkZS11cA==")
+         ("proxy-authorization" . "Basic dXNlcjpzZWNyZXQ=")
+         ("x-kept" . "yes"))
+       (cl-cookie:make-cookie-jar) nil)
+    (declare (ignore method uri))
+    (ok (eq authorization-p (and (assoc "authorization" headers :test #'string-equal) t))
+        (if authorization-p "Authorization kept on the same origin" "Authorization dropped"))
+    (ok (null (assoc "proxy-authorization" headers :test #'string-equal))
+        "Proxy-Authorization never carries over: the caller adds it per hop")
+    (ok (assoc "x-kept" headers :test #'string-equal))))

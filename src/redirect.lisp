@@ -30,17 +30,37 @@
                        :test #'string-equal))
              headers))
 
-(defun prepare-redirect-hop (status uri method body-octets headers cookie-jar
-                             accept-encoding-header)
-  "After Location resolve: return (values method uri headers body host port https)."
+(defun redirect-same-origin-p (from to)
+  "FROM and TO (quri URIs) have the same scheme, host and port, default
+   ports filled in: a redirect between them keeps Authorization."
+  (multiple-value-bind (host port scheme) (%uri-host-port from)
+    (multiple-value-bind (to-host to-port to-scheme) (%uri-host-port to)
+      (and (string-equal scheme to-scheme)
+           (string-equal host to-host)
+           (= port to-port)))))
+
+(defun prepare-redirect-hop
+    (status from uri method body-octets headers cookie-jar accept-encoding-header)
+  "The request a STATUS redirect from FROM to URI (quri URIs, URI resolved
+   from Location) makes. → (values method uri headers body host port https)
+
+   307/308 keep METHOD and the body; 301/302/303 send GET without the body
+   and the headers that describe it. Host is URI's and Cookie comes from
+   COOKIE-JAR for URI. Proxy-Authorization is always dropped: the caller
+   adds it back only for an absolute-form hop to an http(s) proxy, never
+   inside a CONNECT tunnel to the origin (requests' rebuild_proxies, #82).
+   On another origin (scheme, host or port) Authorization goes too, as
+   http-backend-dexador drops it."
   (let* ((new-method (if (redirect-preserves-method-p status) method :get))
          (new-body (if (redirect-preserves-method-p status)
                        body-octets
                        (make-array 0 :element-type '(unsigned-byte 8))))
-         (headers (copy-list headers)))
+         (drop (if (redirect-same-origin-p from uri)
+                   '("host" "cookie" "proxy-authorization")
+                   '("host" "cookie" "proxy-authorization" "authorization")))
+         (headers (remove-if (lambda (pair) (member (car pair) drop :test #'string-equal))
+                             headers)))
     (multiple-value-bind (host port scheme) (%uri-host-port uri)
-      (setf headers (remove "host" headers :key #'car :test #'string-equal)
-            headers (remove "cookie" headers :key #'car :test #'string-equal))
       (unless (redirect-preserves-method-p status)
         (setf headers (%strip-body-headers headers)))
       (when (and accept-encoding-header

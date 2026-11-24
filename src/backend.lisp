@@ -333,25 +333,14 @@ reader never waits on a request that no longer runs.")
                (streaming-final-p nil)
                (headers-delivered-p nil)
                (read-paused-p nil)
-               (pool-key* (pool-key scheme host port :proxy proxy-url))
-               (connect-host host)
-               (connect-port port)
+               (route (hop-route proxy-url uri))
+               (pool-key* (route-pool-key route))
                (previous-pool-key nil)
-               (proxied-http-p nil)
-               (http-connect-p nil) ; HTTPS via HTTP proxy → CONNECT then TLS
-               (proxy-user nil)
-               (proxy-pass nil)
-               (tls-proxy-p nil)
-               (proxy-host nil)
-               (connect-step nil)
+               (connect-step nil) ; HTTPS via HTTP proxy → CONNECT then TLS
                (connect-out nil)
                (connect-wpos 0)
                (connect-in (make-array 0 :element-type '(unsigned-byte 8)
                                          :adjustable t :fill-pointer 0))
-               (socks-p nil)
-               (socks-user nil)
-               (socks-pass nil)
-               (socks-remote-dns nil)
                (socks-step nil)
                (socks-out nil)
                (socks-wpos 0)
@@ -390,35 +379,6 @@ reader never waits on a request that no longer runs.")
                (last-activity (get-internal-real-time)))
           (multiple-value-setq (connect-limit read-limit)
             (%phase-timeouts request client))
-          (when proxy-url
-            (multiple-value-bind (pscheme phost pport puser ppass)
-                (parse-proxy-uri proxy-url)
-              (ecase (proxy-kind proxy-url)
-                ((:http :https)
-                 ;; dexador: cleartext → absolute-form; https → CONNECT then TLS.
-                 ;; An https:// proxy gets TLS first, checked against its own host
-                 ;; name; CONNECT or the absolute-form request go inside it (#53).
-                 (setf connect-host phost
-                       connect-port pport
-                       proxy-user puser
-                       proxy-pass ppass
-                       tls-proxy-p (proxy-tls-p proxy-url)
-                       proxy-host phost
-                       http-connect-p https
-                       proxied-http-p (not https)))
-                (:socks5
-                 (setf connect-host phost
-                       connect-port pport
-                       socks-p t
-                       socks-user puser
-                       socks-pass ppass
-                       socks-remote-dns (socks-remote-dns-p pscheme)
-                       proxied-http-p nil
-                       http-connect-p nil))
-                (:socks4
-                 (error 'unsupported-operation
-                        :operation :socks4-proxy
-                        :message "SOCKS4 not implemented; use socks5:// or socks5h://")))))
           (labels
               ((touch ()
                  "Octets moved (or the consumer drained the body): restart
@@ -486,12 +446,7 @@ reader never waits on a request that no longer runs.")
                                     (format nil "~A:~A" host port))
                                 headers)))
                  ;; Cleartext HTTP via proxy: Proxy-Authorization (dexador).
-                 (when (and proxied-http-p
-                            (not (assoc "proxy-authorization" headers
-                                        :test #'string-equal)))
-                   (let ((v (proxy-authorization-value proxy-user proxy-pass)))
-                     (when v
-                       (setf headers (acons "proxy-authorization" (make-secret v) headers)))))
+                 (setf headers (add-proxy-authorization headers route))
                  (setf headers (inject-cookie-header headers cookie-jar
                                                      (quri:render-uri uri)))
                  ;; Credentials travel as SECRETs: frames and conditions below
@@ -527,7 +482,7 @@ reader never waits on a request that no longer runs.")
                                         method uri headers
                                         :chunked-p chunked-p
                                         :content-length content-length
-                                        :absolute-p proxied-http-p
+                                        :absolute-p (route-absolute-form-p route)
                                         :keep-alive keep-alive-p)
                             wpos 0
                             chunk-frame nil))
@@ -538,13 +493,13 @@ reader never waits on a request that no longer runs.")
                             chunked-p nil
                             req-octets (build-request-octets
                                         method uri headers body-octets
-                                        :absolute-p proxied-http-p
+                                        :absolute-p (route-absolute-form-p route)
                                         :keep-alive keep-alive-p)
                             wpos 0
                             chunk-frame nil)))))
                (%write-octets (octets from to)
                  "Write OCTETS[FROM:TO]. Returns (values new-pos done-p want)."
-                 (when (and tls-proxy-p (null tls))
+                 (when (and (route-tls-p route) (null tls))
                    ;; Never: an https:// proxy only ever sees octets inside TLS (#53).
                    (error 'http-tls-error
                           :message "refusing a cleartext write to an https:// proxy"))
@@ -854,7 +809,7 @@ reader never waits on a request that no longer runs.")
                (dial-origin ()
                  (handler-case
                      (multiple-value-bind (usock status)
-                         (tcp-connect-nb connect-host connect-port)
+                         (tcp-connect-nb (route-host route) (route-port route))
                        (setf sock usock
                              (async-request-socket handle) sock
                              fd (socket-fd sock)
@@ -955,13 +910,12 @@ reader never waits on a request that no longer runs.")
                                      :message
                                      "cannot replay streamed request body on redirect"))
                             (multiple-value-bind (m u h b ho po https?)
-                                (prepare-redirect-hop status next method body-octets
+                                (prepare-redirect-hop status uri next method body-octets
                                                       headers cookie-jar ae)
                               ;; the socket being released belongs to the old origin
                               (setf previous-pool-key pool-key*)
                               (setf method m
                                     uri u
-                                    headers h
                                     body-octets b
                                     body-stream-src nil
                                     stream-body-p nil
@@ -971,22 +925,20 @@ reader never waits on a request that no longer runs.")
                                     port po
                                     https https?
                                     scheme (if https? "https" "http")
+                                    wpos 0
+                                    phase :reconnect)
+                              ;; This hop's own route (#82): its proxy, asked again for
+                              ;; the new URL, what to dial, absolute-form or CONNECT,
+                              ;; its pool key. Then its request: Proxy-Authorization
+                              ;; only on an absolute-form hop to the proxy, never
+                              ;; inside a tunnel to the origin.
+                              (setf route (hop-route (resolve-proxy proxy-cfg uri) uri)
+                                    pool-key* (route-pool-key route)
+                                    headers (add-proxy-authorization h route)
                                     req-octets (build-request-octets
                                                 method uri headers body-octets
-                                                :absolute-p proxied-http-p
-                                                :keep-alive keep-alive-p)
-                                    wpos 0
-                                    phase :reconnect
-                                    pool-key* (pool-key scheme host port
-                                                        :proxy proxy-url))
-                              ;; a direct connection dials the new origin; through a
-                              ;; proxy the target stays the proxy (CONNECT for https)
-                              (if proxy-url
-                                  (let ((http-proxy (and (member (proxy-kind proxy-url) '(:http :https)) t)))
-                                    (setf http-connect-p (and http-proxy https)
-                                          proxied-http-p (and http-proxy (not https))))
-                                  (setf connect-host host
-                                        connect-port port))
+                                                :absolute-p (route-absolute-form-p route)
+                                                :keep-alive keep-alive-p))
                               (reset-parser)
                               (next-tick
                                (lambda ()
@@ -1268,7 +1220,7 @@ reader never waits on a request that no longer runs.")
                                           :negotiated nil
                                           :message "cleartext h2c not implemented")))
                    (https
-                    (setf tls (if (and tls-proxy-p tls)
+                    (setf tls (if (and (route-tls-p route) tls)
                                   ;; TLS to the origin inside the proxy's TLS tunnel (#53)
                                   (make-tunneled-tls-session
                                    tls host
@@ -1328,19 +1280,19 @@ reader never waits on a request that no longer runs.")
                                 (#x00
                                  (setf socks-out (socks5-connect-request
                                                   host port
-                                                  :remote-dns socks-remote-dns)
+                                                  :remote-dns (route-remote-dns-p route))
                                        socks-wpos 0
                                        socks-step :connect-write)
                                  (arm-io :write)
                                  (next-tick #'do-socks))
                                 (#x02
-                                 (unless socks-user
+                                 (unless (route-user route)
                                    (return-from do-socks
                                      (fail (make-condition
                                             'http-connection-error
                                             :message "SOCKS5 auth required"))))
                                  (setf socks-out (socks5-userpass-request
-                                                  socks-user socks-pass)
+                                                  (route-user route) (route-password route))
                                        socks-wpos 0
                                        socks-step :auth-write)
                                  (arm-io :write)
@@ -1371,7 +1323,7 @@ reader never waits on a request that no longer runs.")
                                                       :message "SOCKS5 auth failed"))))
                             (setf socks-out (socks5-connect-request
                                              host port
-                                             :remote-dns socks-remote-dns)
+                                             :remote-dns (route-remote-dns-p route))
                                   socks-wpos 0
                                   socks-step :connect-write)
                             (arm-io :write)
@@ -1457,26 +1409,26 @@ reader never waits on a request that no longer runs.")
                (on-connected ()
                  (set-socket-nonblocking sock t)
                  (cond
-                   (socks-p
+                   ((eq (route-form route) :socks5)
                     (setf phase :socks
                           socks-step :greet-write
-                          socks-out (socks5-greeting :username socks-user)
+                          socks-out (socks5-greeting :username (route-user route))
                           socks-wpos 0
                           (fill-pointer socks-in) 0)
                     (arm-io :write)
                     (next-tick (lambda () (on-io :ok))))
-                   ((and tls-proxy-p (null tls))
+                   ((and (route-tls-p route) (null tls))
                     ;; https:// proxy: TLS to it before any octet of CONNECT or the request,
                     ;; verified against the proxy's host name (curl, urllib3; #53). The
                     ;; handshake comes back here with TLS set.
-                    (setf tls (make-tls-session fd proxy-host
+                    (setf tls (make-tls-session fd (route-host route)
                                                 :verify verify
                                                 :alpn-protocols '("http/1.1"))
                           (async-request-tls-stream handle) tls
                           phase :proxy-tls-hs)
                     (arm-io :write)
                     (next-tick (lambda () (on-io :ok))))
-                   (http-connect-p
+                   ((eq (route-form route) :connect)
                     (setf phase :http-connect
                           connect-step :write
                           connect-out (build-connect-request-octets
@@ -1484,7 +1436,7 @@ reader never waits on a request that no longer runs.")
                                        :proxy-authorization
                                        (make-secret
                                         (proxy-authorization-value
-                                         proxy-user proxy-pass)))
+                                         (route-user route) (route-password route))))
                           connect-wpos 0
                           (fill-pointer connect-in) 0)
                     (arm-io :write)
