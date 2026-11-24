@@ -58,6 +58,7 @@
                (:file "keep-alive-test")
                (:file "redact-test")
                (:file "proxy-test")
+               (:file "https-proxy-test")
                (:file "socks-test")
                (:file "backend-test")
                (:file "poll-error-test")
