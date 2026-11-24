@@ -5,9 +5,24 @@
 (defun redirect-status-p (status)
   (member status '(301 302 303 307 308) :test #'=))
 
-(defun redirect-preserves-method-p (status)
-  "307/308 keep method+body; 301/302/303 become GET without body."
-  (member status '(307 308) :test #'=))
+(defun redirect-method (status method)
+  "The method a STATUS redirect of METHOD goes out with (RFC 9110 §15.4, as
+   the Fetch standard has it): 303 makes anything but HEAD a GET, 301 and 302
+   make only POST a GET (#84). 307, 308 and every other case keep METHOD.
+   requests also makes a 302 of any method but HEAD a GET; the RFC does not."
+  (let ((name (string-upcase (string method))))
+    (if (or (and (= status 303) (string/= name "HEAD"))
+            (and (member status '(301 302)) (string= name "POST")))
+        :get
+        method)))
+
+(defun redirect-keeps-body-p (status method)
+  "T when a STATUS redirect of METHOD sends the request body again: the
+   method stays (REDIRECT-METHOD) and STATUS is not 303, whose GET or HEAD
+   only retrieves. RFC 9110 §15.4: resend the request, and drop the body and
+   its headers only when the method became GET or HEAD."
+  (and (/= status 303)
+       (eq (redirect-method status method) method)))
 
 (defun resolve-redirect-uri (current-uri location)
   "Merge LOCATION (string or uri) against CURRENT-URI → absolute quri:uri."
@@ -44,15 +59,17 @@
   "The request a STATUS redirect from FROM to URI (quri URIs, URI resolved
    from Location) makes. → (values method uri headers body host port https)
 
-   307/308 keep METHOD and the body; 301/302/303 send GET without the body
-   and the headers that describe it. Host is URI's and Cookie comes from
-   COOKIE-JAR for URI. Proxy-Authorization is always dropped: the caller
-   adds it back only for an absolute-form hop to an http(s) proxy, never
-   inside a CONNECT tunnel to the origin (requests' rebuild_proxies, #82).
-   On another origin (scheme, host or port) Authorization goes too, as
-   http-backend-dexador drops it."
-  (let* ((new-method (if (redirect-preserves-method-p status) method :get))
-         (new-body (if (redirect-preserves-method-p status)
+   The method is REDIRECT-METHOD's: 303 makes anything but HEAD a GET, 301
+   and 302 make only POST a GET. When REDIRECT-KEEPS-BODY-P the body goes
+   again; otherwise the hop has no body and none of the headers that
+   describe it. Host is URI's and Cookie comes from COOKIE-JAR for URI.
+   Proxy-Authorization is always dropped: the caller adds it back only for
+   an absolute-form hop to an http(s) proxy, never inside a CONNECT tunnel
+   to the origin (requests' rebuild_proxies, #82). On another origin
+   (scheme, host or port) Authorization goes too, as http-backend-dexador
+   drops it."
+  (let* ((new-method (redirect-method status method))
+         (new-body (if (redirect-keeps-body-p status method)
                        body-octets
                        (make-array 0 :element-type '(unsigned-byte 8))))
          (drop (if (redirect-same-origin-p from uri)
@@ -61,7 +78,7 @@
          (headers (remove-if (lambda (pair) (member (car pair) drop :test #'string-equal))
                              headers)))
     (multiple-value-bind (host port scheme) (%uri-host-port uri)
-      (unless (redirect-preserves-method-p status)
+      (unless (redirect-keeps-body-p status method)
         (setf headers (%strip-body-headers headers)))
       (when (and accept-encoding-header
                  (not (assoc "accept-encoding" headers :test #'string-equal)))

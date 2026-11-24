@@ -606,12 +606,15 @@ reader never waits on a request that no longer runs.")
                     (lambda ()
                       (unless (async-request-canceled-p handle)
                         (dial-origin))))))
-               (detach-connection ()
-                 "Hand socket/TLS to an HTTP/1.1 pool entry without closing."
+               (detach-connection (&key (conn-https https)
+                                        (idle-timeout (keep-alive-timeout hdrs)))
+                 "Hand socket/TLS to an HTTP/1.1 pool entry without closing.
+                  CONN-HTTPS and IDLE-TIMEOUT (the server's Keep-Alive
+                  timeout) describe the response the connection carried."
                  (stop-io-and-timer)
                  (let ((conn (make-async-pooled-connection
-                              sock :tls tls :https https
-                              :idle-timeout (keep-alive-timeout hdrs)
+                              sock :tls tls :https conn-https
+                              :idle-timeout idle-timeout
                               :idle-limit (pool-idle-limit pool))))
                    (setf sock nil
                          tls nil
@@ -633,11 +636,16 @@ reader never waits on a request that no longer runs.")
                      (when (and (not reset) (typep stream 'async-h2-stream-hooks))
                        (ignore-errors (h2-stream-release-window stream)))
                      (h2-mux-stream-done mux stream :reset reset))))
-               (release-or-close (&key (force-close nil) (key pool-key*))
+               (release-or-close (&key (force-close nil) (key pool-key*)
+                                       (reuse reuse-ok-p) (conn-https https)
+                                       (idle-timeout (keep-alive-timeout hdrs)))
                  "Return the connection to POOL when it can be reused; else close.
 
                   HTTP/1.1: keep-alive and the response allows reuse. The entry
                   is an ASYNC-POOLED-CONNECTION under the origin key.
+                  REUSE, CONN-HTTPS and IDLE-TIMEOUT default to this request's
+                  state; a redirect passes the hop's, taken before RESET-PARSER
+                  and the next hop's scheme replace it (#85).
 
                   HTTP/2: the socket belongs to H2-MUX, never to this request.
                   Releasing ends the request's stream (RST_STREAM when it did not
@@ -649,11 +657,12 @@ reader never waits on a request that no longer runs.")
                           (null pool)
                           (null sock)
                           (not keep-alive-p)
-                          (not reuse-ok-p)
+                          (not reuse)
                           (eq negotiated-version :http/2))
                       (close-connection))
                      (t
-                      (let ((conn (detach-connection)))
+                      (let ((conn (detach-connection :conn-https conn-https
+                                                     :idle-timeout idle-timeout)))
                         (pool-release pool key conn))))))
                (complete-request (&key (force-close nil))
                  "Stop IO/timer; pool or close after full response / stream EOF."
@@ -903,9 +912,12 @@ reader never waits on a request that no longer runs.")
                                           (response-keeps-alive-p
                                            headers* (fast-http:http-version http))))))
                       (handler-case
-                          (let ((next (resolve-redirect-uri uri location)))
-                            (when (and chunked-p
-                                       (redirect-preserves-method-p status))
+                          (let ((next (resolve-redirect-uri uri location))
+                                (hop-reuse reuse-ok-p)
+                                (hop-https https)
+                                (hop-idle-timeout (keep-alive-timeout hdrs)))
+                            (when (and stream-body-p
+                                       (redirect-keeps-body-p status method))
                               (error 'http-protocol-error
                                      :message
                                      "cannot replay streamed request body on redirect"))
@@ -945,7 +957,10 @@ reader never waits on a request that no longer runs.")
                                  (unless (async-request-canceled-p handle)
                                    ;; Prefer pool release over hard close when
                                    ;; the redirect hop can reuse the socket.
-                                   (release-or-close :key previous-pool-key)
+                                   (release-or-close :key previous-pool-key
+                                                     :reuse hop-reuse
+                                                     :conn-https hop-https
+                                                     :idle-timeout hop-idle-timeout)
                                    (setf (async-request-canceled-p handle) nil)
                                    (do-connect))))))
                         (http-error (e) (fail e))
