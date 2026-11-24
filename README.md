@@ -21,7 +21,12 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
   absolute-form request and `Proxy-Authorization` go inside it, as curl and
   urllib3 do (#53). Nothing reaches such a proxy in cleartext
 - `send-async` + `cancel-request`; facade promises via `http:*-async`
-- Cookie-jar (cl-cookie) + redirect follow (`response-history`; 301/302/303→GET)
+- Cookie-jar (cl-cookie) + redirect follow (`response-history`; 301/302/303→GET).
+  Each hop is built for its own URL (#82): the proxy is resolved again,
+  `http://` goes to it in absolute-form with `Proxy-Authorization`, `https://`
+  through CONNECT, and the request inside the tunnel never carries
+  `Proxy-Authorization`. A hop to another origin (scheme, host or port) drops
+  `Authorization`; `Cookie` comes from the jar for the new URL
 - Content-Encoding decode (chipz; soft-load br/zstd)
 - Bodies via `http-protocol` ≥ **0.2.0**: `:form-data` / typed `:data` / `:content` / streams
 - Live CE tests: `HTTP_ASYNC_LIVE=1` (default in CI) → httpbingo `/gzip` `/brotli`
