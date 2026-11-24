@@ -12,7 +12,14 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
   FD → `event-protocol:register-io` `:read-write`)
 - HTTPS via `cl+ssl` / `cl-stack-ssl` socket-BIO: `SSL_connect` /
   `SSL_read` / `SSL_write` pumped with `WANT_READ`/`WANT_WRITE` on the
-  event loop (no blocking `ensure-ssl-funcall` / MemoryBIO)
+  event loop (no blocking `ensure-ssl-funcall`). TLS inside TLS (an https
+  origin through an `https://` proxy) runs the inner session on two memory
+  BIOs carried by the outer one
+- Proxies: `http://` (absolute-form, or CONNECT for https), `https://` and
+  `socks5://` / `socks5h://`. An `https://` proxy gets TLS first, verified
+  against the proxy's host name with the client's `:verify`; CONNECT or the
+  absolute-form request and `Proxy-Authorization` go inside it, as curl and
+  urllib3 do (#53). Nothing reaches such a proxy in cleartext
 - `send-async` + `cancel-request`; facade promises via `http:*-async`
 - Cookie-jar (cl-cookie) + redirect follow (`response-history`; 301/302/303→GET)
 - Content-Encoding decode (chipz; soft-load br/zstd)

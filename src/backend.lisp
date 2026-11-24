@@ -341,6 +341,8 @@ reader never waits on a request that no longer runs.")
                (http-connect-p nil) ; HTTPS via HTTP proxy → CONNECT then TLS
                (proxy-user nil)
                (proxy-pass nil)
+               (tls-proxy-p nil)
+               (proxy-host nil)
                (connect-step nil)
                (connect-out nil)
                (connect-wpos 0)
@@ -392,12 +394,16 @@ reader never waits on a request that no longer runs.")
             (multiple-value-bind (pscheme phost pport puser ppass)
                 (parse-proxy-uri proxy-url)
               (ecase (proxy-kind proxy-url)
-                (:http
-                 ;; dexador: cleartext → absolute-form; https → CONNECT then TLS
+                ((:http :https)
+                 ;; dexador: cleartext → absolute-form; https → CONNECT then TLS.
+                 ;; An https:// proxy gets TLS first, checked against its own host
+                 ;; name; CONNECT or the absolute-form request go inside it (#53).
                  (setf connect-host phost
                        connect-port pport
                        proxy-user puser
                        proxy-pass ppass
+                       tls-proxy-p (proxy-tls-p proxy-url)
+                       proxy-host phost
                        http-connect-p https
                        proxied-http-p (not https)))
                 (:socks5
@@ -420,6 +426,7 @@ reader never waits on a request that no longer runs.")
                  (setf last-activity (get-internal-real-time)))
                (connect-phase-p ()
                  (member phase '(:connect :connecting :socks :http-connect
+                                 :proxy-tls-hs
                                  :tls-hs :reconnect)))
                (watchdog-tick ()
                  "The longest the watchdog may sleep: the smaller limit, so a
@@ -537,8 +544,12 @@ reader never waits on a request that no longer runs.")
                             chunk-frame nil)))))
                (%write-octets (octets from to)
                  "Write OCTETS[FROM:TO]. Returns (values new-pos done-p want)."
+                 (when (and tls-proxy-p (null tls))
+                   ;; Never: an https:// proxy only ever sees octets inside TLS (#53).
+                   (error 'http-tls-error
+                          :message "refusing a cleartext write to an https:// proxy"))
                  (multiple-value-bind (n want)
-                     (if https
+                     (if tls
                          (tls-write-octets tls octets from to)
                          (values (socket-send-octets sock octets from to) nil))
                    (cond
@@ -971,8 +982,9 @@ reader never waits on a request that no longer runs.")
                               ;; a direct connection dials the new origin; through a
                               ;; proxy the target stays the proxy (CONNECT for https)
                               (if proxy-url
-                                  (setf http-connect-p (and (eq (proxy-kind proxy-url) :http) https)
-                                        proxied-http-p (and (eq (proxy-kind proxy-url) :http) (not https)))
+                                  (let ((http-proxy (and (member (proxy-kind proxy-url) '(:http :https)) t)))
+                                    (setf http-connect-p (and http-proxy https)
+                                          proxied-http-p (and http-proxy (not https))))
                                   (setf connect-host host
                                         connect-port port))
                               (reset-parser)
@@ -1256,10 +1268,16 @@ reader never waits on a request that no longer runs.")
                                           :negotiated nil
                                           :message "cleartext h2c not implemented")))
                    (https
-                    (setf tls (make-tls-session
-                               fd host
-                               :verify verify
-                               :alpn-protocols (alpn-offer version-pref))
+                    (setf tls (if (and tls-proxy-p tls)
+                                  ;; TLS to the origin inside the proxy's TLS tunnel (#53)
+                                  (make-tunneled-tls-session
+                                   tls host
+                                   :verify verify
+                                   :alpn-protocols (alpn-offer version-pref))
+                                  (make-tls-session
+                                   fd host
+                                   :verify verify
+                                   :alpn-protocols (alpn-offer version-pref)))
                           (async-request-tls-stream handle) tls
                           phase :tls-hs)
                     (arm-io :write)
@@ -1389,16 +1407,14 @@ reader never waits on a request that no longer runs.")
                  (loop for i below n
                        do (vector-push-extend (aref octets i) connect-in)))
                (%connect-write-step ()
-                 (let ((n (socket-send-octets sock connect-out connect-wpos
-                                              (length connect-out))))
+                 (multiple-value-bind (pos done want)
+                     ;; inside the TLS session of an https:// proxy (#53)
+                     (%write-octets connect-out connect-wpos (length connect-out))
+                   (setf connect-wpos pos)
                    (cond
-                     ((null n) (arm-io :write) nil)
-                     ((zerop n) (arm-io :write) nil)
-                     (t
-                      (incf connect-wpos n)
-                      (if (>= connect-wpos (length connect-out))
-                          t
-                          (progn (arm-io :write) nil))))))
+                    (want (arm-tls-want want) nil)
+                    (done t)
+                    (t (arm-io :write) nil))))
                (do-http-connect ()
                  "HTTP CONNECT tunnel (dexador make-connect-stream) before TLS."
                  (handler-case
@@ -1409,8 +1425,14 @@ reader never waits on a request that no longer runs.")
                                 (fill-pointer connect-in) 0)
                           (arm-io :read)))
                        (:read
-                        (let ((n (socket-recv-octets sock recv-buf)))
-                          (when (null n) (arm-io :read) (return-from do-http-connect))
+                        (multiple-value-bind (n want)
+                            ;; inside the TLS session of an https:// proxy (#53)
+                            (if tls
+                                (tls-read-octets tls recv-buf)
+                                (values (socket-recv-octets sock recv-buf) nil))
+                          (when (null n)
+                            (if want (arm-tls-want want) (arm-io :read))
+                            (return-from do-http-connect))
                           (when (zerop n)
                             (return-from do-http-connect
                               (fail (make-condition 'http-connection-error
@@ -1443,6 +1465,17 @@ reader never waits on a request that no longer runs.")
                           (fill-pointer socks-in) 0)
                     (arm-io :write)
                     (next-tick (lambda () (on-io :ok))))
+                   ((and tls-proxy-p (null tls))
+                    ;; https:// proxy: TLS to it before any octet of CONNECT or the request,
+                    ;; verified against the proxy's host name (curl, urllib3; #53). The
+                    ;; handshake comes back here with TLS set.
+                    (setf tls (make-tls-session fd proxy-host
+                                                :verify verify
+                                                :alpn-protocols '("http/1.1"))
+                          (async-request-tls-stream handle) tls
+                          phase :proxy-tls-hs)
+                    (arm-io :write)
+                    (next-tick (lambda () (on-io :ok))))
                    (http-connect-p
                     (setf phase :http-connect
                           connect-step :write
@@ -1461,6 +1494,10 @@ reader never waits on a request that no longer runs.")
                  (loop
                    (ecase (tls-handshake-step tls)
                      (:done
+                      (when (eq phase :proxy-tls-hs)
+                        ;; TLS to the https:// proxy is up, its certificate checked against
+                        ;; its host name: CONNECT or the request go inside it (#53)
+                        (return (on-connected)))
                       (let* ((alpn (tls-selected-alpn tls))
                              (got (or (http-version-from-alpn alpn) :http/1.1)))
                         (setf negotiated-version got)
@@ -1547,7 +1584,7 @@ reader never waits on a request that no longer runs.")
                    (when read-paused-p
                      (return))
                    (multiple-value-bind (n want)
-                       (if https
+                       (if tls
                            (tls-read-octets tls recv-buf)
                            (values (socket-recv-octets sock recv-buf) nil))
                      (cond
@@ -1603,7 +1640,7 @@ reader never waits on a request that no longer runs.")
                      (if (and (member phase '(:write :read)) (stale-pooled-p))
                          (retry-on-fresh-connection)
                          (fail (make-condition
-                                (if (and https (eq phase :tls-hs))
+                                (if (member phase '(:tls-hs :proxy-tls-hs))
                                     'http-tls-error
                                     'http-connection-error)
                                 :message (poll-error-message code))))))
@@ -1613,6 +1650,7 @@ reader never waits on a request that no longer runs.")
                         (when (tcp-connect-finish sock)
                           (on-connected)))
                        (:socks (do-socks))
+                       (:proxy-tls-hs (do-tls-hs))
                        (:http-connect (do-http-connect))
                        (:tls-hs (do-tls-hs))
                        (:h2 nil)
@@ -1630,7 +1668,7 @@ reader never waits on a request that no longer runs.")
                      (if (and (member phase '(:write :read)) (stale-pooled-p))
                          (retry-on-fresh-connection)
                          (fail (make-condition
-                                (if https 'http-tls-error 'http-connection-error)
+                                (if (or https tls) 'http-tls-error 'http-connection-error)
                                 :message (princ-to-string e))))))))
             ;; RFC 9113 h2c prior-knowledge is P2 — fail before TCP.
             (when (and (not https) (eq version-pref :http/2))
