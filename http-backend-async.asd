@@ -59,6 +59,7 @@
                (:file "redact-test")
                (:file "proxy-test")
                (:file "https-proxy-test")
+               (:file "proxy-redirect-test")
                (:file "socks-test")
                (:file "backend-test")
                (:file "poll-error-test")
