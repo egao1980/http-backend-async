@@ -67,6 +67,7 @@
                (:file "poll-error-test")
                (:file "timeout-test")
                (:file "live-stream-test")
+               (:file "close-delimited-test")
                (:file "error-response-test")
                (:file "http2-test")
                (:file "h2-mux-test")
