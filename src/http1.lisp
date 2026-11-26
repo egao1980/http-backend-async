@@ -211,11 +211,21 @@
             (values decoded ht))))))))
 
 (defun make-response-accumulator (&key on-headers no-body-p)
-  "Return (values http headers-ht body-vector finished-fn parser-fn set-body-fn headers-done-fn).
+  "Return (values http headers-ht body-vector finished-fn parser-fn set-body-fn
+   headers-done-fn close-delimited-fn).
 
    NO-BODY-P: the request was HEAD. Its response, like any 204 or 304, ends
    with the header block (RFC 9110 §6.4.1, §9.3.2) whatever Content-Length
    says; waiting for that many body octets hung until the timeout.
+
+   A response with neither Content-Length nor chunked framing is
+   close-delimited (RFC 9112 §6.3 rule 8): its body ends only when the peer
+   closes the connection. fast-http calls such a message complete at the end
+   of every read, so a pause between the server's writes cut the body (#89).
+   Once the header block says so, the octets bypass the parser and go
+   straight to the body callback; PARSER-FN called with no octets is the
+   peer's EOF and finishes the body. CLOSE-DELIMITED-FN is then true: the
+   connection cannot be reused.
 
    SET-BODY-FN (fn) replaces the body callback (fn data start end).
    Default body callback accumulates into BODY-VECTOR.
@@ -226,10 +236,11 @@
                              :adjustable t :fill-pointer 0))
          (finished nil)
          (headers-done nil)
+         (close-delimited nil)
          (body-fn
-          (lambda (data start end)
-            (loop for i from start below end
-                  do (vector-push-extend (aref data i) body))))
+           (lambda (data start end)
+             (loop for i from start below end
+                   do (vector-push-extend (aref data i) body))))
          (parser (fast-http:make-parser
                   http
                   :header-callback
@@ -238,20 +249,33 @@
                                (setf (gethash (string-downcase k) headers) v))
                              h)
                     (setf headers-done t)
-                    (when (or no-body-p
-                              (member (fast-http:http-status http) '(204 304)))
-                      (setf finished t))
+                    (let ((status (fast-http:http-status http)))
+                      (cond
+                        ((or no-body-p (member status '(204 304)))
+                         (setf finished t))
+                        ((and (>= status 200)
+                              (null (fast-http:http-content-length http))
+                              (not (fast-http:http-chunked-p http)))
+                         (setf close-delimited t))))
                     (when on-headers
                       (funcall on-headers http headers)))
                   :body-callback
                   (lambda (data start end)
                     (funcall body-fn data start end))
                   :finish-callback
-                  (lambda () (setf finished t)))))
+                  ;; A close-delimited body ends at EOF, not where the read did.
+                  (lambda () (unless close-delimited (setf finished t))))))
     (values http headers body
             (lambda () finished)
             (lambda (octets &key (start 0) (end (length octets)))
-              (funcall parser octets :start start :end end)
+              (cond
+                ((not close-delimited)
+                 (funcall parser octets :start start :end end))
+                ((= start end)
+                 (setf finished t))
+                (t
+                 (funcall body-fn octets start end)))
               finished)
             (lambda (fn) (setf body-fn fn))
-            (lambda () headers-done))))
+            (lambda () headers-done)
+            (lambda () close-delimited))))

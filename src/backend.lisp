@@ -329,6 +329,7 @@ reader never waits on a request that no longer runs.")
                (finishedp nil)
                (parse! nil)
                (set-body-fn nil)
+               (close-delimited-fn (constantly nil))
                (body-feed nil)
                (streaming-final-p nil)
                (headers-delivered-p nil)
@@ -675,6 +676,13 @@ reader never waits on a request that no longer runs.")
                         (redirect-status-p status)
                         (plusp max-redirects)
                         (< redirect-hops max-redirects))))
+               (http1-keeps-alive-p (headers*)
+                 "HTTP/1.x: the response lets its connection carry another request. A
+   close-delimited one never does: its body ended with the connection (#89),
+   even an HTTP/1.1 answer without Connection: close."
+                 (and http
+                      (not (funcall close-delimited-fn))
+                      (response-keeps-alive-p headers* (fast-http:http-version http))))
                (begin-stream-body (status headers*)
                  "Switch parser body sink to ASYNC-BODY-INPUT-STREAM and deliver."
                  (let* ((final-url (quri:render-uri uri))
@@ -682,8 +690,7 @@ reader never waits on a request that no longer runs.")
                                       cookie-jar final-url headers*)))
                    (setf reuse-ok-p
                          (and keep-alive-p
-                              (response-keeps-alive-p
-                               headers* (fast-http:http-version http)))
+                              (http1-keeps-alive-p headers*))
                          body-feed
                          (make-async-body-input-stream
                           :on-space #'unpause-read-threadsafe)
@@ -714,12 +721,14 @@ reader never waits on a request that no longer runs.")
                                   (fast-http:http-status http) headers*)))
                    (begin-stream-body (fast-http:http-status http) headers*)))
                (reset-parser ()
-                 (multiple-value-bind (h hd b f p set-body)
+                 (multiple-value-bind (h hd b f p set-body headers-done-fn close-delimited)
                      (make-response-accumulator
                       :on-headers #'on-response-headers
                       :no-body-p (string-equal (string method) "HEAD"))
+                   (declare (ignore headers-done-fn))
                    (setf http h hdrs hd body b finishedp f parse! p
                          set-body-fn set-body
+                         close-delimited-fn close-delimited
                          body-feed nil
                          streaming-final-p nil
                          read-paused-p nil
@@ -879,8 +888,7 @@ reader never waits on a request that no longer runs.")
                       (setf reuse-ok-p
                             (and keep-alive-p
                                  (or (eq negotiated-version :http/2)
-                                     (response-keeps-alive-p
-                                      headers* (fast-http:http-version http)))))
+                                     (http1-keeps-alive-p headers*))))
                       (succeed (make-hop-response
                                 status headers* body* set-cookies final-url
                                 :history-for-final (nreverse history)
@@ -889,8 +897,7 @@ reader never waits on a request that no longer runs.")
                       (setf reuse-ok-p
                             (and keep-alive-p
                                  (or (eq negotiated-version :http/2)
-                                     (response-keeps-alive-p
-                                      headers* (fast-http:http-version http)))))
+                                     (http1-keeps-alive-p headers*))))
                       (succeed (make-hop-response
                                 status headers* body* set-cookies final-url
                                 :history-for-final (nreverse history)
@@ -908,9 +915,7 @@ reader never waits on a request that no longer runs.")
                       (setf reuse-ok-p
                             (and keep-alive-p
                                  (or (eq negotiated-version :http/2)
-                                     (and http
-                                          (response-keeps-alive-p
-                                           headers* (fast-http:http-version http))))))
+                                     (http1-keeps-alive-p headers*))))
                       (handler-case
                           (let ((next (resolve-redirect-uri uri location))
                                 (hop-reuse reuse-ok-p)

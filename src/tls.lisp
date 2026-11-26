@@ -238,8 +238,30 @@
    failed (the peer reset it). Both a TLS error and a connection error, so a
    stale pooled HTTPS socket is retried like a cleartext one (#57)."))
 
+(defconstant +err-lib-ssl+ 20)
+(defconstant +ssl-r-unexpected-eof-while-reading+ 294)
+
+(defun %ssl-unexpected-eof-p ()
+  "T when the first queued OpenSSL error is SSL_R_UNEXPECTED_EOF_WHILE_READING
+   (OpenSSL 3: the peer closed TCP without close_notify). The queue is then
+   cleared: the error was handled as EOF."
+  (let* ((code (cffi:foreign-funcall "ERR_peek_error" :unsigned-long))
+         (lib (ldb (byte 8 23) code))
+         (reason (ldb (byte 23 0) code)))
+    (when (and (= lib +err-lib-ssl+)
+               (= reason +ssl-r-unexpected-eof-while-reading+))
+      (cffi:foreign-funcall "ERR_clear_error" :void)
+      t)))
+
 (defun %ssl-step (session func &rest args)
-  "One nonblocking SSL_* call → (:ok n) | (:want-read n) | (:want-write n) | (:eof 0)."
+  "One nonblocking SSL_* call → (:ok n) | (:want-read n) | (:want-write n) | (:eof 0).
+
+   An SSL_read that meets a TCP close without close_notify (OpenSSL 3:
+   SSL_R_UNEXPECTED_EOF_WHILE_READING; 1.1: SSL_ERROR_SYSCALL, ret 0) is EOF,
+   as Python's ssl (suppress_ragged_eofs) and so requests / urllib3 take it.
+   A truncation stays visible where framing exists: a Content-Length or
+   chunked body cut short fails as HTTP-INCOMPLETE-RESPONSE. Only a
+   close-delimited body (#89) has no other end to check."
   (when (tls-session-transport session)
     (return-from %ssl-step (%tunnel-step session func args)))
   (let* ((stream (tls-session-stream session))
@@ -260,11 +282,15 @@
                 (error 'tls-connection-error
                        :message (format nil "SSL syscall error ret=~A" ret))))
            (t
-            (handler-case
-                (cl+ssl::ssl-signal-error handle func err ret)
-              (error (e)
-                (error 'http-tls-error
-                       :message (format nil "TLS error: ~A" e)))))))))))
+            (if (and (eql err cl+ssl::+ssl-error-ssl+)
+                     (eq func #'cl+ssl::ssl-read)
+                     (%ssl-unexpected-eof-p))
+                (values :eof 0)
+                (handler-case
+                    (cl+ssl::ssl-signal-error handle func err ret)
+                  (error (e)
+                    (error 'http-tls-error
+                           :message (format nil "TLS error: ~A" e))))))))))))
 
 (defun tls-handshake-step (session)
   "Advance SSL_connect. Returns :done | :want-read | :want-write."
