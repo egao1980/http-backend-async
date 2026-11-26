@@ -226,7 +226,8 @@
      (nil)
      (t))
   ;; A TCP close without close_notify is EOF, but a Content-Length body that
-  ;; it cuts short is still an incomplete response, not a short success.
+  ;; it cuts short is still an incomplete response: not a short success, and
+  ;; not the TLS error it was before #89.
   (with-async-test (eb el hb)
     (declare (ignore eb el))
     (let ((*http-backend* hb))
@@ -235,4 +236,5 @@
                                                           :content-length 4096))
         (let ((res (handler-case (%close-delimited-get url :want-stream want-stream)
                      (error (e) e))))
-          (ok (typep res 'http-error) (format nil "~A" res)))))))
+          (ok (typep res 'http-incomplete-response)
+              (format nil "~S: ~A" (type-of res) res)))))))

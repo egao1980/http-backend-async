@@ -199,7 +199,10 @@
       (when want
         (return-from %tunnel-step (values want -1))))
     (loop
-      (let ((ret (apply func handle args)))
+      (let ((ret (progn
+                   ;; as in %SSL-STEP: SSL_get_error needs an empty queue before the call
+                   (cffi:foreign-funcall "ERR_clear_error" :void)
+                   (apply func handle args))))
         (when (plusp ret)
           ;; Best effort: what stays in OUT goes before the next call.
           (%tunnel-flush session)
@@ -261,12 +264,16 @@
    as Python's ssl (suppress_ragged_eofs) and so requests / urllib3 take it.
    A truncation stays visible where framing exists: a Content-Length or
    chunked body cut short fails as HTTP-INCOMPLETE-RESPONSE. Only a
-   close-delimited body (#89) has no other end to check."
+   close-delimited body (#89) has no other end to check.
+
+   The thread's OpenSSL error queue is cleared before the call, as
+   SSL_get_error requires: a stale entry must not decide this result."
   (when (tls-session-transport session)
     (return-from %ssl-step (%tunnel-step session func args)))
   (let* ((stream (tls-session-stream session))
          (handle (tls-session-handle session))
          (ret (let ((cl+ssl::*bio-socket* (cl+ssl::ssl-stream-socket stream)))
+                (cffi:foreign-funcall "ERR_clear_error" :void)
                 (apply func handle args))))
     (cond
       ((plusp ret) (values :ok ret))
