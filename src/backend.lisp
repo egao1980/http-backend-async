@@ -1581,7 +1581,10 @@ reader never waits on a request that no longer runs.")
                         (incf response-octets-seen n)
                         (when (handler-case
                                   (funcall parse! recv-buf :end n)
-                                (error (e)
+                                (fast-http:fast-http-error (e)
+                                  ;; Only the parser's own errors are a parse failure; a body
+                                  ;; sink's or a header hook's error (and an HTTP-ERROR such as a
+                                  ;; refused transfer coding) is signalled as it is.
                                   ;; Keep raw bytes: reuse bugs (pooled sockets)
                                   ;; show up as mid-stream parses.
                                   (error 'http-protocol-error
