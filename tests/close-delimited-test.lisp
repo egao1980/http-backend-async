@@ -40,6 +40,16 @@
 
 (defvar *close-delimited-accepts* 0)
 
+(defun %join-or-destroy (thread &key (seconds 5))
+  "Join THREAD within SECONDS; past that destroy it (a connection thread
+   still waiting for a request the client never sends)."
+  (loop repeat (* seconds 20)
+        while (bt:thread-alive-p thread)
+        do (sleep 0.05))
+  (if (bt:thread-alive-p thread)
+      (ignore-errors (bt:destroy-thread thread))
+      (ignore-errors (bt:join-thread thread))))
+
 (defun call-with-close-delimited-origin (fn &key tls (close-notify t) serve-args)
   "Serve close-delimited answers on a loopback listener; call FN with its URL.
    TLS: https with tests/certs/origin.crt. CLOSE-NOTIFY NIL: the server drops
@@ -82,9 +92,11 @@
     (unwind-protect
         (funcall fn (format nil "~A://127.0.0.1:~D/sse" (if tls "https" "http") port))
       (ignore-errors (usocket:socket-close server))
-      (ignore-errors (bt:join-thread thread))
+      (when (bt:thread-alive-p thread)
+        ;; Closing the listener does not wake a blocked accept() on Linux.
+        (ignore-errors (bt:destroy-thread thread)))
       (dolist (c (bt:with-lock-held (lock) conns))
-        (ignore-errors (bt:join-thread c))))))
+        (%join-or-destroy c)))))
 
 (defmacro with-close-delimited-origin ((url-var &rest options) &body body)
   `(call-with-close-delimited-origin (lambda (,url-var) ,@body) ,@options))

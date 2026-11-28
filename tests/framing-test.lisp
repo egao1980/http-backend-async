@@ -64,9 +64,11 @@
     (unwind-protect
          (funcall fn (format nil "http://127.0.0.1:~D" port))
       (ignore-errors (usocket:socket-close server))
-      (ignore-errors (bt:join-thread acceptor))
+      (when (bt:thread-alive-p acceptor)
+        ;; Closing the listener does not wake a blocked accept() on Linux.
+        (ignore-errors (bt:destroy-thread acceptor)))
       (dolist (th (bt:with-lock-held (lock) threads))
-        (ignore-errors (bt:join-thread th))))))
+        (%join-or-destroy th)))))
 
 (defmacro with-raw-origin ((url-var responder &rest options) &body body)
   `(call-with-raw-origin (lambda (,url-var) ,@body) ,responder ,@options))
