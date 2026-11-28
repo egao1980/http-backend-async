@@ -28,6 +28,16 @@ One HTTP backend × N event loops (`event-backend-libuv`, `event-backend-libev`)
   `Proxy-Authorization`. A hop to another origin (scheme, host or port) drops
   `Authorization`; `Cookie` comes from the jar for the new URL
 - Content-Encoding decode (chipz; soft-load br/zstd)
+- HTTP/1 framing (#91): interim responses (`100 Continue`, `103 Early Hints`,
+  any 1xx but `101`) are skipped, so the final response is the one returned
+  (RFC 9110 §15.2). A transfer coding other than `chunked`
+  (`Transfer-Encoding: gzip, chunked`, or `gzip` alone, which is then
+  close-delimited) is decoded with the content codings: it is appended to the
+  response's `Content-Encoding` (so with `:decompress nil` it stays applied and
+  is listed there). `chunked` that is not the final coding is an
+  `http-protocol-error`. A close-delimited body ends at the peer's FIN; one cut
+  by an RST fails as a connection error, as in urllib3. An error of a body
+  sink is signalled as it is, not as "response parse failed"
 - Bodies via `http-protocol` ≥ **0.2.0**: `:form-data` / typed `:data` / `:content` / streams
 - Live CE tests: `HTTP_ASYNC_LIVE=1` (default in CI) → httpbingo `/gzip` `/brotli`
 - HTTP/2 over ALPN `h2`, multiplexed: one pooled `h2-mux` per origin and event

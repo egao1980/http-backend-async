@@ -40,14 +40,27 @@
 
 (defvar *close-delimited-accepts* 0)
 
+(defun %join-or-destroy (thread &key (seconds 5))
+  "Join THREAD within SECONDS; past that destroy it (a connection thread
+   still waiting for a request the client never sends)."
+  (loop repeat (* seconds 20)
+        while (bt:thread-alive-p thread)
+        do (sleep 0.05))
+  (if (bt:thread-alive-p thread)
+      (ignore-errors (bt:destroy-thread thread))
+      (ignore-errors (bt:join-thread thread))))
+
 (defun call-with-close-delimited-origin (fn &key tls (close-notify t) serve-args)
   "Serve close-delimited answers on a loopback listener; call FN with its URL.
    TLS: https with tests/certs/origin.crt. CLOSE-NOTIFY NIL: the server drops
-   the TCP connection without a TLS close_notify alert."
+   the TCP connection without a TLS close_notify alert. The acceptor and every
+   connection thread are joined before returning (#91)."
   (setf *close-delimited-accepts* 0)
   (let* ((server (usocket:socket-listen "127.0.0.1" 0 :reuseaddress t
                                                       :element-type '(unsigned-byte 8)))
          (port (usocket:get-local-port server))
+         (lock (bt:make-lock "close-delimited-origin"))
+         (conns '())
          (thread
            (bt:make-thread
             (lambda ()
@@ -56,28 +69,34 @@
                     (let ((c (usocket:socket-accept server
                                                     :element-type '(unsigned-byte 8))))
                       (incf *close-delimited-accepts*)
-                      (bt:make-thread
-                       (lambda ()
-                         (unwind-protect
-                              (ignore-errors
-                               (if tls
-                                   (let ((s (cl+ssl:make-ssl-server-stream
-                                             (usocket:socket-stream c)
-                                             :certificate (%test-cert "origin.crt")
-                                             :key (%test-cert "origin.key"))))
-                                     (apply #'%close-delimited-serve s serve-args)
-                                     (close s :abort (not close-notify)))
-                                   (apply #'%close-delimited-serve
-                                          (usocket:socket-stream c) serve-args)))
-                           (ignore-errors (usocket:socket-close c))))
-                       :name "close-delimited-conn"))
+                      (bt:with-lock-held (lock)
+                        (push
+                         (bt:make-thread
+                          (lambda ()
+                            (unwind-protect
+                                (ignore-errors
+                                  (if tls
+                                      (let ((s (cl+ssl:make-ssl-server-stream
+                                                (usocket:socket-stream c)
+                                                :certificate (%test-cert "origin.crt")
+                                                :key (%test-cert "origin.key"))))
+                                        (apply #'%close-delimited-serve s serve-args)
+                                        (close s :abort (not close-notify)))
+                                      (apply #'%close-delimited-serve
+                                             (usocket:socket-stream c) serve-args)))
+                              (ignore-errors (usocket:socket-close c))))
+                          :name "close-delimited-conn")
+                         conns)))
                   (error () (return)))))
             :name "close-delimited-origin")))
     (unwind-protect
-         (funcall fn (format nil "~A://127.0.0.1:~D/sse" (if tls "https" "http") port))
+        (funcall fn (format nil "~A://127.0.0.1:~D/sse" (if tls "https" "http") port))
       (ignore-errors (usocket:socket-close server))
       (when (bt:thread-alive-p thread)
-        (ignore-errors (bt:destroy-thread thread))))))
+        ;; Closing the listener does not wake a blocked accept() on Linux.
+        (ignore-errors (bt:destroy-thread thread)))
+      (dolist (c (bt:with-lock-held (lock) conns))
+        (%join-or-destroy c)))))
 
 (defmacro with-close-delimited-origin ((url-var &rest options) &body body)
   `(call-with-close-delimited-origin (lambda (,url-var) ,@body) ,@options))
